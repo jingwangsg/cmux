@@ -6531,6 +6531,15 @@ struct LocalTerminalDaemonRegistration: Equatable {
     let stderrLogPath: String
 }
 
+private struct LocalTerminalDaemonControlError: LocalizedError {
+    let key: String
+    let defaultValue: String
+
+    var errorDescription: String? {
+        Bundle.main.localizedString(forKey: key, value: defaultValue, table: nil)
+    }
+}
+
 struct TerminalRuntimeMetadata: Equatable {
     let ttyName: String?
     let currentDirectory: String?
@@ -6545,6 +6554,9 @@ struct TerminalRuntimeMetadata: Equatable {
 final class Workspace: Identifiable, ObservableObject {
     static let terminalScrollBarHiddenDidChangeNotification = Notification.Name(
         "cmux.workspaceTerminalScrollBarHiddenDidChange"
+    )
+    static let localTerminalDaemonWarmupDidChangeNotification = Notification.Name(
+        "cmux.localTerminalDaemonWarmupDidChange"
     )
 
     let id: UUID
@@ -6665,6 +6677,7 @@ final class Workspace: Identifiable, ObservableObject {
 
     private static let remoteErrorStatusKey = "remote.error"
     private static let remotePortConflictStatusKey = "remote.port_conflicts"
+    private static let localTerminalDaemonFallbackStatusKey = "local.terminal_daemon_starting"
     private static let remoteNotificationCooldown: TimeInterval = 5 * 60
     private static let sshControlMasterCleanupQueue = DispatchQueue(
         label: "com.cmux.remote-ssh.control-master-cleanup",
@@ -6678,8 +6691,21 @@ final class Workspace: Identifiable, ObservableObject {
     nonisolated(unsafe) static var runSSHControlMasterCommandOverrideForTesting: (([String]) -> Void)?
     nonisolated(unsafe) static var localTerminalLaunchConfigurationOverrideForTesting: ((LocalTerminalLaunchRequest) -> LocalTerminalLaunchConfiguration?)?
     nonisolated(unsafe) static var localTerminalStatusPayloadOverrideForTesting: ((String) -> [String: Any]?)?
+    nonisolated(unsafe) static var localTerminalBundledCLIPathOverrideForTesting: (() -> String?)?
+    nonisolated(unsafe) static var localTerminalSocketConnectivityOverrideForTesting: ((String) -> Bool)?
+    nonisolated(unsafe) static var localTerminalLaunchctlResultOverrideForTesting: (([String]) -> (status: Int32, stdout: Data, stderr: Data)?)?
     nonisolated(unsafe) private static let localTerminalDaemonLaunchLock = NSLock()
+    nonisolated(unsafe) private static let localTerminalDaemonControlQueue = DispatchQueue(
+        label: "com.cmux.local-terminal-daemon.control",
+        qos: .utility
+    )
+    nonisolated(unsafe) private static let localTerminalDaemonStartupStateLock = NSLock()
+    nonisolated(unsafe) private static var localTerminalDaemonStartupGroup: DispatchGroup?
+    nonisolated private static let localTerminalDaemonKickstartReadyTimeout: TimeInterval = 2.0
+    nonisolated private static let localTerminalDaemonBootstrapReadyTimeout: TimeInterval = 8.0
     private var panelShellActivityStates: [UUID: PanelShellActivityState] = [:]
+    private var localTerminalDaemonWarmupObserver: NSObjectProtocol?
+    private var localTerminalDaemonWarmupStatusVisible = false
     /// PIDs associated with agent status entries (e.g. claude_code), keyed by status key.
     /// Used for stale-session detection: if the PID is dead, the status entry is cleared.
     var agentPIDs: [String: pid_t] = [:]
@@ -7010,6 +7036,13 @@ final class Workspace: Identifiable, ObservableObject {
 
         // Set ourselves as delegate
         bonsplitController.delegate = self
+        localTerminalDaemonWarmupObserver = NotificationCenter.default.addObserver(
+            forName: Self.localTerminalDaemonWarmupDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshLocalTerminalDaemonWarmupStatus()
+        }
 
         // Ensure bonsplit has a focused pane and our didSelectTab handler runs for the
         // initial terminal. bonsplit's createTab selects internally but does not emit
@@ -7035,11 +7068,17 @@ final class Workspace: Identifiable, ObservableObject {
     deinit {
         activeRemoteSessionControllerID = nil
         remoteSessionController?.stop()
+        if let localTerminalDaemonWarmupObserver {
+            NotificationCenter.default.removeObserver(localTerminalDaemonWarmupObserver)
+        }
     }
 
-    private static func shouldUseLocalTerminalDaemon(
+    nonisolated private static func shouldUseLocalTerminalDaemon(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
+        if environment["CMUX_LOCAL_DAEMON_ALLOW_TESTING"] == "1" {
+            return true
+        }
         if environment["CMUX_LOCAL_DAEMON_DISABLE"] == "1" {
             return false
         }
@@ -7049,7 +7088,10 @@ final class Workspace: Identifiable, ObservableObject {
         return !SessionRestorePolicy.isRunningUnderAutomatedTests(environment: environment)
     }
 
-    private static func bundledCLIPath() -> String? {
+    nonisolated private static func bundledCLIPath() -> String? {
+        if let override = localTerminalBundledCLIPathOverrideForTesting {
+            return override()
+        }
         guard let bundledCLIURL = Bundle.main.resourceURL?.appendingPathComponent("bin/cmux", isDirectory: false),
               FileManager.default.isExecutableFile(atPath: bundledCLIURL.path) else {
             return nil
@@ -7057,12 +7099,29 @@ final class Workspace: Identifiable, ObservableObject {
         return bundledCLIURL.path
     }
 
-    private static func shortStableLocalDaemonIdentifier(for value: String) -> String {
+    nonisolated private static func shortStableLocalDaemonIdentifier(for value: String) -> String {
         let digest = SHA256.hash(data: Data(value.utf8))
         return digest.prefix(6).map { String(format: "%02x", $0) }.joined()
     }
 
-    static func localTerminalDaemonRegistrationForTesting(
+    nonisolated private static func localTerminalDaemonStateDirectory(instanceID: String) -> String {
+        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let candidate = appSupport.appendingPathComponent("cmux", isDirectory: true).path
+            let socketCandidate = URL(fileURLWithPath: candidate, isDirectory: true)
+                .appendingPathComponent("locald-\(instanceID).sock", isDirectory: false)
+                .path
+            if socketCandidate.utf8.count < 100 {
+                return candidate
+            }
+        }
+
+        let homeFallback = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent(".cmux", isDirectory: true)
+            .path
+        return homeFallback
+    }
+
+    nonisolated static func localTerminalDaemonRegistrationForTesting(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> LocalTerminalDaemonRegistration {
         let instanceSource = nonEmptyTrimmedString(environment["CMUX_LOCAL_DAEMON_INSTANCE"])
@@ -7073,15 +7132,9 @@ final class Workspace: Identifiable, ObservableObject {
             if let override = nonEmptyTrimmedString(environment["CMUX_LOCAL_DAEMON_SOCKET_PATH"]) {
                 return override
             }
-            if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-                let candidate = appSupport
-                    .appendingPathComponent("cmux/locald-\(instanceID).sock", isDirectory: false)
-                    .path
-                if candidate.utf8.count < 100 {
-                    return candidate
-                }
-            }
-            return "/tmp/cmux-locald-\(instanceID).sock"
+            return URL(fileURLWithPath: localTerminalDaemonStateDirectory(instanceID: instanceID), isDirectory: true)
+                .appendingPathComponent("locald-\(instanceID).sock", isDirectory: false)
+                .path
         }()
 
         let authTokenFilePath: String = {
@@ -7129,22 +7182,22 @@ final class Workspace: Identifiable, ObservableObject {
         )
     }
 
-    private static func localShellSingleQuoted(_ value: String) -> String {
+    nonisolated private static func localShellSingleQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 
-    private static func nonEmptyTrimmedString(_ value: String?) -> String? {
+    nonisolated private static func nonEmptyTrimmedString(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func nonEmptyPayloadString(_ object: Any?) -> String? {
+    nonisolated private static func nonEmptyPayloadString(_ object: Any?) -> String? {
         guard let value = object as? String else { return nil }
         return nonEmptyTrimmedString(value)
     }
 
-    static func localTerminalLaunchAgentPropertyListForTesting(
+    nonisolated static func localTerminalLaunchAgentPropertyListForTesting(
         registration: LocalTerminalDaemonRegistration,
         cliPath: String
     ) -> [String: Any] {
@@ -7166,7 +7219,7 @@ final class Workspace: Identifiable, ObservableObject {
         ]
     }
 
-    private static func localAttachCommand(
+    nonisolated private static func localAttachCommand(
         cliPath: String,
         socketPath: String,
         authTokenFilePath: String,
@@ -7177,7 +7230,24 @@ final class Workspace: Identifiable, ObservableObject {
             .joined(separator: " ")
     }
 
-    private static func canConnectToLocalDaemonSocket(_ socketPath: String) -> Bool {
+    nonisolated private static func isSafeLocalDaemonSocketPath(_ socketPath: String) -> Bool {
+        var socketInfo = stat()
+        guard stat(socketPath, &socketInfo) == 0 else {
+            return false
+        }
+        guard (socketInfo.st_mode & mode_t(S_IFMT)) == mode_t(S_IFSOCK) else {
+            return false
+        }
+        return socketInfo.st_uid == getuid()
+    }
+
+    nonisolated private static func canConnectToLocalDaemonSocket(_ socketPath: String) -> Bool {
+        if let override = localTerminalSocketConnectivityOverrideForTesting {
+            return override(socketPath)
+        }
+        guard isSafeLocalDaemonSocketPath(socketPath) else {
+            return false
+        }
         let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
         guard socketFD >= 0 else { return false }
         defer { Darwin.close(socketFD) }
@@ -7203,7 +7273,7 @@ final class Workspace: Identifiable, ObservableObject {
         return result == 0
     }
 
-    private static func waitForLocalDaemonSocket(_ socketPath: String, timeout: TimeInterval) -> Bool {
+    nonisolated private static func waitForLocalDaemonSocket(_ socketPath: String, timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if canConnectToLocalDaemonSocket(socketPath) {
@@ -7214,21 +7284,66 @@ final class Workspace: Identifiable, ObservableObject {
         return canConnectToLocalDaemonSocket(socketPath)
     }
 
-    private static func ensureLocalTerminalDaemonAuthTokenFile(_ path: String) -> Bool {
+    nonisolated private static func ensureLocalTerminalDaemonSecureDirectory(_ directoryPath: String) -> Bool {
         let fileManager = FileManager.default
-        let url = URL(fileURLWithPath: path)
+        let directoryURL = URL(fileURLWithPath: directoryPath, isDirectory: true)
         do {
             try fileManager.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
+                at: directoryURL,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
             )
+            chmod(directoryPath, 0o700)
         } catch {
             return false
         }
 
-        if let existing = try? String(contentsOf: url, encoding: .utf8)
+        var directoryInfo = stat()
+        guard stat(directoryPath, &directoryInfo) == 0 else {
+            return false
+        }
+        guard (directoryInfo.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
+            return false
+        }
+        guard directoryInfo.st_uid == getuid() else {
+            return false
+        }
+        return (directoryInfo.st_mode & 0o077) == 0
+    }
+
+    nonisolated private static func isValidLocalTerminalDaemonAuthTokenFile(_ path: String) -> Bool {
+        var tokenInfo = stat()
+        guard stat(path, &tokenInfo) == 0 else {
+            return false
+        }
+        guard (tokenInfo.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            return false
+        }
+        guard tokenInfo.st_uid == getuid() else {
+            return false
+        }
+        guard (tokenInfo.st_mode & 0o177) == 0 else {
+            return false
+        }
+        guard let existing = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines),
-           !existing.isEmpty {
+              !existing.isEmpty else {
+            return false
+        }
+        return true
+    }
+
+    nonisolated private static func ensureLocalTerminalDaemonAuthTokenFile(_ path: String) -> Bool {
+        let fileManager = FileManager.default
+        let url = URL(fileURLWithPath: path)
+        guard ensureLocalTerminalDaemonSecureDirectory(url.deletingLastPathComponent().path) else {
+            return false
+        }
+
+        if fileManager.fileExists(atPath: path) {
+            guard isValidLocalTerminalDaemonAuthTokenFile(path) else {
+                return false
+            }
             return true
         }
 
@@ -7243,13 +7358,13 @@ final class Workspace: Identifiable, ObservableObject {
         do {
             try data.write(to: url, options: .atomic)
             chmod(path, 0o600)
-            return true
+            return isValidLocalTerminalDaemonAuthTokenFile(path)
         } catch {
             return false
         }
     }
 
-    private static func writeLocalTerminalLaunchAgentPlist(
+    nonisolated private static func writeLocalTerminalLaunchAgentPlist(
         registration: LocalTerminalDaemonRegistration,
         cliPath: String
     ) -> Bool {
@@ -7271,10 +7386,11 @@ final class Workspace: Identifiable, ObservableObject {
                 at: plistURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            try FileManager.default.createDirectory(
-                at: URL(fileURLWithPath: registration.stdoutLogPath).deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
+            guard ensureLocalTerminalDaemonSecureDirectory(
+                URL(fileURLWithPath: registration.stdoutLogPath).deletingLastPathComponent().path
+            ) else {
+                return false
+            }
             if let existing = try? Data(contentsOf: plistURL), existing == plistData {
                 return true
             }
@@ -7286,25 +7402,180 @@ final class Workspace: Identifiable, ObservableObject {
         }
     }
 
-    private static func localTerminalLaunchctlTarget(label: String) -> String {
+    nonisolated private static func localTerminalLaunchctlTarget(label: String) -> String {
         "gui/\(getuid())/\(label)"
     }
 
-    private static func runLocalLaunchctl(
+    nonisolated private static func runLocalLaunchctl(
         arguments: [String],
         timeout: TimeInterval = 5.0
     ) -> (status: Int32, stdout: Data, stderr: Data)? {
-        runLocalTerminalCLI(cliPath: "/bin/launchctl", arguments: arguments, timeout: timeout)
+        if let override = localTerminalLaunchctlResultOverrideForTesting {
+            return override(arguments)
+        }
+        return runLocalTerminalCLI(cliPath: "/bin/launchctl", arguments: arguments, timeout: timeout)
     }
 
-    private static func isLocalTerminalLaunchAgentLoaded(label: String) -> Bool {
+    nonisolated private static func isLocalTerminalLaunchAgentLoaded(label: String) -> Bool {
         guard let result = runLocalLaunchctl(arguments: ["print", localTerminalLaunchctlTarget(label: label)], timeout: 2.0) else {
             return false
         }
         return result.status == 0
     }
 
-    private static func ensureLocalTerminalDaemonRunning(
+    nonisolated private static func localTerminalDaemonLaunchctlFailureMessage(
+        action: String,
+        result: (status: Int32, stdout: Data, stderr: Data)?
+    ) -> String {
+        guard let result else {
+            return "\(action) failed: launchctl invocation returned no result"
+        }
+        let stderr = String(data: result.stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stdout = String(data: result.stdout, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let detail = [stderr, stdout].first(where: { !$0.isEmpty }) ?? "exit status \(result.status)"
+        return "\(action) failed: \(detail)"
+    }
+
+    nonisolated private static func readLocalTerminalDaemonAuthToken(_ path: String) -> String? {
+        guard isValidLocalTerminalDaemonAuthTokenFile(path) else {
+            return nil
+        }
+        guard let token = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else {
+            return nil
+        }
+        return token
+    }
+
+    @MainActor
+    private func refreshLocalTerminalDaemonWarmupStatus() {
+        guard localTerminalDaemonWarmupStatusVisible else {
+            statusEntries.removeValue(forKey: Self.localTerminalDaemonFallbackStatusKey)
+            return
+        }
+
+        guard Self.isLocalTerminalDaemonStartupInFlight() else {
+            localTerminalDaemonWarmupStatusVisible = false
+            statusEntries.removeValue(forKey: Self.localTerminalDaemonFallbackStatusKey)
+            return
+        }
+
+        statusEntries[Self.localTerminalDaemonFallbackStatusKey] = SidebarStatusEntry(
+            key: Self.localTerminalDaemonFallbackStatusKey,
+            value: String(
+                localized: "status.localTerminalDaemon.starting",
+                defaultValue: "Local terminal daemon is still starting; this terminal will not survive app close."
+            ),
+            icon: "bolt.horizontal.circle",
+            color: nil,
+            priority: 40
+        )
+    }
+
+    static func localTerminalDaemonControlTitle() -> String {
+        String(
+            localized: "debug.menu.restartLocalTerminalDaemon",
+            defaultValue: "Restart Local Terminal Daemon…"
+        )
+    }
+
+    nonisolated static func localTerminalLaunchConfigurationForTesting(
+        request: LocalTerminalLaunchRequest,
+        environment: [String: String]
+    ) -> LocalTerminalLaunchConfiguration? {
+        resolveLocalTerminalLaunchConfiguration(request: request, environment: environment)
+    }
+
+    nonisolated static func startLocalTerminalDaemonInBackgroundIfNeeded(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        guard shouldUseLocalTerminalDaemon(environment: environment),
+              let cliPath = bundledCLIPath() else {
+            return
+        }
+        let registration = localTerminalDaemonRegistrationForTesting(environment: environment)
+        _ = localTerminalDaemonStartupGroup(cliPath: cliPath, registration: registration)
+    }
+
+    @discardableResult
+    nonisolated static func restartLocalTerminalDaemonFromApp(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> String {
+        guard shouldUseLocalTerminalDaemon(environment: environment) else {
+            throw LocalTerminalDaemonControlError(
+                key: "debug.localTerminalDaemon.error.disabled",
+                defaultValue: "Local terminal daemon is disabled in this environment."
+            )
+        }
+        guard let cliPath = bundledCLIPath() else {
+            throw LocalTerminalDaemonControlError(
+                key: "debug.localTerminalDaemon.error.missingCLI",
+                defaultValue: "Bundled cmux CLI not found."
+            )
+        }
+
+        let registration = localTerminalDaemonRegistrationForTesting(environment: environment)
+
+        localTerminalDaemonLaunchLock.lock()
+        defer { localTerminalDaemonLaunchLock.unlock() }
+
+        guard ensureLocalTerminalDaemonAuthTokenFile(registration.authTokenFilePath) else {
+            throw LocalTerminalDaemonControlError(
+                key: "debug.localTerminalDaemon.error.authToken",
+                defaultValue: "Failed to prepare local daemon auth token file."
+            )
+        }
+        guard writeLocalTerminalLaunchAgentPlist(registration: registration, cliPath: cliPath) else {
+            throw LocalTerminalDaemonControlError(
+                key: "debug.localTerminalDaemon.error.plist",
+                defaultValue: "Failed to write local daemon LaunchAgent plist."
+            )
+        }
+
+        let launchctlTarget = localTerminalLaunchctlTarget(label: registration.launchAgentLabel)
+        if isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
+            let bootoutResult = runLocalLaunchctl(arguments: ["bootout", launchctlTarget], timeout: 3.0)
+            if bootoutResult?.status != 0 && isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
+                throw LocalTerminalDaemonControlError(
+                    key: "debug.localTerminalDaemon.error.bootout",
+                    defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootout", result: bootoutResult)
+                )
+            }
+        }
+
+        let bootstrapResult = runLocalLaunchctl(
+            arguments: ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+            timeout: 3.0
+        )
+        if bootstrapResult?.status != 0 && !isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
+            throw LocalTerminalDaemonControlError(
+                key: "debug.localTerminalDaemon.error.bootstrap",
+                defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootstrap", result: bootstrapResult)
+            )
+        }
+
+        let kickstartResult = runLocalLaunchctl(arguments: ["kickstart", "-k", launchctlTarget], timeout: 3.0)
+        guard kickstartResult?.status == 0 else {
+            throw LocalTerminalDaemonControlError(
+                key: "debug.localTerminalDaemon.error.kickstart",
+                defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl kickstart", result: kickstartResult)
+            )
+        }
+
+        guard waitForLocalDaemonSocket(
+            registration.socketPath,
+            timeout: localTerminalDaemonBootstrapReadyTimeout
+        ) else {
+            throw LocalTerminalDaemonControlError(
+                key: "debug.localTerminalDaemon.error.notReady",
+                defaultValue: "Local terminal daemon did not become ready at \(registration.socketPath)."
+            )
+        }
+        return registration.socketPath
+    }
+
+    nonisolated private static func startLocalTerminalDaemonIfNeeded(
         cliPath: String,
         registration: LocalTerminalDaemonRegistration
     ) -> Bool {
@@ -7327,7 +7598,10 @@ final class Workspace: Identifiable, ObservableObject {
         let launchctlTarget = localTerminalLaunchctlTarget(label: registration.launchAgentLabel)
         if isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
             _ = runLocalLaunchctl(arguments: ["kickstart", "-k", launchctlTarget], timeout: 3.0)
-            if waitForLocalDaemonSocket(registration.socketPath, timeout: 1.5) {
+            if waitForLocalDaemonSocket(
+                registration.socketPath,
+                timeout: localTerminalDaemonKickstartReadyTimeout
+            ) {
                 return true
             }
             _ = runLocalLaunchctl(arguments: ["bootout", launchctlTarget], timeout: 3.0)
@@ -7338,10 +7612,51 @@ final class Workspace: Identifiable, ObservableObject {
             timeout: 3.0
         )
         _ = runLocalLaunchctl(arguments: ["kickstart", "-k", launchctlTarget], timeout: 3.0)
-        return waitForLocalDaemonSocket(registration.socketPath, timeout: 1.5)
+        return waitForLocalDaemonSocket(
+            registration.socketPath,
+            timeout: localTerminalDaemonBootstrapReadyTimeout
+        )
     }
 
-    private static func runLocalTerminalCLI(
+    nonisolated private static func localTerminalDaemonStartupGroup(
+        cliPath: String,
+        registration: LocalTerminalDaemonRegistration
+    ) -> DispatchGroup? {
+        if canConnectToLocalDaemonSocket(registration.socketPath) {
+            return nil
+        }
+
+        localTerminalDaemonStartupStateLock.lock()
+        if let existingGroup = localTerminalDaemonStartupGroup {
+            localTerminalDaemonStartupStateLock.unlock()
+            return existingGroup
+        }
+        let group = DispatchGroup()
+        localTerminalDaemonStartupGroup = group
+        localTerminalDaemonStartupStateLock.unlock()
+        NotificationCenter.default.post(name: localTerminalDaemonWarmupDidChangeNotification, object: nil)
+
+        group.enter()
+        localTerminalDaemonControlQueue.async {
+            _ = startLocalTerminalDaemonIfNeeded(cliPath: cliPath, registration: registration)
+            localTerminalDaemonStartupStateLock.lock()
+            if localTerminalDaemonStartupGroup === group {
+                localTerminalDaemonStartupGroup = nil
+            }
+            localTerminalDaemonStartupStateLock.unlock()
+            NotificationCenter.default.post(name: localTerminalDaemonWarmupDidChangeNotification, object: nil)
+            group.leave()
+        }
+        return group
+    }
+
+    nonisolated private static func isLocalTerminalDaemonStartupInFlight() -> Bool {
+        localTerminalDaemonStartupStateLock.lock()
+        defer { localTerminalDaemonStartupStateLock.unlock() }
+        return localTerminalDaemonStartupGroup != nil
+    }
+
+    nonisolated private static func runLocalTerminalCLI(
         cliPath: String,
         arguments: [String],
         timeout: TimeInterval = 5.0
@@ -7376,37 +7691,151 @@ final class Workspace: Identifiable, ObservableObject {
         return (process.terminationStatus, stdout, stderr)
     }
 
-    private static func runLocalTerminalDaemonRPC(
+    nonisolated private static func runLocalTerminalDaemonRPCDirect(
+        registration: LocalTerminalDaemonRegistration,
+        method: String,
+        params: [String: Any],
+        timeout: TimeInterval
+    ) -> [String: Any]? {
+        guard isSafeLocalDaemonSocketPath(registration.socketPath) else {
+            return nil
+        }
+        guard let authToken = readLocalTerminalDaemonAuthToken(registration.authTokenFilePath) else {
+            return nil
+        }
+
+        let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard socketFD >= 0 else { return nil }
+        defer { Darwin.close(socketFD) }
+
+#if os(macOS)
+        var noSigPipe: Int32 = 1
+        _ = withUnsafePointer(to: &noSigPipe) { ptr in
+            setsockopt(
+                socketFD,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                ptr,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+        }
+#endif
+
+        var address = sockaddr_un()
+        memset(&address, 0, MemoryLayout<sockaddr_un>.size)
+        address.sun_family = sa_family_t(AF_UNIX)
+        let utf8Bytes = Array(registration.socketPath.utf8CString)
+        let maxLength = MemoryLayout.size(ofValue: address.sun_path)
+        guard utf8Bytes.count <= maxLength else {
+            return nil
+        }
+        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+            let raw = UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self)
+            memset(raw, 0, maxLength)
+            for index in 0..<utf8Bytes.count {
+                raw[index] = utf8Bytes[index]
+            }
+        }
+        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path) ?? 0
+        let addressLength = socklen_t(pathOffset + utf8Bytes.count)
+#if os(macOS)
+        address.sun_len = UInt8(min(Int(addressLength), 255))
+#endif
+
+        var timeoutValue = timeval(
+            tv_sec: Int(timeout.rounded(.down)),
+            tv_usec: __darwin_suseconds_t((timeout.truncatingRemainder(dividingBy: 1) * 1_000_000).rounded())
+        )
+        _ = withUnsafePointer(to: &timeoutValue) {
+            setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, $0, socklen_t(MemoryLayout<timeval>.size))
+        }
+        _ = withUnsafePointer(to: &timeoutValue) {
+            setsockopt(socketFD, SOL_SOCKET, SO_SNDTIMEO, $0, socklen_t(MemoryLayout<timeval>.size))
+        }
+
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.connect(socketFD, sockaddrPointer, addressLength)
+            }
+        }
+        guard connected == 0 else { return nil }
+
+        let request: [String: Any] = [
+            "id": UUID().uuidString,
+            "method": method,
+            "params": params,
+            "auth_token": authToken,
+        ]
+        guard let payload = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]) else {
+            return nil
+        }
+
+        var frame = payload
+        frame.append(0x0A)
+        let wrote = frame.withUnsafeBytes { rawBuffer -> Bool in
+            guard let baseAddress = rawBuffer.baseAddress else { return false }
+            var remaining = rawBuffer.count
+            var offset = 0
+            while remaining > 0 {
+                let written = Darwin.write(socketFD, baseAddress.advanced(by: offset), remaining)
+                if written <= 0 {
+                    return false
+                }
+                remaining -= written
+                offset += written
+            }
+            return true
+        }
+        guard wrote else { return nil }
+
+        var bufferedData = Data()
+        while true {
+            if let newlineRange = bufferedData.firstRange(of: Data([0x0A])) {
+                let line = bufferedData.subdata(in: bufferedData.startIndex..<newlineRange.lowerBound)
+                guard let response = try? JSONSerialization.jsonObject(with: line, options: []) as? [String: Any],
+                      let ok = response["ok"] as? Bool, ok else {
+                    return nil
+                }
+                return response["result"] as? [String: Any]
+            }
+
+            var buffer = [UInt8](repeating: 0, count: 8192)
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+                return Darwin.read(socketFD, baseAddress, rawBuffer.count)
+            }
+            guard bytesRead > 0 else { return nil }
+            buffer.withUnsafeBufferPointer { pointer in
+                guard let baseAddress = pointer.baseAddress else { return }
+                bufferedData.append(baseAddress, count: bytesRead)
+            }
+        }
+    }
+
+    nonisolated private static func runLocalTerminalDaemonRPC(
         registration: LocalTerminalDaemonRegistration,
         method: String,
         params: [String: Any],
         timeout: TimeInterval = 5.0
     ) -> [String: Any]? {
-        guard let cliPath = bundledCLIPath(),
-              ensureLocalTerminalDaemonRunning(cliPath: cliPath, registration: registration),
+        guard canConnectToLocalDaemonSocket(registration.socketPath) else {
+            startLocalTerminalDaemonInBackgroundIfNeeded()
+            return nil
+        }
+        guard
               JSONSerialization.isValidJSONObject(params),
-              let jsonData = try? JSONSerialization.data(withJSONObject: params, options: []),
-              let json = String(data: jsonData, encoding: .utf8),
-              let result = runLocalTerminalCLI(
-                cliPath: cliPath,
-                arguments: [
-                    "local-daemon",
-                    "rpc",
-                    "--socket", registration.socketPath,
-                    "--auth-token-file", registration.authTokenFilePath,
-                    method,
-                    json,
-                ],
+              let object = runLocalTerminalDaemonRPCDirect(
+                registration: registration,
+                method: method,
+                params: params,
                 timeout: timeout
-              ),
-              result.status == 0,
-              let object = try? JSONSerialization.jsonObject(with: result.stdout, options: []) as? [String: Any] else {
+              ) else {
             return nil
         }
         return object
     }
 
-    private static func localTerminalStatusPayload(sessionID: String) -> [String: Any]? {
+    nonisolated private static func localTerminalStatusPayload(sessionID: String) -> [String: Any]? {
         if let override = localTerminalStatusPayloadOverrideForTesting {
             return override(sessionID)
         }
@@ -7418,21 +7847,42 @@ final class Workspace: Identifiable, ObservableObject {
         )
     }
 
-    private static func resolveLocalTerminalLaunchConfiguration(
-        request: LocalTerminalLaunchRequest
+    nonisolated private static func resolveLocalTerminalLaunchConfiguration(
+        request: LocalTerminalLaunchRequest,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> LocalTerminalLaunchConfiguration? {
         if let override = localTerminalLaunchConfigurationOverrideForTesting {
             return override(request)
         }
 
-        guard shouldUseLocalTerminalDaemon() else {
+        guard shouldUseLocalTerminalDaemon(environment: environment) else {
             return nil
         }
 
-        let registration = localTerminalDaemonRegistrationForTesting()
+        guard let cliPath = bundledCLIPath() else {
+            return nil
+        }
+        let registration = localTerminalDaemonRegistrationForTesting(environment: environment)
+        let bestEffortAttachConfiguration = { (sessionID: String) in
+            LocalTerminalLaunchConfiguration(
+                sessionID: sessionID,
+                initialCommand: localAttachCommand(
+                    cliPath: cliPath,
+                    socketPath: registration.socketPath,
+                    authTokenFilePath: registration.authTokenFilePath,
+                    sessionID: sessionID
+                ),
+                daemonSocketPath: registration.socketPath,
+                daemonAuthTokenFilePath: registration.authTokenFilePath
+            )
+        }
 
         switch request.mode {
         case .create:
+            guard canConnectToLocalDaemonSocket(registration.socketPath) else {
+                startLocalTerminalDaemonInBackgroundIfNeeded(environment: environment)
+                return nil
+            }
             let sessionID = UUID().uuidString
             var params: [String: Any] = [
                 "session_id": sessionID,
@@ -7453,8 +7903,7 @@ final class Workspace: Identifiable, ObservableObject {
                 method: "session.open",
                 params: params
             ),
-            let resolvedSessionID = openResult["session_id"] as? String,
-            let cliPath = bundledCLIPath() else {
+            let resolvedSessionID = openResult["session_id"] as? String else {
                 return nil
             }
             return LocalTerminalLaunchConfiguration(
@@ -7470,28 +7919,22 @@ final class Workspace: Identifiable, ObservableObject {
             )
 
         case .attachExisting(let sessionID):
-            guard canConnectToLocalDaemonSocket(registration.socketPath),
-                  let statusResult = runLocalTerminalDaemonRPC(
+            guard canConnectToLocalDaemonSocket(registration.socketPath) else {
+                startLocalTerminalDaemonInBackgroundIfNeeded(environment: environment)
+                return bestEffortAttachConfiguration(sessionID)
+            }
+            guard let statusResult = runLocalTerminalDaemonRPC(
                     registration: registration,
                     method: "session.status",
                     params: ["session_id": sessionID]
-                  ),
-                  let state = statusResult["state"] as? String,
-                  state == "running",
-                  let cliPath = bundledCLIPath() else {
+                  ) else {
+                return bestEffortAttachConfiguration(sessionID)
+            }
+            guard let state = statusResult["state"] as? String,
+                  state == "running" else {
                 return nil
             }
-            return LocalTerminalLaunchConfiguration(
-                sessionID: sessionID,
-                initialCommand: localAttachCommand(
-                    cliPath: cliPath,
-                    socketPath: registration.socketPath,
-                    authTokenFilePath: registration.authTokenFilePath,
-                    sessionID: sessionID
-                ),
-                daemonSocketPath: registration.socketPath,
-                daemonAuthTokenFilePath: registration.authTokenFilePath
-            )
+            return bestEffortAttachConfiguration(sessionID)
         }
     }
 
@@ -7723,6 +8166,31 @@ final class Workspace: Identifiable, ObservableObject {
                 )
             }
         }()
+        let shouldShowLocalDaemonWarmupStatus: Bool = {
+            guard localDaemonEligible,
+                  launchConfiguration == nil,
+                  Self.shouldUseLocalTerminalDaemon(),
+                  Self.isLocalTerminalDaemonStartupInFlight() else {
+                return false
+            }
+            switch localTerminalMode {
+            case .auto:
+                return true
+            case .disabled, .attachExisting:
+                return false
+            }
+        }()
+
+        if launchConfiguration != nil {
+            localTerminalDaemonWarmupStatusVisible = false
+            refreshLocalTerminalDaemonWarmupStatus()
+        } else if shouldShowLocalDaemonWarmupStatus {
+            localTerminalDaemonWarmupStatusVisible = true
+            refreshLocalTerminalDaemonWarmupStatus()
+        } else if !Self.isLocalTerminalDaemonStartupInFlight() {
+            localTerminalDaemonWarmupStatusVisible = false
+            refreshLocalTerminalDaemonWarmupStatus()
+        }
 
         if case .attachExisting = localTerminalMode, launchConfiguration == nil {
             return nil

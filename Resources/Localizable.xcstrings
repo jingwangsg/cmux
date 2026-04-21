@@ -1380,6 +1380,227 @@
         }
       }
     },
+    "debug.localTerminalDaemon.error.authToken": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Failed to prepare local daemon auth token file."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルデーモンの認証トークンファイルを準備できませんでした。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.error.bootstrap": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "launchctl bootstrap failed."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "launchctl bootstrap に失敗しました。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.error.bootout": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "launchctl bootout failed."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "launchctl bootout に失敗しました。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.error.disabled": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Local terminal daemon is disabled in this environment."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この環境ではローカルターミナルデーモンが無効です。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.error.kickstart": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "launchctl kickstart failed."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "launchctl kickstart に失敗しました。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.error.missingCLI": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bundled cmux CLI not found."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "同梱の cmux CLI が見つかりません。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.error.notReady": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Local terminal daemon did not become ready."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルターミナルデーモンの準備が完了しませんでした。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.error.plist": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Failed to write local daemon LaunchAgent plist."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルデーモンの LaunchAgent plist を書き込めませんでした。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.restartConfirm.confirm": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restart"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "再起動"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.restartConfirm.message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restarting the local terminal daemon will drop detached local terminal sessions. Continue only if the daemon is stuck or you need to recover the control plane."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルターミナルデーモンを再起動すると、切り離したローカルターミナルセッションは失われます。デーモンが停止した場合や制御プレーンの復旧が必要な場合のみ続行してください。"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.restartConfirm.title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restart Local Terminal Daemon?"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルターミナルデーモンを再起動しますか？"
+          }
+        }
+      }
+    },
+    "debug.localTerminalDaemon.restartFailed.title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Failed to Restart Local Terminal Daemon"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルターミナルデーモンを再起動できませんでした"
+          }
+        }
+      }
+    },
+    "debug.menu.restartLocalTerminalDaemon": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restart Local Terminal Daemon…"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルターミナルデーモンを再起動…"
+          }
+        }
+      }
+    },
     "sidebar.help.button": {
       "extractionState": "manual",
       "localizations": {
@@ -54547,6 +54768,74 @@
         }
       }
     },
+    "settings.automation.localTerminalDaemon": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Local Terminal Daemon"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルターミナルデーモン"
+          }
+        }
+      }
+    },
+    "settings.automation.localTerminalDaemon.note": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Closing the app acts as detach for local daemon-backed terminals. Restarting the daemon is a recovery action and will drop detached local terminal sessions."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アプリを閉じると、ローカルデーモン管理下のターミナルは切り離し扱いになります。デーモンの再起動は復旧用であり、切り離したローカルターミナルセッションは失われます。"
+          }
+        }
+      }
+    },
+    "settings.automation.localTerminalDaemon.statusManaged": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "launchd"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "launchd"
+          }
+        }
+      }
+    },
+    "settings.automation.localTerminalDaemon.subtitle": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keeps local terminal sessions alive after the app closes so reopening can reattach them. Restart only for recovery."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アプリを閉じたあともローカルターミナルセッションを保持し、再度開いたときに再接続できるようにします。再起動は復旧時のみ使ってください。"
+          }
+        }
+      }
+    },
     "settings.automation.claudeCode.customPath": {
       "extractionState": "manual",
       "localizations": {
@@ -75241,6 +75530,23 @@
           "stringUnit": {
             "state": "translated",
             "value": "Позначити все як прочитане"
+          }
+        }
+      }
+    },
+    "status.localTerminalDaemon.starting": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Local terminal daemon is still starting; this terminal will not survive app close."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルターミナルデーモンはまだ起動中です。このターミナルはアプリを閉じると保持されません。"
           }
         }
       }

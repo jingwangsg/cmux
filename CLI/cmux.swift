@@ -15214,11 +15214,13 @@ private final class LocalTerminalDaemonServer {
     }
 
     private func prepareListener() throws {
+        let socketDirectoryURL = URL(fileURLWithPath: configuration.socketPath).deletingLastPathComponent()
         try FileManager.default.createDirectory(
-            at: URL(fileURLWithPath: configuration.socketPath).deletingLastPathComponent(),
+            at: socketDirectoryURL,
             withIntermediateDirectories: true,
-            attributes: nil
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
         )
+        chmod(socketDirectoryURL.path, 0o700)
         unlink(configuration.socketPath)
 
         listenerFD = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -15568,6 +15570,9 @@ private final class LocalTerminalDaemonClient {
         if fileDescriptor >= 0 {
             return
         }
+        guard LocalTerminalDaemonTool.isSafeSocketPath(socketPath) else {
+            throw CLIError(message: "Socket at \(socketPath) is missing, unsafe, or not owned by the current user")
+        }
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
@@ -15769,14 +15774,15 @@ private struct LocalTerminalDaemonTool {
     }
 
     fileprivate static func defaultSocketPath() -> String {
-        let uid = getuid()
         if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
             let candidate = appSupport.appendingPathComponent("cmux/cmuxd-local.sock").path
             if candidate.utf8.count < 100 {
                 return candidate
             }
         }
-        return "/tmp/cmuxd-local-\(uid).sock"
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent(".cmux/cmuxd-local.sock", isDirectory: false)
+            .path
     }
 
     fileprivate static func defaultAuthTokenFilePath(forSocketPath socketPath: String) -> String {
@@ -15796,12 +15802,43 @@ private struct LocalTerminalDaemonTool {
 
     fileprivate static func readAuthToken(filePath: String) throws -> String {
         let fileURL = URL(fileURLWithPath: filePath)
+        var tokenInfo = stat()
+        guard stat(filePath, &tokenInfo) == 0 else {
+            throw CLIError(message: "Missing or invalid local daemon auth token file at \(filePath)")
+        }
+        guard (tokenInfo.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              tokenInfo.st_uid == getuid(),
+              (tokenInfo.st_mode & 0o177) == 0 else {
+            throw CLIError(message: "Local daemon auth token file at \(filePath) is not a private file owned by the current user")
+        }
         guard let token = try? String(contentsOf: fileURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !token.isEmpty else {
             throw CLIError(message: "Missing or invalid local daemon auth token file at \(filePath)")
         }
         return token
+    }
+
+    fileprivate static func isSafeSocketPath(_ socketPath: String) -> Bool {
+        var socketInfo = stat()
+        guard stat(socketPath, &socketInfo) == 0 else {
+            return false
+        }
+        guard (socketInfo.st_mode & mode_t(S_IFMT)) == mode_t(S_IFSOCK) else {
+            return false
+        }
+        return socketInfo.st_uid == getuid()
+    }
+
+    fileprivate static func waitForSafeSocketPath(path: String, timeout: TimeInterval) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if isSafeSocketPath(path) {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        throw CLIError(message: "Timed out waiting for a safe local daemon socket at \(path)")
     }
 
     private func localDaemonUsageText() -> String {
@@ -15867,6 +15904,10 @@ private struct LocalTerminalAttachTool {
         guard let sessionID, !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CLIError(message: "local-attach requires --session <id>")
         }
+
+        try LocalTerminalDaemonTool.waitForSafeSocketPath(path: socketPath, timeout: 10)
+        let probeClient = try SocketClient.waitForConnectableSocket(path: socketPath, timeout: 10)
+        probeClient.close()
 
         let client = try LocalTerminalDaemonClient(
             socketPath: socketPath,

@@ -2193,6 +2193,9 @@ func shouldSuppressWindowMoveForFolderDrag(window: NSWindow, event: NSEvent) -> 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSMenuItemValidation {
     nonisolated(unsafe) static var shared: AppDelegate?
+    nonisolated(unsafe) static var localTerminalDaemonRestartConfirmationOverrideForTesting: (() -> Bool)?
+    nonisolated(unsafe) static var localTerminalDaemonRestartOperationOverrideForTesting: (() throws -> String)?
+    nonisolated(unsafe) static var localTerminalDaemonRestartFailureHandlerOverrideForTesting: ((String) -> Void)?
 
     private static let cachedIsRunningUnderXCTest = detectRunningUnderXCTest(ProcessInfo.processInfo.environment)
 
@@ -7350,6 +7353,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return
         }
         restartSocketListenerIfEnabled(source: "menu.command")
+    }
+
+    private func confirmLocalTerminalDaemonRestart() -> Bool {
+        if let override = Self.localTerminalDaemonRestartConfirmationOverrideForTesting {
+            return override()
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = String(
+            localized: "debug.localTerminalDaemon.restartConfirm.title",
+            defaultValue: "Restart Local Terminal Daemon?"
+        )
+        alert.informativeText = String(
+            localized: "debug.localTerminalDaemon.restartConfirm.message",
+            defaultValue: "Restarting the local terminal daemon will drop detached local terminal sessions. Continue only if the daemon is stuck or you need to recover the control plane."
+        )
+        alert.addButton(withTitle: String(localized: "debug.localTerminalDaemon.restartConfirm.confirm", defaultValue: "Restart"))
+        alert.addButton(withTitle: String(localized: "common.cancel", defaultValue: "Cancel"))
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func performLocalTerminalDaemonRestart(
+        restartOperation: @escaping () throws -> String
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let socketPath = try restartOperation()
+                NSLog("Local terminal daemon ready at %@", socketPath)
+            } catch {
+                let message = error.localizedDescription
+                DispatchQueue.main.async { [weak self] in
+                    if let handler = Self.localTerminalDaemonRestartFailureHandlerOverrideForTesting {
+                        handler(message)
+                        return
+                    }
+
+                    self?.presentCLIPathAlert(
+                        title: String(
+                            localized: "debug.localTerminalDaemon.restartFailed.title",
+                            defaultValue: "Failed to Restart Local Terminal Daemon"
+                        ),
+                        informativeText: message,
+                        style: .warning
+                    )
+                }
+            }
+        }
+    }
+
+    @objc func restartLocalTerminalDaemon(_ sender: Any?) {
+        guard confirmLocalTerminalDaemonRestart() else { return }
+        performLocalTerminalDaemonRestart {
+            if let override = Self.localTerminalDaemonRestartOperationOverrideForTesting {
+                return try override()
+            }
+            return try Workspace.restartLocalTerminalDaemonFromApp()
+        }
     }
 
     private func setupMenuBarExtra() {

@@ -152,6 +152,7 @@ enum UITestLaunchManifest {
 
 @main
 struct cmuxApp: App {
+    nonisolated(unsafe) static var localTerminalDaemonWarmupOverrideForTesting: (() -> Void)?
     @StateObject private var tabManager: TabManager
     @StateObject private var notificationStore = TerminalNotificationStore.shared
     @StateObject private var sidebarState = SidebarState()
@@ -210,6 +211,14 @@ struct cmuxApp: App {
             SocketControlPasswordStore.migrateLegacyKeychainPasswordIfNeeded(defaults: defaults)
         }
         migrateSidebarAppearanceDefaultsIfNeeded(defaults: defaults)
+
+        // Warm the local terminal daemon off-main so first restore / new-terminal
+        // paths don't have to block on launchctl startup.
+        if let override = Self.localTerminalDaemonWarmupOverrideForTesting {
+            override()
+        } else {
+            Workspace.startLocalTerminalDaemonInBackgroundIfNeeded()
+        }
 
         // UI tests depend on AppDelegate wiring happening even if SwiftUI view appearance
         // callbacks (e.g. `.onAppear`) are delayed or skipped.
@@ -481,6 +490,10 @@ struct cmuxApp: App {
                     )
                 ) {
                     appDelegate.openDebugStressWorkspacesWithLoadedSurfaces(nil)
+                }
+
+                Button(Workspace.localTerminalDaemonControlTitle()) {
+                    appDelegate.restartLocalTerminalDaemon(nil)
                 }
 
                 Divider()
@@ -4489,6 +4502,55 @@ struct SettingsView: View {
     @State private var workspaceTabPaletteEntries = WorkspaceTabColorSettings.palette()
     @State private var trustedDirectoriesDraft: String = CmuxDirectoryTrust.shared.allTrustedPaths.joined(separator: "\n")
 
+    private var appDelegateBridge: AppDelegate? {
+        NSApp.delegate as? AppDelegate
+    }
+
+    @ViewBuilder
+    private var localTerminalDaemonSettingsCard: some View {
+        SettingsCard {
+            SettingsCardRow(
+                configurationReview: .action,
+                String(
+                    localized: "settings.automation.localTerminalDaemon",
+                    defaultValue: "Local Terminal Daemon"
+                ),
+                subtitle: String(
+                    localized: "settings.automation.localTerminalDaemon.subtitle",
+                    defaultValue: "Keeps local terminal sessions alive after the app closes so reopening can reattach them. Restart only for recovery."
+                )
+            ) {
+                HStack(spacing: 8) {
+                    Text(
+                        String(
+                            localized: "settings.automation.localTerminalDaemon.statusManaged",
+                            defaultValue: "launchd"
+                        )
+                    )
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 60, alignment: .trailing)
+
+                    Button(Workspace.localTerminalDaemonControlTitle()) {
+                        appDelegateBridge?.restartLocalTerminalDaemon(nil)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("SettingsLocalTerminalDaemonButton")
+                }
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardNote(
+                String(
+                    localized: "settings.automation.localTerminalDaemon.note",
+                    defaultValue: "Closing the app acts as detach for local daemon-backed terminals. Restarting the daemon is a recovery action and will drop detached local terminal sessions."
+                )
+            )
+        }
+    }
+
     private var selectedWorkspacePlacement: NewWorkspacePlacement {
         NewWorkspacePlacement(rawValue: newWorkspacePlacement) ?? WorkspacePlacementSettings.defaultPlacement
     }
@@ -5842,6 +5904,8 @@ struct SettingsView: View {
                         }
                         SettingsCardNote(String(localized: "settings.automation.socketOverrides.note", defaultValue: "Overrides: CMUX_SOCKET_ENABLE, CMUX_SOCKET_MODE, and CMUX_SOCKET_PATH (set CMUX_ALLOW_SOCKET_OVERRIDE=1 for stable/nightly builds)."))
                     }
+
+                    localTerminalDaemonSettingsCard
 
                     SettingsCard {
                         SettingsCardRow(

@@ -2335,6 +2335,11 @@ final class WorkspaceTeardownTests: XCTestCase {
 
 @MainActor
 final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
+    private struct FakeLocalTerminalDaemonServerResult {
+        let request: [String: Any]
+        let handlerCalled: Bool
+    }
+
     private func waitForCondition(
         timeout: TimeInterval = 2,
         pollInterval: TimeInterval = 0.01,
@@ -2375,6 +2380,147 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
             "Expected runtime surface to materialize after hosting panel in a window"
         )
         return window
+    }
+
+    private func makeExecutableFile(named name: String, in directory: URL) throws -> String {
+        let executableURL = directory.appendingPathComponent(name, isDirectory: false)
+        try "#!/bin/sh\nexit 0\n".write(to: executableURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: executableURL.path
+        )
+        return executableURL.path
+    }
+
+    private func withFakeLocalTerminalDaemonServer(
+        socketPath: String,
+        responseResult: [String: Any],
+        body: () throws -> Void
+    ) throws -> FakeLocalTerminalDaemonServerResult {
+        let listenerFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(listenerFD, 0, "Expected to create test daemon listener")
+        defer {
+            if listenerFD >= 0 {
+                Darwin.close(listenerFD)
+            }
+            unlink(socketPath)
+        }
+
+        unlink(socketPath)
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: socketPath).deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        var address = sockaddr_un()
+        memset(&address, 0, MemoryLayout<sockaddr_un>.size)
+        address.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(socketPath.utf8CString)
+        let maxLength = MemoryLayout.size(ofValue: address.sun_path)
+        XCTAssertLessThanOrEqual(pathBytes.count, maxLength, "Expected socket path to fit sockaddr_un")
+        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+            let raw = UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self)
+            memset(raw, 0, maxLength)
+            for index in 0..<pathBytes.count {
+                raw[index] = pathBytes[index]
+            }
+        }
+        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path) ?? 0
+        let addressLength = socklen_t(pathOffset + pathBytes.count)
+#if os(macOS)
+        address.sun_len = UInt8(min(Int(addressLength), 255))
+#endif
+
+        let bindResult = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.bind(listenerFD, sockaddrPointer, addressLength)
+            }
+        }
+        XCTAssertEqual(bindResult, 0, "Expected test daemon socket bind to succeed")
+        XCTAssertEqual(listen(listenerFD, 1), 0, "Expected test daemon socket listen to succeed")
+
+        let handledExpectation = expectation(description: "fake local daemon handled request")
+        let requestLock = NSLock()
+        var capturedRequest: [String: Any] = [:]
+        var handlerCalled = false
+        let queue = DispatchQueue(label: "cmux.tests.local-daemon-server")
+        queue.async {
+            for _ in 0..<4 {
+                let clientFD = Darwin.accept(listenerFD, nil, nil)
+                guard clientFD >= 0 else { return }
+
+                var timeoutValue = timeval(tv_sec: 0, tv_usec: 200_000)
+                _ = withUnsafePointer(to: &timeoutValue) {
+                    setsockopt(
+                        clientFD,
+                        SOL_SOCKET,
+                        SO_RCVTIMEO,
+                        $0,
+                        socklen_t(MemoryLayout<timeval>.size)
+                    )
+                }
+
+                var requestData = Data()
+                while true {
+                    var buffer = [UInt8](repeating: 0, count: 4096)
+                    let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                        guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+                        return Darwin.read(clientFD, baseAddress, rawBuffer.count)
+                    }
+                    guard bytesRead > 0 else { break }
+                    buffer.withUnsafeBufferPointer { pointer in
+                        guard let baseAddress = pointer.baseAddress else { return }
+                        requestData.append(baseAddress, count: bytesRead)
+                    }
+                    if requestData.contains(0x0A) {
+                        break
+                    }
+                }
+
+                guard !requestData.isEmpty else {
+                    Darwin.close(clientFD)
+                    continue
+                }
+
+                if let newlineIndex = requestData.firstIndex(of: 0x0A) {
+                    requestData = Data(requestData.prefix(upTo: newlineIndex))
+                }
+
+                let requestObject = (try? JSONSerialization.jsonObject(with: requestData)) as? [String: Any] ?? [:]
+                requestLock.lock()
+                capturedRequest = requestObject
+                handlerCalled = true
+                requestLock.unlock()
+
+                let requestID = (requestObject["id"] as? String) ?? UUID().uuidString
+                let response: [String: Any] = [
+                    "id": requestID,
+                    "ok": true,
+                    "result": responseResult,
+                ]
+                let responseData = (try? JSONSerialization.data(withJSONObject: response, options: [.sortedKeys])) ?? Data()
+                _ = responseData.withUnsafeBytes { rawBuffer in
+                    guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+                    return Darwin.write(clientFD, baseAddress, rawBuffer.count)
+                }
+                let newline: [UInt8] = [0x0A]
+                _ = newline.withUnsafeBytes { rawBuffer in
+                    guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+                    return Darwin.write(clientFD, baseAddress, rawBuffer.count)
+                }
+                Darwin.close(clientFD)
+                handledExpectation.fulfill()
+                return
+            }
+        }
+
+        try body()
+        wait(for: [handledExpectation], timeout: 2.0)
+        requestLock.lock()
+        let result = FakeLocalTerminalDaemonServerResult(request: capturedRequest, handlerCalled: handlerCalled)
+        requestLock.unlock()
+        return result
     }
 
     func testNewTerminalSplitFallsBackToRequestedWorkingDirectoryWhenReportedDirectoryIsStale() {
@@ -2612,6 +2758,394 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
                 "--auth-token-file", "/tmp/cmux-phase1.auth",
                 "--retained-bytes", "131072",
                 "--cold-attach-tail-bytes", "32768",
+            ]
+        )
+    }
+
+    func testLocalTerminalLaunchConfigurationUsesDirectSocketRPCForCreateRequests() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-direct-rpc-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true, attributes: nil)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        try "test-auth-token\n".write(
+            to: URL(fileURLWithPath: authTokenFilePath),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+        }
+
+        let request = LocalTerminalLaunchRequest(
+            panelID: UUID(),
+            mode: .create,
+            requestedWorkingDirectory: "/tmp/direct-rpc-working-directory",
+            requestedCommand: "echo direct-rpc",
+            requestedEnvironment: [
+                "CUSTOM_ENV": "custom-value",
+                "TERM": "xterm-256color",
+            ]
+        )
+        let environment = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-direct-rpc-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+
+        let serverResult = try withFakeLocalTerminalDaemonServer(
+            socketPath: socketPath,
+            responseResult: ["session_id": "direct-session-id"]
+        ) {
+            let launchConfiguration = Workspace.localTerminalLaunchConfigurationForTesting(
+                request: request,
+                environment: environment
+            )
+            XCTAssertEqual(launchConfiguration?.sessionID, "direct-session-id")
+            XCTAssertEqual(launchConfiguration?.daemonSocketPath, socketPath)
+            XCTAssertEqual(launchConfiguration?.daemonAuthTokenFilePath, authTokenFilePath)
+            XCTAssertEqual(
+                launchConfiguration?.initialCommand,
+                "'\(cliPath)' 'local-attach' '--socket' '\(socketPath)' '--auth-token-file' '\(authTokenFilePath)' '--session' 'direct-session-id'"
+            )
+        }
+
+        XCTAssertTrue(serverResult.handlerCalled)
+        XCTAssertEqual(serverResult.request["method"] as? String, "session.open")
+        XCTAssertEqual(serverResult.request["auth_token"] as? String, "test-auth-token")
+        guard let params = serverResult.request["params"] as? [String: Any] else {
+            XCTFail("Expected daemon RPC params")
+            return
+        }
+        XCTAssertEqual(params["working_directory"] as? String, "/tmp/direct-rpc-working-directory")
+        XCTAssertEqual(params["command"] as? String, "echo direct-rpc")
+        XCTAssertEqual(params["cols"] as? Int, 80)
+        XCTAssertEqual(params["rows"] as? Int, 24)
+        XCTAssertEqual((params["environment"] as? [String: String])?["CUSTOM_ENV"], "custom-value")
+    }
+
+    func testLocalTerminalLaunchConfigurationRecoversLoadedDaemonWithKickstartBeforeAttach() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-kickstart-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true, attributes: nil)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        try "kickstart-auth-token\n".write(
+            to: URL(fileURLWithPath: authTokenFilePath),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let environment = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-kickstart-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+        let registration = Workspace.localTerminalDaemonRegistrationForTesting(environment: environment)
+        let request = LocalTerminalLaunchRequest(
+            panelID: UUID(),
+            mode: .attachExisting("existing-session-id"),
+            requestedWorkingDirectory: nil,
+            requestedCommand: nil,
+            requestedEnvironment: [:]
+        )
+
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        var commands: [[String]] = []
+        var connectable = false
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return connectable
+        }
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            commands.append(arguments)
+            switch arguments.first {
+            case "print":
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "kickstart":
+                connectable = true
+                return (status: 0, stdout: Data(), stderr: Data())
+            default:
+                return (status: 0, stdout: Data(), stderr: Data())
+            }
+        }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        let serverResult = try withFakeLocalTerminalDaemonServer(
+            socketPath: socketPath,
+            responseResult: [
+                "session_id": "existing-session-id",
+                "state": "running",
+            ]
+        ) {
+            let launchConfiguration = Workspace.localTerminalLaunchConfigurationForTesting(
+                request: request,
+                environment: environment
+            )
+            XCTAssertEqual(launchConfiguration?.sessionID, "existing-session-id")
+            XCTAssertEqual(launchConfiguration?.daemonSocketPath, socketPath)
+        }
+
+        XCTAssertEqual(
+            commands,
+            [
+                ["print", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["kickstart", "-k", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+            ]
+        )
+        XCTAssertEqual(serverResult.request["method"] as? String, "session.status")
+        XCTAssertEqual(serverResult.request["auth_token"] as? String, "kickstart-auth-token")
+    }
+
+    func testLocalTerminalLaunchConfigurationBootsOutLoadedDaemonWhenKickstartDoesNotRecoverSocket() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-bootout-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true, attributes: nil)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        try "bootout-auth-token\n".write(
+            to: URL(fileURLWithPath: authTokenFilePath),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let environment = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-bootout-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+        let registration = Workspace.localTerminalDaemonRegistrationForTesting(environment: environment)
+        let request = LocalTerminalLaunchRequest(
+            panelID: UUID(),
+            mode: .attachExisting("bootout-session-id"),
+            requestedWorkingDirectory: nil,
+            requestedCommand: nil,
+            requestedEnvironment: [:]
+        )
+
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        var commands: [[String]] = []
+        var connectable = false
+        var kickstartCount = 0
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return connectable
+        }
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            commands.append(arguments)
+            switch arguments.first {
+            case "print":
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "kickstart":
+                kickstartCount += 1
+                if kickstartCount >= 2 {
+                    connectable = true
+                }
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "bootout":
+                connectable = false
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "bootstrap":
+                return (status: 0, stdout: Data(), stderr: Data())
+            default:
+                return (status: 0, stdout: Data(), stderr: Data())
+            }
+        }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        let serverResult = try withFakeLocalTerminalDaemonServer(
+            socketPath: socketPath,
+            responseResult: [
+                "session_id": "bootout-session-id",
+                "state": "running",
+            ]
+        ) {
+            let launchConfiguration = Workspace.localTerminalLaunchConfigurationForTesting(
+                request: request,
+                environment: environment
+            )
+            XCTAssertEqual(launchConfiguration?.sessionID, "bootout-session-id")
+            XCTAssertEqual(launchConfiguration?.daemonSocketPath, socketPath)
+        }
+
+        XCTAssertEqual(
+            commands,
+            [
+                ["print", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["kickstart", "-k", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["bootout", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+                ["kickstart", "-k", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+            ]
+        )
+        XCTAssertEqual(serverResult.request["method"] as? String, "session.status")
+        XCTAssertEqual(serverResult.request["auth_token"] as? String, "bootout-auth-token")
+    }
+
+    func testRestartLocalTerminalDaemonFromAppBootsOutAndBootstrapsLaunchAgent() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-restart-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let env = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-restart-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+        let registration = Workspace.localTerminalDaemonRegistrationForTesting(environment: env)
+
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+
+        var commands: [[String]] = []
+        var loaded = true
+        var connectable = false
+
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return connectable
+        }
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            commands.append(arguments)
+            switch arguments.first {
+            case "print":
+                return (status: loaded ? 0 : 1, stdout: Data(), stderr: Data())
+            case "bootout":
+                loaded = false
+                connectable = false
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "bootstrap":
+                loaded = true
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "kickstart":
+                connectable = true
+                return (status: 0, stdout: Data(), stderr: Data())
+            default:
+                return (status: 0, stdout: Data(), stderr: Data())
+            }
+        }
+        defer {
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        let resolvedSocketPath = try Workspace.restartLocalTerminalDaemonFromApp(environment: env)
+
+        XCTAssertEqual(resolvedSocketPath, socketPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: authTokenFilePath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: plistPath))
+        XCTAssertEqual(
+            commands,
+            [
+                ["print", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["bootout", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+                ["kickstart", "-k", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+            ]
+        )
+    }
+
+    func testRestartLocalTerminalDaemonFromAppStartsLaunchAgentWhenNotLoaded() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-start-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let env = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-start-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+        let registration = Workspace.localTerminalDaemonRegistrationForTesting(environment: env)
+
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+
+        var commands: [[String]] = []
+        var loaded = false
+        var connectable = false
+
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return connectable
+        }
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            commands.append(arguments)
+            switch arguments.first {
+            case "print":
+                return (status: loaded ? 0 : 1, stdout: Data(), stderr: Data())
+            case "bootstrap":
+                loaded = true
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "kickstart":
+                connectable = true
+                return (status: 0, stdout: Data(), stderr: Data())
+            default:
+                return (status: 0, stdout: Data(), stderr: Data())
+            }
+        }
+        defer {
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        let resolvedSocketPath = try Workspace.restartLocalTerminalDaemonFromApp(environment: env)
+
+        XCTAssertEqual(resolvedSocketPath, socketPath)
+        XCTAssertEqual(
+            commands,
+            [
+                ["print", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+                ["kickstart", "-k", "gui/\(getuid())/\(registration.launchAgentLabel)"],
             ]
         )
     }
