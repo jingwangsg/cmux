@@ -870,6 +870,15 @@ final class CmuxSettingsFileStore {
         }
 
         guard let shortcut else { return nil }
+        // Keep settings.json parsing side-effect free. Normalizing the global
+        // hotkey consults KeyboardShortcutSettings.shortcut(for:), which
+        // touches the lazily-initialized shared settingsFileStore and can
+        // recurse during bootstrap. Managed file values for this action are
+        // intentionally preserved even when invalid, so parser-time
+        // normalization is not needed here.
+        if action == .showHideAllWindows {
+            return shortcut
+        }
         if let normalized = action.normalizedRecordedShortcut(shortcut) {
             return normalized
         }
