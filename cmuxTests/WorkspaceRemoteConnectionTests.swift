@@ -67,6 +67,81 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
             .write(to: url, atomically: true, encoding: .utf8)
     }
 
+    private func writeLocalDaemonAuthTokenFile(at path: String, token: String = String(repeating: "ab", count: 32)) throws {
+        let url = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try token.write(to: url, atomically: true, encoding: .utf8)
+        chmod(path, 0o600)
+    }
+
+    private func localDaemonAuthTokenFilePath(for socketPath: String) -> String {
+        let socketURL = URL(fileURLWithPath: socketPath)
+        let basename = socketURL.deletingPathExtension().lastPathComponent
+        return socketURL.deletingLastPathComponent()
+            .appendingPathComponent("\(basename).auth", isDirectory: false)
+            .path
+    }
+
+    private func makeSocketPath(_ name: String) -> String {
+        let shortID = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)
+        return URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cli-\(name.prefix(6))-\(shortID).sock")
+            .path
+    }
+
+    private func bundledCLIPath() throws -> String {
+        let fileManager = FileManager.default
+        let appBundleURL = Bundle(for: Self.self)
+            .bundleURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let enumerator = fileManager.enumerator(
+            at: appBundleURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+
+        while let item = enumerator?.nextObject() as? URL {
+            guard item.lastPathComponent == "cmux",
+                  item.path.contains(".app/Contents/Resources/bin/cmux") else {
+                continue
+            }
+            return item.path
+        }
+
+        throw XCTSkip("Bundled cmux CLI not found in \(appBundleURL.path)")
+    }
+
+    private func waitForConnectableUnixSocket(at path: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            if fd >= 0 {
+                defer { Darwin.close(fd) }
+                var addr = sockaddr_un()
+                addr.sun_family = sa_family_t(AF_UNIX)
+                let maxPathLength = MemoryLayout.size(ofValue: addr.sun_path)
+                path.withCString { ptr in
+                    withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
+                        let pathBuf = UnsafeMutableRawPointer(pathPtr).assumingMemoryBound(to: CChar.self)
+                        strncpy(pathBuf, ptr, maxPathLength - 1)
+                    }
+                }
+                let result = withUnsafePointer(to: &addr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                        Darwin.connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    }
+                }
+                if result == 0 {
+                    return true
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return false
+    }
+
     private func runRelayZshHistfile(
         configureUserHome: (URL) throws -> URL
     ) throws -> String {
@@ -226,6 +301,339 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
         )
 
         XCTAssertEqual(detail, "remote port forwarding failed for listen port 64009")
+    }
+
+    func testBundledCLILocalDaemonCreatesAndReportsSession() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("locald")
+        let authTokenFilePath = localDaemonAuthTokenFilePath(for: socketPath)
+        try writeLocalDaemonAuthTokenFile(at: authTokenFilePath)
+
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cliPath)
+        daemon.arguments = ["local-daemon", "serve", "--socket", socketPath, "--auth-token-file", authTokenFilePath]
+        daemon.standardInput = FileHandle.nullDevice
+        daemon.standardOutput = FileHandle.nullDevice
+        daemon.standardError = FileHandle.nullDevice
+        try daemon.run()
+        defer {
+            if daemon.isRunning {
+                daemon.terminate()
+            }
+            daemon.waitUntilExit()
+            unlink(socketPath)
+            unlink(authTokenFilePath)
+        }
+
+        XCTAssertTrue(waitForConnectableUnixSocket(at: socketPath, timeout: 5), "Daemon socket never became connectable")
+
+        let openResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket",
+                socketPath,
+                "--auth-token-file",
+                authTokenFilePath,
+                "session.open",
+                #"{"session_id":"local-session-core","command":"printf 'hello-from-daemon\n'; exec /bin/cat","cols":80,"rows":24}"#,
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(openResult.timedOut, openResult.stderr)
+        XCTAssertEqual(openResult.status, 0, openResult.stderr)
+        guard let openData = openResult.stdout.data(using: String.Encoding.utf8),
+              let openPayload = try JSONSerialization.jsonObject(with: openData, options: []) as? [String: Any] else {
+            return XCTFail("Expected JSON payload from session.open, got \(openResult.stdout)")
+        }
+        XCTAssertEqual(openPayload["session_id"] as? String, "local-session-core")
+        XCTAssertEqual(openPayload["effective_cols"] as? Int, 80)
+        XCTAssertEqual(openPayload["effective_rows"] as? Int, 24)
+
+        let statusResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket",
+                socketPath,
+                "--auth-token-file",
+                authTokenFilePath,
+                "session.status",
+                #"{"session_id":"local-session-core"}"#,
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(statusResult.timedOut, statusResult.stderr)
+        XCTAssertEqual(statusResult.status, 0, statusResult.stderr)
+        guard let statusData = statusResult.stdout.data(using: String.Encoding.utf8),
+              let statusPayload = try JSONSerialization.jsonObject(with: statusData, options: []) as? [String: Any] else {
+            return XCTFail("Expected JSON payload from session.status, got \(statusResult.stdout)")
+        }
+        XCTAssertEqual(statusPayload["session_id"] as? String, "local-session-core")
+        XCTAssertEqual(statusPayload["state"] as? String, "running")
+    }
+
+    func testBundledCLILocalDaemonRejectsRequestsWithoutAuthToken() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("authd")
+        let authTokenFilePath = "\(socketPath).custom-auth"
+        try writeLocalDaemonAuthTokenFile(at: authTokenFilePath)
+
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cliPath)
+        daemon.arguments = ["local-daemon", "serve", "--socket", socketPath, "--auth-token-file", authTokenFilePath]
+        daemon.standardInput = FileHandle.nullDevice
+        daemon.standardOutput = FileHandle.nullDevice
+        daemon.standardError = FileHandle.nullDevice
+        try daemon.run()
+        defer {
+            if daemon.isRunning {
+                daemon.terminate()
+            }
+            daemon.waitUntilExit()
+            unlink(socketPath)
+            unlink(authTokenFilePath)
+        }
+
+        XCTAssertTrue(waitForConnectableUnixSocket(at: socketPath, timeout: 5), "Daemon socket never became connectable")
+
+        let unauthenticatedResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket",
+                socketPath,
+                "hello",
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(unauthenticatedResult.timedOut, unauthenticatedResult.stderr)
+        XCTAssertNotEqual(unauthenticatedResult.status, 0)
+        XCTAssertTrue(
+            unauthenticatedResult.stderr.contains("authentication failed")
+                || unauthenticatedResult.stderr.contains("Missing or invalid local daemon auth token file"),
+            unauthenticatedResult.stderr
+        )
+    }
+
+    func testBundledCLILocalAttachReplaysUnreadOutput() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("attachd")
+        let authTokenFilePath = localDaemonAuthTokenFilePath(for: socketPath)
+        try writeLocalDaemonAuthTokenFile(at: authTokenFilePath)
+
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cliPath)
+        daemon.arguments = ["local-daemon", "serve", "--socket", socketPath, "--auth-token-file", authTokenFilePath]
+        daemon.standardInput = FileHandle.nullDevice
+        daemon.standardOutput = FileHandle.nullDevice
+        daemon.standardError = FileHandle.nullDevice
+        try daemon.run()
+        defer {
+            if daemon.isRunning {
+                daemon.terminate()
+            }
+            daemon.waitUntilExit()
+            unlink(socketPath)
+            unlink(authTokenFilePath)
+        }
+
+        XCTAssertTrue(waitForConnectableUnixSocket(at: socketPath, timeout: 5), "Daemon socket never became connectable")
+
+        let openResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket",
+                socketPath,
+                "--auth-token-file",
+                authTokenFilePath,
+                "session.open",
+                #"{"session_id":"attach-replay","command":"printf 'first\nsecond\n'; sleep 1","cols":80,"rows":24}"#,
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(openResult.timedOut, openResult.stderr)
+        XCTAssertEqual(openResult.status, 0, openResult.stderr)
+        Thread.sleep(forTimeInterval: 0.3)
+
+        let attachResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-attach",
+                "--socket",
+                socketPath,
+                "--auth-token-file",
+                authTokenFilePath,
+                "--session",
+                "attach-replay",
+                "--attachment-id",
+                "test-attach",
+                "--last-acked-seq",
+                "0",
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(attachResult.timedOut, attachResult.stderr)
+        XCTAssertEqual(attachResult.status, 0, attachResult.stderr)
+        XCTAssertTrue(attachResult.stdout.contains("first"), attachResult.stdout)
+        XCTAssertTrue(attachResult.stdout.contains("second"), attachResult.stdout)
+    }
+
+    func testBundledCLILocalAttachUsesRetainedColdAttachTail() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("coldtail")
+        let authTokenFilePath = localDaemonAuthTokenFilePath(for: socketPath)
+        try writeLocalDaemonAuthTokenFile(at: authTokenFilePath)
+
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cliPath)
+        daemon.arguments = [
+            "local-daemon",
+            "serve",
+            "--socket", socketPath,
+            "--auth-token-file", authTokenFilePath,
+            "--retained-bytes", "256",
+            "--cold-attach-tail-bytes", "32",
+        ]
+        daemon.standardInput = FileHandle.nullDevice
+        daemon.standardOutput = FileHandle.nullDevice
+        daemon.standardError = FileHandle.nullDevice
+        try daemon.run()
+        defer {
+            if daemon.isRunning {
+                daemon.terminate()
+            }
+            daemon.waitUntilExit()
+            unlink(socketPath)
+            unlink(authTokenFilePath)
+        }
+
+        XCTAssertTrue(waitForConnectableUnixSocket(at: socketPath, timeout: 5), "Daemon socket never became connectable")
+
+        let openResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket", socketPath,
+                "--auth-token-file", authTokenFilePath,
+                "session.open",
+                #"{"session_id":"attach-cold-tail","command":"printf 'l1-AAAAAAAAAAAA\nl2-BBBBBBBBBBBB\nl3-CCCCCCCCCCCC\nl4-DDDDDDDDDDDD\n'; sleep 1","cols":80,"rows":24}"#,
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(openResult.timedOut, openResult.stderr)
+        XCTAssertEqual(openResult.status, 0, openResult.stderr)
+        Thread.sleep(forTimeInterval: 0.3)
+
+        let attachResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-attach",
+                "--socket", socketPath,
+                "--auth-token-file", authTokenFilePath,
+                "--session", "attach-cold-tail",
+                "--attachment-id", "cold-tail-attach",
+                "--last-acked-seq", "0",
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(attachResult.timedOut, attachResult.stderr)
+        XCTAssertEqual(attachResult.status, 0, attachResult.stderr)
+        XCTAssertFalse(attachResult.stdout.contains("l1-AAAAAAAAAAAA"), attachResult.stdout)
+        XCTAssertTrue(attachResult.stdout.contains("l4-DDDDDDDDDDDD"), attachResult.stdout)
+    }
+
+    func testBundledCLILocalDaemonStatusReportsForegroundMetadata() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("metad")
+        let authTokenFilePath = localDaemonAuthTokenFilePath(for: socketPath)
+        try writeLocalDaemonAuthTokenFile(at: authTokenFilePath)
+
+        let workingDirectoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-metadata-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workingDirectoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workingDirectoryURL) }
+
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cliPath)
+        daemon.arguments = ["local-daemon", "serve", "--socket", socketPath, "--auth-token-file", authTokenFilePath]
+        daemon.standardInput = FileHandle.nullDevice
+        daemon.standardOutput = FileHandle.nullDevice
+        daemon.standardError = FileHandle.nullDevice
+        try daemon.run()
+        defer {
+            if daemon.isRunning {
+                daemon.terminate()
+            }
+            daemon.waitUntilExit()
+            unlink(socketPath)
+            unlink(authTokenFilePath)
+        }
+
+        XCTAssertTrue(waitForConnectableUnixSocket(at: socketPath, timeout: 5), "Daemon socket never became connectable")
+
+        let openResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket", socketPath,
+                "--auth-token-file", authTokenFilePath,
+                "session.open",
+                #"{"session_id":"metadata-session","command":"exec sleep 2","working_directory":"\#(workingDirectoryURL.path)","cols":80,"rows":24}"#,
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(openResult.timedOut, openResult.stderr)
+        XCTAssertEqual(openResult.status, 0, openResult.stderr)
+        Thread.sleep(forTimeInterval: 0.2)
+
+        let statusResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket", socketPath,
+                "--auth-token-file", authTokenFilePath,
+                "session.status",
+                #"{"session_id":"metadata-session"}"#,
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(statusResult.timedOut, statusResult.stderr)
+        XCTAssertEqual(statusResult.status, 0, statusResult.stderr)
+        guard let statusData = statusResult.stdout.data(using: .utf8),
+              let statusPayload = try JSONSerialization.jsonObject(with: statusData, options: []) as? [String: Any] else {
+            return XCTFail("Expected JSON payload from session.status, got \(statusResult.stdout)")
+        }
+
+        XCTAssertEqual(statusPayload["foreground_process_name"] as? String, "sleep")
+        XCTAssertTrue(
+            ((statusPayload["foreground_process_command"] as? String) ?? "").contains("sleep 2"),
+            String(describing: statusPayload["foreground_process_command"])
+        )
+        XCTAssertEqual(statusPayload["title"] as? String, "sleep")
+        XCTAssertEqual(
+            (statusPayload["working_directory"] as? String).map {
+                URL(fileURLWithPath: $0).resolvingSymlinksInPath().path
+            },
+            workingDirectoryURL.resolvingSymlinksInPath().path
+        )
     }
 
     func testExecutableSearchPathsIncludesHomebrewAndHomeFallbacks() {
@@ -1477,6 +1885,35 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
         }
 
         return fd
+    }
+
+    private func waitForConnectableUnixSocket(at path: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            if fd >= 0 {
+                defer { Darwin.close(fd) }
+                var addr = sockaddr_un()
+                addr.sun_family = sa_family_t(AF_UNIX)
+                let maxPathLength = MemoryLayout.size(ofValue: addr.sun_path)
+                path.withCString { ptr in
+                    withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
+                        let pathBuf = UnsafeMutableRawPointer(pathPtr).assumingMemoryBound(to: CChar.self)
+                        strncpy(pathBuf, ptr, maxPathLength - 1)
+                    }
+                }
+                let result = withUnsafePointer(to: &addr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                        Darwin.connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    }
+                }
+                if result == 0 {
+                    return true
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return false
     }
 
     private func startMockServer(

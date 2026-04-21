@@ -72,6 +72,104 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertTrue(panelSnapshot.listeningPorts.isEmpty)
     }
 
+    func testTerminalPanelSnapshotRoundTripsLocalSessionID() throws {
+        let snapshot = SessionPanelSnapshot(
+            id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+            type: .terminal,
+            title: "Terminal",
+            customTitle: nil,
+            directory: "/tmp/demo",
+            isPinned: false,
+            isManuallyUnread: false,
+            gitBranch: nil,
+            listeningPorts: [],
+            ttyName: "/dev/ttys001",
+            terminal: SessionTerminalPanelSnapshot(
+                workingDirectory: "/tmp/demo",
+                scrollback: "hello",
+                localSessionID: "local-session-1"
+            ),
+            browser: nil,
+            markdown: nil
+        )
+
+        let data = try JSONEncoder().encode(snapshot)
+        let decoded = try JSONDecoder().decode(SessionPanelSnapshot.self, from: data)
+
+        XCTAssertEqual(decoded.terminal?.localSessionID, "local-session-1")
+    }
+
+    @MainActor
+    func testWorkspaceRestoreReattachesLiveLocalTerminalSession() throws {
+        let restoredPanelID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        let previousOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            switch request.mode {
+            case .attachExisting(let sessionID):
+                XCTAssertEqual(sessionID, "live-local-session")
+                return LocalTerminalLaunchConfiguration(
+                    sessionID: sessionID,
+                    initialCommand: "'/tmp/cmux' 'local-attach' '--socket' '/tmp/cmuxd-local-test.sock' '--auth-token-file' '/tmp/cmuxd-local-test.auth' '--session' 'live-local-session'",
+                    daemonSocketPath: "/tmp/cmuxd-local-test.sock",
+                    daemonAuthTokenFilePath: "/tmp/cmuxd-local-test.auth"
+                )
+            case .create:
+                return nil
+            }
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousOverride
+        }
+
+        let snapshot = SessionWorkspaceSnapshot(
+            processTitle: "Terminal",
+            customTitle: nil,
+            customDescription: nil,
+            customColor: nil,
+            isPinned: false,
+            terminalScrollBarHidden: nil,
+            currentDirectory: "/tmp/demo",
+            focusedPanelId: restoredPanelID,
+            layout: .pane(SessionPaneLayoutSnapshot(panelIds: [restoredPanelID], selectedPanelId: restoredPanelID)),
+            panels: [
+                SessionPanelSnapshot(
+                    id: restoredPanelID,
+                    type: .terminal,
+                    title: "Terminal",
+                    customTitle: nil,
+                    directory: "/tmp/demo",
+                    isPinned: false,
+                    isManuallyUnread: false,
+                    gitBranch: nil,
+                    listeningPorts: [],
+                    ttyName: nil,
+                    terminal: SessionTerminalPanelSnapshot(
+                        workingDirectory: "/tmp/demo",
+                        scrollback: nil,
+                        localSessionID: "live-local-session"
+                    ),
+                    browser: nil,
+                    markdown: nil
+                )
+            ],
+            statusEntries: [],
+            logEntries: [],
+            progress: nil,
+            gitBranch: nil
+        )
+
+        let workspace = Workspace()
+        workspace.restoreSessionSnapshot(snapshot)
+
+        let panelID = try XCTUnwrap(workspace.focusedPanelId)
+        let panel = try XCTUnwrap(workspace.terminalPanel(for: panelID))
+        XCTAssertEqual(panel.localSessionID, "live-local-session")
+        XCTAssertEqual(
+            panel.surface.debugInitialCommand(),
+            "'/tmp/cmux' 'local-attach' '--socket' '/tmp/cmuxd-local-test.sock' '--auth-token-file' '/tmp/cmuxd-local-test.auth' '--session' 'live-local-session'"
+        )
+    }
+
     func testSaveAndLoadRoundTripWithCustomSnapshotPath() throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("cmux-session-tests-\(UUID().uuidString)", isDirectory: true)

@@ -2871,6 +2871,7 @@ class TerminalController {
         for (surfaceIndex, panel) in orderedPanels(in: workspace).enumerated() {
             let paneUUID = paneByPanelId[panel.id]
             let selectedInPane = selectedInPaneByPanelId[panel.id] ?? false
+            let runtimeMetadata = workspace.terminalRuntimeMetadata(panelId: panel.id)
 
             var item: [String: Any] = [
                 "id": panel.id.uuidString,
@@ -2884,7 +2885,12 @@ class TerminalController {
                 "pane_id": v2OrNull(paneUUID?.uuidString),
                 "pane_ref": v2Ref(kind: .pane, uuid: paneUUID),
                 "index_in_pane": v2OrNull(indexInPaneByPanelId[panel.id]),
-                "tty": v2OrNull(workspace.surfaceTTYNames[panel.id])
+                "tty": v2OrNull(runtimeMetadata.ttyName),
+                "current_directory": v2OrNull(runtimeMetadata.currentDirectory),
+                "local_session_id": v2OrNull(runtimeMetadata.localSessionID),
+                "foreground_process_name": v2OrNull(runtimeMetadata.foregroundProcessName),
+                "foreground_process_command": v2OrNull(runtimeMetadata.foregroundProcessCommand),
+                "runtime_title": v2OrNull(runtimeMetadata.title)
             ]
 
             if panel.panelType == .browser, let browserPanel = panel as? BrowserPanel {
@@ -3328,7 +3334,7 @@ class TerminalController {
             "pinned": workspace.isPinned,
             "listening_ports": workspace.listeningPorts,
             "remote": workspace.remoteStatusPayload(),
-            "current_directory": v2OrNull(workspace.currentDirectory),
+            "current_directory": v2OrNull(workspace.currentDirectoryForCLI()),
             "custom_color": v2OrNull(workspace.customColor)
         ]
         if let index {
@@ -4827,6 +4833,7 @@ class TerminalController {
             let panels = orderedPanels(in: ws)
             let surfaces: [[String: Any]] = panels.enumerated().map { index, panel in
                 let paneUUID = paneByPanelId[panel.id]
+                let runtimeMetadata = ws.terminalRuntimeMetadata(panelId: panel.id)
                 var item: [String: Any] = [
                     "id": panel.id.uuidString,
                     "ref": v2Ref(kind: .surface, uuid: panel.id),
@@ -4837,7 +4844,13 @@ class TerminalController {
                     "pane_id": v2OrNull(paneUUID?.uuidString),
                     "pane_ref": v2Ref(kind: .pane, uuid: paneUUID),
                     "index_in_pane": v2OrNull(indexInPaneByPanelId[panel.id]),
-                    "selected_in_pane": v2OrNull(selectedInPaneByPanelId[panel.id])
+                    "selected_in_pane": v2OrNull(selectedInPaneByPanelId[panel.id]),
+                    "tty": v2OrNull(runtimeMetadata.ttyName),
+                    "current_directory": v2OrNull(runtimeMetadata.currentDirectory),
+                    "local_session_id": v2OrNull(runtimeMetadata.localSessionID),
+                    "foreground_process_name": v2OrNull(runtimeMetadata.foregroundProcessName),
+                    "foreground_process_command": v2OrNull(runtimeMetadata.foregroundProcessCommand),
+                    "runtime_title": v2OrNull(runtimeMetadata.title)
                 ]
                 if let browserPanel = panel as? BrowserPanel {
                     item["developer_tools_visible"] = browserPanel.isDeveloperToolsVisible()
@@ -5557,8 +5570,9 @@ class TerminalController {
                 let title = workspace?.panelTitle(panelId: panelId)
                 let paneId = mapped?.paneId
                 let treeVisible = mapped?.bonsplitTabId != nil && paneId != nil
-                let ttyName = workspace?.surfaceTTYNames[panelId]
-                let currentDirectory = nonEmpty(workspace?.panelDirectories[panelId] ?? mapped?.terminalPanel.directory)
+                let runtimeMetadata = workspace.map { $0.terminalRuntimeMetadata(panelId: panelId) }
+                let ttyName = runtimeMetadata?.ttyName
+                let currentDirectory = nonEmpty(runtimeMetadata?.currentDirectory)
                 let teardownRequest = terminalSurface.debugTeardownRequest()
                 let lastKnownWorkspaceId = terminalSurface.debugLastKnownWorkspaceId()
 
@@ -5626,6 +5640,11 @@ class TerminalController {
                     "portal_host_area": v2OrNull(portalHostLease.area.map(Double.init)),
                     "tty": v2OrNull(ttyName),
                     "current_directory": v2OrNull(currentDirectory),
+                    "local_session_id": v2OrNull(runtimeMetadata?.localSessionID),
+                    "local_session_state": v2OrNull(runtimeMetadata?.state),
+                    "foreground_process_name": v2OrNull(runtimeMetadata?.foregroundProcessName),
+                    "foreground_process_command": v2OrNull(runtimeMetadata?.foregroundProcessCommand),
+                    "runtime_title": v2OrNull(runtimeMetadata?.title),
                     "requested_working_directory": v2OrNull(nonEmpty(terminalSurface.requestedWorkingDirectory)),
                     "initial_command": v2OrNull(nonEmpty(terminalSurface.debugInitialCommand())),
                     "git_branch": v2OrNull(nonEmpty(gitBranchState?.branch)),

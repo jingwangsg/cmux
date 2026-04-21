@@ -16,6 +16,8 @@ final class TerminalPanel: Panel, ObservableObject {
     /// The workspace ID this panel belongs to
     private(set) var workspaceId: UUID
 
+    private(set) var localSessionID: String?
+
     /// Published title from the terminal process
     @Published private(set) var title: String = "Terminal"
 
@@ -71,10 +73,11 @@ final class TerminalPanel: Panel, ObservableObject {
         surface.requestedWorkingDirectory
     }
 
-    init(workspaceId: UUID, surface: TerminalSurface) {
+    init(workspaceId: UUID, surface: TerminalSurface, localSessionID: String? = nil) {
         self.id = surface.id
         self.workspaceId = workspaceId
         self.surface = surface
+        self.localSessionID = localSessionID
 
         // Subscribe to surface's search state changes
         surface.$searchState
@@ -88,6 +91,7 @@ final class TerminalPanel: Panel, ObservableObject {
 
     /// Create a new terminal panel with a fresh surface
     convenience init(
+        id: UUID? = nil,
         workspaceId: UUID,
         context: ghostty_surface_context_e = GHOSTTY_SURFACE_CONTEXT_SPLIT,
         configTemplate: CmuxSurfaceConfigTemplate? = nil,
@@ -96,9 +100,11 @@ final class TerminalPanel: Panel, ObservableObject {
         initialCommand: String? = nil,
         initialInput: String? = nil,
         initialEnvironmentOverrides: [String: String] = [:],
-        additionalEnvironment: [String: String] = [:]
+        additionalEnvironment: [String: String] = [:],
+        localSessionID: String? = nil
     ) {
         let surface = TerminalSurface(
+            id: id,
             tabId: workspaceId,
             context: context,
             configTemplate: configTemplate,
@@ -109,7 +115,11 @@ final class TerminalPanel: Panel, ObservableObject {
             additionalEnvironment: additionalEnvironment
         )
         surface.portOrdinal = portOrdinal
-        self.init(workspaceId: workspaceId, surface: surface)
+        self.init(workspaceId: workspaceId, surface: surface, localSessionID: localSessionID)
+    }
+
+    func updateLocalSessionID(_ newLocalSessionID: String?) {
+        localSessionID = newLocalSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func updateTitle(_ newTitle: String) {

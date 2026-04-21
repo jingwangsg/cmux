@@ -2422,6 +2422,200 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
         )
     }
 
+    func testNewTerminalSurfaceUsesLocalAttachCommandWhenDaemonLaunchConfigExists() throws {
+        let workspace = Workspace()
+        guard let paneId = workspace.bonsplitController.focusedPaneId else {
+            XCTFail("Expected focused pane in new workspace")
+            return
+        }
+
+        let previousOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            switch request.mode {
+            case .create:
+                XCTAssertEqual(request.requestedWorkingDirectory, "/tmp/local-daemon-test")
+                return LocalTerminalLaunchConfiguration(
+                    sessionID: "local-session-test",
+                    initialCommand: "'/tmp/cmux' 'local-attach' '--socket' '/tmp/cmuxd-local-test.sock' '--auth-token-file' '/tmp/cmuxd-local-test.auth' '--session' 'local-session-test'",
+                    daemonSocketPath: "/tmp/cmuxd-local-test.sock",
+                    daemonAuthTokenFilePath: "/tmp/cmuxd-local-test.auth"
+                )
+            case .attachExisting:
+                return nil
+            }
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousOverride
+        }
+
+        guard let panel = workspace.newTerminalSurface(
+            inPane: paneId,
+            focus: false,
+            workingDirectory: "/tmp/local-daemon-test"
+        ) else {
+            XCTFail("Expected daemon-backed terminal panel")
+            return
+        }
+
+        XCTAssertEqual(panel.localSessionID, "local-session-test")
+        XCTAssertEqual(
+            panel.surface.debugInitialCommand(),
+            "'/tmp/cmux' 'local-attach' '--socket' '/tmp/cmuxd-local-test.sock' '--auth-token-file' '/tmp/cmuxd-local-test.auth' '--session' 'local-session-test'"
+        )
+    }
+
+    func testTerminalRuntimeMetadataUsesLocalDaemonStatusWhenPresent() throws {
+        let workspace = Workspace()
+        guard let paneId = workspace.bonsplitController.focusedPaneId else {
+            XCTFail("Expected focused pane in new workspace")
+            return
+        }
+
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        let previousStatusOverride = Workspace.localTerminalStatusPayloadOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            switch request.mode {
+            case .create:
+                return LocalTerminalLaunchConfiguration(
+                    sessionID: "daemon-session-metadata",
+                    initialCommand: "'/tmp/cmux' 'local-attach' '--socket' '/tmp/cmuxd-local-test.sock' '--auth-token-file' '/tmp/cmuxd-local-test.auth' '--session' 'daemon-session-metadata'",
+                    daemonSocketPath: "/tmp/cmuxd-local-test.sock",
+                    daemonAuthTokenFilePath: "/tmp/cmuxd-local-test.auth"
+                )
+            case .attachExisting:
+                return nil
+            }
+        }
+        Workspace.localTerminalStatusPayloadOverrideForTesting = { sessionID in
+            XCTAssertEqual(sessionID, "daemon-session-metadata")
+            return [
+                "session_id": sessionID,
+                "state": "running",
+                "tty_name": "/dev/ttys777",
+                "working_directory": "/tmp/runtime-daemon-cwd",
+                "foreground_process_name": "sleep",
+                "foreground_process_command": "/bin/sleep 2",
+                "title": "sleep",
+            ]
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+            Workspace.localTerminalStatusPayloadOverrideForTesting = previousStatusOverride
+        }
+
+        guard let panel = workspace.newTerminalSurface(inPane: paneId, focus: false) else {
+            XCTFail("Expected daemon-backed terminal panel")
+            return
+        }
+
+        let metadata = workspace.terminalRuntimeMetadata(panelId: panel.id)
+        XCTAssertEqual(metadata.localSessionID, "daemon-session-metadata")
+        XCTAssertEqual(metadata.state, "running")
+        XCTAssertEqual(metadata.ttyName, "/dev/ttys777")
+        XCTAssertEqual(metadata.currentDirectory, "/tmp/runtime-daemon-cwd")
+        XCTAssertEqual(metadata.foregroundProcessName, "sleep")
+        XCTAssertEqual(metadata.foregroundProcessCommand, "/bin/sleep 2")
+        XCTAssertEqual(metadata.title, "sleep")
+    }
+
+    func testNewTerminalSurfacePassesManagedEnvironmentToLocalDaemon() throws {
+        let workspace = Workspace()
+        guard let paneId = workspace.bonsplitController.focusedPaneId else {
+            XCTFail("Expected focused pane in new workspace")
+            return
+        }
+
+        let previousOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            switch request.mode {
+            case .create:
+                let env = request.requestedEnvironment
+                XCTAssertEqual(env["CMUX_PANEL_ID"], request.panelID.uuidString)
+                XCTAssertEqual(env["CMUX_SURFACE_ID"], request.panelID.uuidString)
+                XCTAssertEqual(request.requestedWorkingDirectory, "/tmp/local-daemon-env")
+                XCTAssertEqual(env["TERM"], TerminalSurface.managedTerminalType)
+                XCTAssertEqual(env["COLORTERM"], TerminalSurface.managedColorTerm)
+                XCTAssertEqual(env["TERM_PROGRAM"], TerminalSurface.managedTerminalProgram)
+                XCTAssertEqual(env["CMUX_WORKSPACE_ID"], workspace.id.uuidString)
+                XCTAssertEqual(env["CMUX_SOCKET_PATH"], SocketControlSettings.socketPath())
+                XCTAssertEqual(env["CMUX_SOCKET"], SocketControlSettings.socketPath())
+                XCTAssertEqual(env["CUSTOM_ENV"], "custom-value")
+                XCTAssertEqual(
+                    env["TERM"],
+                    TerminalSurface.managedTerminalType,
+                    "Managed terminal identity should override caller-provided TERM"
+                )
+                return LocalTerminalLaunchConfiguration(
+                    sessionID: "daemon-session-env",
+                    initialCommand: "'/tmp/cmux' 'local-attach' '--socket' '/tmp/cmuxd-local-test.sock' '--auth-token-file' '/tmp/cmuxd-local-test.auth' '--session' 'daemon-session-env'",
+                    daemonSocketPath: "/tmp/cmuxd-local-test.sock",
+                    daemonAuthTokenFilePath: "/tmp/cmuxd-local-test.auth"
+                )
+            case .attachExisting:
+                return nil
+            }
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousOverride
+        }
+
+        guard workspace.newTerminalSurface(
+            inPane: paneId,
+            focus: false,
+            workingDirectory: "/tmp/local-daemon-env",
+            startupEnvironment: [
+                "TERM": "broken-term",
+                "CUSTOM_ENV": "custom-value",
+            ]
+        ) != nil else {
+            XCTFail("Expected daemon-backed terminal panel")
+            return
+        }
+    }
+
+    func testLocalTerminalLaunchAgentPropertyListIncludesSocketAuthAndRetention() throws {
+        let registration = Workspace.localTerminalDaemonRegistrationForTesting(
+            environment: [
+                "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-test",
+                "CMUX_LOCAL_DAEMON_SOCKET_PATH": "/tmp/cmux-phase1.sock",
+                "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": "/tmp/cmux-phase1.auth",
+                "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": "/tmp/ai.manaflow.cmux.local-daemon.phase1.plist",
+                "CMUX_LOCAL_DAEMON_RETAINED_BYTES": "131072",
+                "CMUX_LOCAL_DAEMON_COLD_ATTACH_TAIL_BYTES": "32768",
+            ]
+        )
+
+        XCTAssertEqual(registration.socketPath, "/tmp/cmux-phase1.sock")
+        XCTAssertEqual(registration.authTokenFilePath, "/tmp/cmux-phase1.auth")
+        XCTAssertEqual(registration.launchAgentPlistPath, "/tmp/ai.manaflow.cmux.local-daemon.phase1.plist")
+        XCTAssertEqual(registration.retainedByteLimit, 131072)
+        XCTAssertEqual(registration.coldAttachTailByteLimit, 32768)
+        XCTAssertTrue(registration.launchAgentLabel.hasPrefix("ai.manaflow.cmux.local-daemon."))
+
+        let payload = Workspace.localTerminalLaunchAgentPropertyListForTesting(
+            registration: registration,
+            cliPath: "/tmp/cmux"
+        )
+
+        XCTAssertEqual(payload["Label"] as? String, registration.launchAgentLabel)
+        XCTAssertEqual(payload["RunAtLoad"] as? Bool, true)
+        XCTAssertEqual(payload["KeepAlive"] as? Bool, true)
+        XCTAssertEqual(payload["StandardOutPath"] as? String, registration.stdoutLogPath)
+        XCTAssertEqual(payload["StandardErrorPath"] as? String, registration.stderrLogPath)
+        XCTAssertEqual(
+            payload["ProgramArguments"] as? [String],
+            [
+                "/tmp/cmux",
+                "local-daemon",
+                "serve",
+                "--socket", "/tmp/cmux-phase1.sock",
+                "--auth-token-file", "/tmp/cmux-phase1.auth",
+                "--retained-bytes", "131072",
+                "--cold-attach-tail-bytes", "32768",
+            ]
+        )
+    }
+
     func testNewTerminalSplitSkipsFreedInheritedSurfacePointer() throws {
 #if DEBUG
         let workspace = Workspace()

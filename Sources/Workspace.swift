@@ -470,7 +470,8 @@ extension Workspace {
             )
             terminalSnapshot = SessionTerminalPanelSnapshot(
                 workingDirectory: panelDirectories[panelId],
-                scrollback: resolvedScrollback
+                scrollback: resolvedScrollback,
+                localSessionID: terminalPanel.localSessionID
             )
             browserSnapshot = nil
             markdownSnapshot = nil
@@ -642,6 +643,17 @@ extension Workspace {
         switch snapshot.type {
         case .terminal:
             let workingDirectory = snapshot.terminal?.workingDirectory ?? snapshot.directory ?? currentDirectory
+            if let localSessionID = snapshot.terminal?.localSessionID,
+               let terminalPanel = newTerminalSurface(
+                    inPane: paneId,
+                    focus: false,
+                    workingDirectory: workingDirectory,
+                    startupEnvironment: [:],
+                    localTerminalMode: .attachExisting(localSessionID)
+               ) {
+                applySessionPanelMetadata(snapshot, toPanelId: terminalPanel.id)
+                return terminalPanel.id
+            }
             let replayEnvironment = SessionScrollbackReplayStore.replayEnvironment(
                 for: snapshot.terminal?.scrollback
             )
@@ -649,7 +661,8 @@ extension Workspace {
                 inPane: paneId,
                 focus: false,
                 workingDirectory: workingDirectory,
-                startupEnvironment: replayEnvironment
+                startupEnvironment: replayEnvironment,
+                localTerminalMode: .disabled
             ) else {
                 return nil
             }
@@ -6480,6 +6493,54 @@ struct ClosedBrowserPanelRestoreSnapshot {
 
 /// Workspace represents a sidebar tab.
 /// Each workspace contains one BonsplitController that manages split panes and nested surfaces.
+enum LocalTerminalMode: Equatable {
+    case auto
+    case disabled
+    case attachExisting(String)
+}
+
+struct LocalTerminalLaunchRequest {
+    enum Mode: Equatable {
+        case create
+        case attachExisting(String)
+    }
+
+    let panelID: UUID
+    let mode: Mode
+    let requestedWorkingDirectory: String?
+    let requestedCommand: String?
+    let requestedEnvironment: [String: String]
+}
+
+struct LocalTerminalLaunchConfiguration: Equatable {
+    let sessionID: String
+    let initialCommand: String
+    let daemonSocketPath: String
+    let daemonAuthTokenFilePath: String
+}
+
+struct LocalTerminalDaemonRegistration: Equatable {
+    let instanceID: String
+    let socketPath: String
+    let authTokenFilePath: String
+    let launchAgentLabel: String
+    let launchAgentPlistPath: String
+    let retainedByteLimit: Int
+    let coldAttachTailByteLimit: Int
+    let stdoutLogPath: String
+    let stderrLogPath: String
+}
+
+struct TerminalRuntimeMetadata: Equatable {
+    let ttyName: String?
+    let currentDirectory: String?
+    let localSessionID: String?
+    let state: String?
+    let foregroundProcessName: String?
+    let foregroundProcessCommand: String?
+    let title: String?
+}
+
 @MainActor
 final class Workspace: Identifiable, ObservableObject {
     static let terminalScrollBarHiddenDidChangeNotification = Notification.Name(
@@ -6615,6 +6676,9 @@ final class Workspace: Identifiable, ObservableObject {
         return formatter
     }()
     nonisolated(unsafe) static var runSSHControlMasterCommandOverrideForTesting: (([String]) -> Void)?
+    nonisolated(unsafe) static var localTerminalLaunchConfigurationOverrideForTesting: ((LocalTerminalLaunchRequest) -> LocalTerminalLaunchConfiguration?)?
+    nonisolated(unsafe) static var localTerminalStatusPayloadOverrideForTesting: ((String) -> [String: Any]?)?
+    nonisolated(unsafe) private static let localTerminalDaemonLaunchLock = NSLock()
     private var panelShellActivityStates: [UUID: PanelShellActivityState] = [:]
     /// PIDs associated with agent status entries (e.g. claude_code), keyed by status key.
     /// Used for stale-session detection: if the PID is dead, the status entry is cleared.
@@ -6906,16 +6970,14 @@ final class Workspace: Identifiable, ObservableObject {
         let welcomeTabIds = bonsplitController.allTabIds
 
         // Create initial terminal panel
-        let terminalPanel = TerminalPanel(
-            workspaceId: id,
+        let terminalPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_TAB,
             configTemplate: configTemplate,
             workingDirectory: hasWorkingDirectory ? trimmedWorkingDirectory : nil,
-            portOrdinal: portOrdinal,
             initialCommand: initialTerminalCommand,
             initialInput: initialTerminalInput,
             initialEnvironmentOverrides: initialTerminalEnvironment
-        )
+        )!
         configureTerminalPanel(terminalPanel)
         panels[terminalPanel.id] = terminalPanel
         panelTitles[terminalPanel.id] = terminalPanel.displayTitle
@@ -6973,6 +7035,712 @@ final class Workspace: Identifiable, ObservableObject {
     deinit {
         activeRemoteSessionControllerID = nil
         remoteSessionController?.stop()
+    }
+
+    private static func shouldUseLocalTerminalDaemon(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        if environment["CMUX_LOCAL_DAEMON_DISABLE"] == "1" {
+            return false
+        }
+        if NSClassFromString("XCTestCase") != nil {
+            return false
+        }
+        return !SessionRestorePolicy.isRunningUnderAutomatedTests(environment: environment)
+    }
+
+    private static func bundledCLIPath() -> String? {
+        guard let bundledCLIURL = Bundle.main.resourceURL?.appendingPathComponent("bin/cmux", isDirectory: false),
+              FileManager.default.isExecutableFile(atPath: bundledCLIURL.path) else {
+            return nil
+        }
+        return bundledCLIURL.path
+    }
+
+    private static func shortStableLocalDaemonIdentifier(for value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return digest.prefix(6).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func localTerminalDaemonRegistrationForTesting(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> LocalTerminalDaemonRegistration {
+        let instanceSource = nonEmptyTrimmedString(environment["CMUX_LOCAL_DAEMON_INSTANCE"])
+            ?? Bundle.main.bundleIdentifier
+            ?? "cmux"
+        let instanceID = shortStableLocalDaemonIdentifier(for: instanceSource)
+        let socketPath: String = {
+            if let override = nonEmptyTrimmedString(environment["CMUX_LOCAL_DAEMON_SOCKET_PATH"]) {
+                return override
+            }
+            if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                let candidate = appSupport
+                    .appendingPathComponent("cmux/locald-\(instanceID).sock", isDirectory: false)
+                    .path
+                if candidate.utf8.count < 100 {
+                    return candidate
+                }
+            }
+            return "/tmp/cmux-locald-\(instanceID).sock"
+        }()
+
+        let authTokenFilePath: String = {
+            if let override = nonEmptyTrimmedString(environment["CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE"]) {
+                return override
+            }
+            let socketURL = URL(fileURLWithPath: socketPath)
+            let basename = socketURL.deletingPathExtension().lastPathComponent
+            return socketURL.deletingLastPathComponent()
+                .appendingPathComponent("\(basename).auth", isDirectory: false)
+                .path
+        }()
+
+        let launchAgentLabel = "ai.manaflow.cmux.local-daemon.\(instanceID)"
+        let launchAgentPlistPath: String = {
+            if let override = nonEmptyTrimmedString(environment["CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH"]) {
+                return override
+            }
+            return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent("Library/LaunchAgents/\(launchAgentLabel).plist", isDirectory: false)
+                .path
+        }()
+
+        let retainedByteLimit = max(
+            Int(environment["CMUX_LOCAL_DAEMON_RETAINED_BYTES"] ?? "") ?? 4_194_304,
+            65_536
+        )
+        let coldAttachTailByteLimit = max(
+            min(Int(environment["CMUX_LOCAL_DAEMON_COLD_ATTACH_TAIL_BYTES"] ?? "") ?? 262_144, retainedByteLimit),
+            1
+        )
+
+        let authURL = URL(fileURLWithPath: authTokenFilePath)
+        let logBaseDirectory = authURL.deletingLastPathComponent()
+        return LocalTerminalDaemonRegistration(
+            instanceID: instanceID,
+            socketPath: socketPath,
+            authTokenFilePath: authTokenFilePath,
+            launchAgentLabel: launchAgentLabel,
+            launchAgentPlistPath: launchAgentPlistPath,
+            retainedByteLimit: retainedByteLimit,
+            coldAttachTailByteLimit: coldAttachTailByteLimit,
+            stdoutLogPath: logBaseDirectory.appendingPathComponent("locald-\(instanceID).stdout.log", isDirectory: false).path,
+            stderrLogPath: logBaseDirectory.appendingPathComponent("locald-\(instanceID).stderr.log", isDirectory: false).path
+        )
+    }
+
+    private static func localShellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    private static func nonEmptyTrimmedString(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func nonEmptyPayloadString(_ object: Any?) -> String? {
+        guard let value = object as? String else { return nil }
+        return nonEmptyTrimmedString(value)
+    }
+
+    static func localTerminalLaunchAgentPropertyListForTesting(
+        registration: LocalTerminalDaemonRegistration,
+        cliPath: String
+    ) -> [String: Any] {
+        [
+            "Label": registration.launchAgentLabel,
+            "ProgramArguments": [
+                cliPath,
+                "local-daemon",
+                "serve",
+                "--socket", registration.socketPath,
+                "--auth-token-file", registration.authTokenFilePath,
+                "--retained-bytes", String(registration.retainedByteLimit),
+                "--cold-attach-tail-bytes", String(registration.coldAttachTailByteLimit),
+            ],
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "StandardOutPath": registration.stdoutLogPath,
+            "StandardErrorPath": registration.stderrLogPath,
+        ]
+    }
+
+    private static func localAttachCommand(
+        cliPath: String,
+        socketPath: String,
+        authTokenFilePath: String,
+        sessionID: String
+    ) -> String {
+        [cliPath, "local-attach", "--socket", socketPath, "--auth-token-file", authTokenFilePath, "--session", sessionID]
+            .map(localShellSingleQuoted)
+            .joined(separator: " ")
+    }
+
+    private static func canConnectToLocalDaemonSocket(_ socketPath: String) -> Bool {
+        let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard socketFD >= 0 else { return false }
+        defer { Darwin.close(socketFD) }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let utf8Bytes = Array(socketPath.utf8)
+        guard utf8Bytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
+            return false
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { rawBuffer in
+            rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
+            for (index, value) in utf8Bytes.enumerated() {
+                rawBuffer[index] = value
+            }
+        }
+
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.connect(socketFD, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_un>.stride))
+            }
+        }
+        return result == 0
+    }
+
+    private static func waitForLocalDaemonSocket(_ socketPath: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if canConnectToLocalDaemonSocket(socketPath) {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return canConnectToLocalDaemonSocket(socketPath)
+    }
+
+    private static func ensureLocalTerminalDaemonAuthTokenFile(_ path: String) -> Bool {
+        let fileManager = FileManager.default
+        let url = URL(fileURLWithPath: path)
+        do {
+            try fileManager.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            return false
+        }
+
+        if let existing = try? String(contentsOf: url, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !existing.isEmpty {
+            return true
+        }
+
+        var bytes = [UInt8](repeating: 0, count: 32)
+        for index in bytes.indices {
+            bytes[index] = UInt8.random(in: 0...UInt8.max)
+        }
+        let token = bytes.map { String(format: "%02x", $0) }.joined()
+        guard let data = token.data(using: .utf8) else {
+            return false
+        }
+        do {
+            try data.write(to: url, options: .atomic)
+            chmod(path, 0o600)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func writeLocalTerminalLaunchAgentPlist(
+        registration: LocalTerminalDaemonRegistration,
+        cliPath: String
+    ) -> Bool {
+        let payload = localTerminalLaunchAgentPropertyListForTesting(
+            registration: registration,
+            cliPath: cliPath
+        )
+        guard let plistData = try? PropertyListSerialization.data(
+            fromPropertyList: payload,
+            format: .xml,
+            options: 0
+        ) else {
+            return false
+        }
+
+        let plistURL = URL(fileURLWithPath: registration.launchAgentPlistPath)
+        do {
+            try FileManager.default.createDirectory(
+                at: plistURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: registration.stdoutLogPath).deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            if let existing = try? Data(contentsOf: plistURL), existing == plistData {
+                return true
+            }
+            try plistData.write(to: plistURL, options: .atomic)
+            chmod(registration.launchAgentPlistPath, 0o644)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func localTerminalLaunchctlTarget(label: String) -> String {
+        "gui/\(getuid())/\(label)"
+    }
+
+    private static func runLocalLaunchctl(
+        arguments: [String],
+        timeout: TimeInterval = 5.0
+    ) -> (status: Int32, stdout: Data, stderr: Data)? {
+        runLocalTerminalCLI(cliPath: "/bin/launchctl", arguments: arguments, timeout: timeout)
+    }
+
+    private static func isLocalTerminalLaunchAgentLoaded(label: String) -> Bool {
+        guard let result = runLocalLaunchctl(arguments: ["print", localTerminalLaunchctlTarget(label: label)], timeout: 2.0) else {
+            return false
+        }
+        return result.status == 0
+    }
+
+    private static func ensureLocalTerminalDaemonRunning(
+        cliPath: String,
+        registration: LocalTerminalDaemonRegistration
+    ) -> Bool {
+        if canConnectToLocalDaemonSocket(registration.socketPath) {
+            return true
+        }
+
+        localTerminalDaemonLaunchLock.lock()
+        defer { localTerminalDaemonLaunchLock.unlock() }
+
+        if canConnectToLocalDaemonSocket(registration.socketPath) {
+            return true
+        }
+
+        guard ensureLocalTerminalDaemonAuthTokenFile(registration.authTokenFilePath),
+              writeLocalTerminalLaunchAgentPlist(registration: registration, cliPath: cliPath) else {
+            return false
+        }
+
+        let launchctlTarget = localTerminalLaunchctlTarget(label: registration.launchAgentLabel)
+        if isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
+            _ = runLocalLaunchctl(arguments: ["kickstart", "-k", launchctlTarget], timeout: 3.0)
+            if waitForLocalDaemonSocket(registration.socketPath, timeout: 1.5) {
+                return true
+            }
+            _ = runLocalLaunchctl(arguments: ["bootout", launchctlTarget], timeout: 3.0)
+        }
+
+        _ = runLocalLaunchctl(
+            arguments: ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+            timeout: 3.0
+        )
+        _ = runLocalLaunchctl(arguments: ["kickstart", "-k", launchctlTarget], timeout: 3.0)
+        return waitForLocalDaemonSocket(registration.socketPath, timeout: 1.5)
+    }
+
+    private static func runLocalTerminalCLI(
+        cliPath: String,
+        arguments: [String],
+        timeout: TimeInterval = 5.0
+    ) -> (status: Int32, stdout: Data, stderr: Data)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: cliPath)
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+
+        let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, stdout, stderr)
+    }
+
+    private static func runLocalTerminalDaemonRPC(
+        registration: LocalTerminalDaemonRegistration,
+        method: String,
+        params: [String: Any],
+        timeout: TimeInterval = 5.0
+    ) -> [String: Any]? {
+        guard let cliPath = bundledCLIPath(),
+              ensureLocalTerminalDaemonRunning(cliPath: cliPath, registration: registration),
+              JSONSerialization.isValidJSONObject(params),
+              let jsonData = try? JSONSerialization.data(withJSONObject: params, options: []),
+              let json = String(data: jsonData, encoding: .utf8),
+              let result = runLocalTerminalCLI(
+                cliPath: cliPath,
+                arguments: [
+                    "local-daemon",
+                    "rpc",
+                    "--socket", registration.socketPath,
+                    "--auth-token-file", registration.authTokenFilePath,
+                    method,
+                    json,
+                ],
+                timeout: timeout
+              ),
+              result.status == 0,
+              let object = try? JSONSerialization.jsonObject(with: result.stdout, options: []) as? [String: Any] else {
+            return nil
+        }
+        return object
+    }
+
+    private static func localTerminalStatusPayload(sessionID: String) -> [String: Any]? {
+        if let override = localTerminalStatusPayloadOverrideForTesting {
+            return override(sessionID)
+        }
+        let registration = localTerminalDaemonRegistrationForTesting()
+        return runLocalTerminalDaemonRPC(
+            registration: registration,
+            method: "session.status",
+            params: ["session_id": sessionID]
+        )
+    }
+
+    private static func resolveLocalTerminalLaunchConfiguration(
+        request: LocalTerminalLaunchRequest
+    ) -> LocalTerminalLaunchConfiguration? {
+        if let override = localTerminalLaunchConfigurationOverrideForTesting {
+            return override(request)
+        }
+
+        guard shouldUseLocalTerminalDaemon() else {
+            return nil
+        }
+
+        let registration = localTerminalDaemonRegistrationForTesting()
+
+        switch request.mode {
+        case .create:
+            let sessionID = UUID().uuidString
+            var params: [String: Any] = [
+                "session_id": sessionID,
+                "cols": 80,
+                "rows": 24,
+                "environment": request.requestedEnvironment
+            ]
+            if let requestedWorkingDirectory = request.requestedWorkingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !requestedWorkingDirectory.isEmpty {
+                params["working_directory"] = requestedWorkingDirectory
+            }
+            if let requestedCommand = request.requestedCommand?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !requestedCommand.isEmpty {
+                params["command"] = requestedCommand
+            }
+            guard let openResult = runLocalTerminalDaemonRPC(
+                registration: registration,
+                method: "session.open",
+                params: params
+            ),
+            let resolvedSessionID = openResult["session_id"] as? String,
+            let cliPath = bundledCLIPath() else {
+                return nil
+            }
+            return LocalTerminalLaunchConfiguration(
+                sessionID: resolvedSessionID,
+                initialCommand: localAttachCommand(
+                    cliPath: cliPath,
+                    socketPath: registration.socketPath,
+                    authTokenFilePath: registration.authTokenFilePath,
+                    sessionID: resolvedSessionID
+                ),
+                daemonSocketPath: registration.socketPath,
+                daemonAuthTokenFilePath: registration.authTokenFilePath
+            )
+
+        case .attachExisting(let sessionID):
+            guard canConnectToLocalDaemonSocket(registration.socketPath),
+                  let statusResult = runLocalTerminalDaemonRPC(
+                    registration: registration,
+                    method: "session.status",
+                    params: ["session_id": sessionID]
+                  ),
+                  let state = statusResult["state"] as? String,
+                  state == "running",
+                  let cliPath = bundledCLIPath() else {
+                return nil
+            }
+            return LocalTerminalLaunchConfiguration(
+                sessionID: sessionID,
+                initialCommand: localAttachCommand(
+                    cliPath: cliPath,
+                    socketPath: registration.socketPath,
+                    authTokenFilePath: registration.authTokenFilePath,
+                    sessionID: sessionID
+                ),
+                daemonSocketPath: registration.socketPath,
+                daemonAuthTokenFilePath: registration.authTokenFilePath
+            )
+        }
+    }
+
+    private func localTerminalManagedEnvironment(
+        panelID: UUID,
+        initialEnvironmentOverrides: [String: String],
+        additionalEnvironment: [String: String]
+    ) -> [String: String] {
+        var environment: [String: String] = [:]
+        var protectedKeys: Set<String> = []
+
+        TerminalSurface.applyManagedTerminalIdentityEnvironment(
+            to: &environment,
+            protectedKeys: &protectedKeys
+        )
+
+        func setManagedEnvironmentValue(_ key: String, _ value: String) {
+            environment[key] = value
+            protectedKeys.insert(key)
+        }
+
+        setManagedEnvironmentValue("CMUX_SURFACE_ID", panelID.uuidString)
+        setManagedEnvironmentValue("CMUX_PANEL_ID", panelID.uuidString)
+        setManagedEnvironmentValue("CMUX_WORKSPACE_ID", id.uuidString)
+        setManagedEnvironmentValue("CMUX_TAB_ID", id.uuidString)
+
+        let socketPath = SocketControlSettings.socketPath()
+        setManagedEnvironmentValue("CMUX_SOCKET_PATH", socketPath)
+        setManagedEnvironmentValue("CMUX_SOCKET", socketPath)
+
+        if let bundledCLIPath = Self.bundledCLIPath() {
+            setManagedEnvironmentValue("CMUX_BUNDLED_CLI_PATH", bundledCLIPath)
+        }
+        if let bundleId = Bundle.main.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !bundleId.isEmpty {
+            setManagedEnvironmentValue("CMUX_BUNDLE_ID", bundleId)
+        }
+
+        let portBase = {
+            let value = UserDefaults.standard.integer(forKey: "cmuxPortBase")
+            return value > 0 ? value : 9100
+        }()
+        let portRange = {
+            let value = UserDefaults.standard.integer(forKey: "cmuxPortRange")
+            return value > 0 ? value : 10
+        }()
+        let startPort = portBase + (portOrdinal * portRange)
+        setManagedEnvironmentValue("CMUX_PORT", String(startPort))
+        setManagedEnvironmentValue("CMUX_PORT_END", String(startPort + portRange - 1))
+        setManagedEnvironmentValue("CMUX_PORT_RANGE", String(portRange))
+
+        if !ClaudeCodeIntegrationSettings.hooksEnabled() {
+            setManagedEnvironmentValue("CMUX_CLAUDE_HOOKS_DISABLED", "1")
+        }
+        if let customClaudePath = ClaudeCodeIntegrationSettings.customClaudePath() {
+            setManagedEnvironmentValue("CMUX_CUSTOM_CLAUDE_PATH", customClaudePath)
+        }
+        if !CursorIntegrationSettings.hooksEnabled() {
+            setManagedEnvironmentValue("CMUX_CURSOR_HOOKS_DISABLED", "1")
+        }
+        if !GeminiIntegrationSettings.hooksEnabled() {
+            setManagedEnvironmentValue("CMUX_GEMINI_HOOKS_DISABLED", "1")
+        }
+
+        if let cliBinPath = Bundle.main.resourceURL?.appendingPathComponent("bin").path {
+            let currentPath = environment["PATH"]
+                ?? getenv("PATH").map { String(cString: $0) }
+                ?? ProcessInfo.processInfo.environment["PATH"]
+                ?? ""
+            if !currentPath.split(separator: ":").contains(Substring(cliBinPath)) {
+                let separator = currentPath.isEmpty ? "" : ":"
+                setManagedEnvironmentValue("PATH", "\(cliBinPath)\(separator)\(currentPath)")
+            }
+        }
+
+        let shellIntegrationEnabled = UserDefaults.standard.object(forKey: "sidebarShellIntegration") as? Bool ?? true
+        if shellIntegrationEnabled,
+           let integrationDir = Bundle.main.resourceURL?.appendingPathComponent("shell-integration").path {
+            setManagedEnvironmentValue("CMUX_SHELL_INTEGRATION", "1")
+            setManagedEnvironmentValue("CMUX_SHELL_INTEGRATION_DIR", integrationDir)
+
+            let shell = (environment["SHELL"]?.isEmpty == false ? environment["SHELL"] : nil)
+                ?? getenv("SHELL").map { String(cString: $0) }
+                ?? ProcessInfo.processInfo.environment["SHELL"]
+                ?? "/bin/zsh"
+            let shellName = URL(fileURLWithPath: shell).lastPathComponent
+            if shellName == "zsh" {
+                if GhosttyApp.shared.userGhosttyShellIntegrationMode != "none" {
+                    setManagedEnvironmentValue("CMUX_LOAD_GHOSTTY_ZSH_INTEGRATION", "1")
+                }
+                let candidateZdotdir = (environment["ZDOTDIR"]?.isEmpty == false ? environment["ZDOTDIR"] : nil)
+                    ?? getenv("ZDOTDIR").map { String(cString: $0) }
+                    ?? (ProcessInfo.processInfo.environment["ZDOTDIR"]?.isEmpty == false ? ProcessInfo.processInfo.environment["ZDOTDIR"] : nil)
+
+                if let candidateZdotdir, !candidateZdotdir.isEmpty {
+                    var isGhosttyInjected = false
+                    let ghosttyResources = (environment["GHOSTTY_RESOURCES_DIR"]?.isEmpty == false ? environment["GHOSTTY_RESOURCES_DIR"] : nil)
+                        ?? getenv("GHOSTTY_RESOURCES_DIR").map { String(cString: $0) }
+                        ?? (ProcessInfo.processInfo.environment["GHOSTTY_RESOURCES_DIR"]?.isEmpty == false ? ProcessInfo.processInfo.environment["GHOSTTY_RESOURCES_DIR"] : nil)
+                    if let ghosttyResources {
+                        let ghosttyZdotdir = URL(fileURLWithPath: ghosttyResources)
+                            .appendingPathComponent("shell-integration/zsh").path
+                        isGhosttyInjected = (candidateZdotdir == ghosttyZdotdir)
+                    }
+                    if !isGhosttyInjected {
+                        setManagedEnvironmentValue("CMUX_ZSH_ZDOTDIR", candidateZdotdir)
+                    }
+                }
+                setManagedEnvironmentValue("ZDOTDIR", integrationDir)
+            } else if shellName == "bash" {
+                if GhosttyApp.shared.userGhosttyShellIntegrationMode != "none" {
+                    setManagedEnvironmentValue("CMUX_LOAD_GHOSTTY_BASH_INTEGRATION", "1")
+                }
+                setManagedEnvironmentValue("PROMPT_COMMAND", """
+                unset PROMPT_COMMAND; \
+                if [[ "${CMUX_LOAD_GHOSTTY_BASH_INTEGRATION:-0}" == "1" && -n "${GHOSTTY_RESOURCES_DIR:-}" ]]; then \
+                _cmux_ghostty_bash="$GHOSTTY_RESOURCES_DIR/shell-integration/bash/ghostty.bash"; \
+                [[ -r "$_cmux_ghostty_bash" ]] && source "$_cmux_ghostty_bash"; \
+                fi; \
+                if [[ "${CMUX_SHELL_INTEGRATION:-1}" != "0" && -n "${CMUX_SHELL_INTEGRATION_DIR:-}" ]]; then \
+                _cmux_bash_integration="$CMUX_SHELL_INTEGRATION_DIR/cmux-bash-integration.bash"; \
+                [[ -r "$_cmux_bash_integration" ]] && source "$_cmux_bash_integration"; \
+                fi; \
+                unset _cmux_ghostty_bash _cmux_bash_integration; \
+                if declare -F _cmux_prompt_command >/dev/null 2>&1; then _cmux_prompt_command; fi
+                """)
+            }
+        }
+
+        return TerminalSurface.mergedStartupEnvironment(
+            base: environment,
+            protectedKeys: protectedKeys,
+            additionalEnvironment: additionalEnvironment,
+            initialEnvironmentOverrides: initialEnvironmentOverrides
+        )
+    }
+
+    private func mergedLocalTerminalEnvironment(
+        panelID: UUID,
+        initialEnvironmentOverrides: [String: String],
+        additionalEnvironment: [String: String]
+    ) -> [String: String] {
+        localTerminalManagedEnvironment(
+            panelID: panelID,
+            initialEnvironmentOverrides: initialEnvironmentOverrides,
+            additionalEnvironment: additionalEnvironment
+        )
+    }
+
+    func terminalRuntimeMetadata(panelId: UUID) -> TerminalRuntimeMetadata {
+        let fallbackTTY = Self.nonEmptyTrimmedString(surfaceTTYNames[panelId])
+        let fallbackDirectory = normalizedSidebarDirectory(panelDirectories[panelId])
+            ?? Self.nonEmptyTrimmedString(terminalPanel(for: panelId)?.directory)
+        let localSessionID = Self.nonEmptyTrimmedString(terminalPanel(for: panelId)?.localSessionID)
+
+        guard let localSessionID,
+              let statusPayload = Self.localTerminalStatusPayload(sessionID: localSessionID) else {
+            return TerminalRuntimeMetadata(
+                ttyName: fallbackTTY,
+                currentDirectory: fallbackDirectory,
+                localSessionID: localSessionID,
+                state: nil,
+                foregroundProcessName: nil,
+                foregroundProcessCommand: nil,
+                title: nil
+            )
+        }
+
+        return TerminalRuntimeMetadata(
+            ttyName: Self.nonEmptyPayloadString(statusPayload["tty_name"]) ?? fallbackTTY,
+            currentDirectory: Self.nonEmptyPayloadString(statusPayload["working_directory"]) ?? fallbackDirectory,
+            localSessionID: localSessionID,
+            state: Self.nonEmptyPayloadString(statusPayload["state"]),
+            foregroundProcessName: Self.nonEmptyPayloadString(statusPayload["foreground_process_name"]),
+            foregroundProcessCommand: Self.nonEmptyPayloadString(statusPayload["foreground_process_command"]),
+            title: Self.nonEmptyPayloadString(statusPayload["title"])
+        )
+    }
+
+    func currentDirectoryForCLI() -> String {
+        if let focusedPanelId,
+           let resolved = terminalRuntimeMetadata(panelId: focusedPanelId).currentDirectory {
+            return resolved
+        }
+        return currentDirectory
+    }
+
+    private func makeTerminalPanel(
+        context: ghostty_surface_context_e,
+        configTemplate: CmuxSurfaceConfigTemplate?,
+        workingDirectory: String? = nil,
+        initialCommand: String? = nil,
+        initialInput: String? = nil,
+        initialEnvironmentOverrides: [String: String] = [:],
+        additionalEnvironment: [String: String] = [:],
+        localTerminalMode: LocalTerminalMode = .auto,
+        localDaemonEligible: Bool = true
+    ) -> TerminalPanel? {
+        let panelID = UUID()
+        let launchConfiguration: LocalTerminalLaunchConfiguration? = {
+            guard localDaemonEligible else { return nil }
+            let requestEnvironment = mergedLocalTerminalEnvironment(
+                panelID: panelID,
+                initialEnvironmentOverrides: initialEnvironmentOverrides,
+                additionalEnvironment: additionalEnvironment
+            )
+            switch localTerminalMode {
+            case .auto:
+                return Self.resolveLocalTerminalLaunchConfiguration(
+                    request: LocalTerminalLaunchRequest(
+                        panelID: panelID,
+                        mode: .create,
+                        requestedWorkingDirectory: workingDirectory,
+                        requestedCommand: initialCommand,
+                        requestedEnvironment: requestEnvironment
+                    )
+                )
+            case .disabled:
+                return nil
+            case .attachExisting(let sessionID):
+                return Self.resolveLocalTerminalLaunchConfiguration(
+                    request: LocalTerminalLaunchRequest(
+                        panelID: panelID,
+                        mode: .attachExisting(sessionID),
+                        requestedWorkingDirectory: workingDirectory,
+                        requestedCommand: initialCommand,
+                        requestedEnvironment: requestEnvironment
+                    )
+                )
+            }
+        }()
+
+        if case .attachExisting = localTerminalMode, launchConfiguration == nil {
+            return nil
+        }
+
+        return TerminalPanel(
+            id: panelID,
+            workspaceId: id,
+            context: context,
+            configTemplate: configTemplate,
+            workingDirectory: workingDirectory,
+            portOrdinal: portOrdinal,
+            initialCommand: launchConfiguration?.initialCommand ?? initialCommand,
+            initialInput: initialInput,
+            initialEnvironmentOverrides: launchConfiguration == nil ? initialEnvironmentOverrides : [:],
+            additionalEnvironment: launchConfiguration == nil ? additionalEnvironment : [:],
+            localSessionID: launchConfiguration?.sessionID
+        )
     }
 
     func refreshSplitButtonTooltips() {
@@ -8855,14 +9623,14 @@ final class Workspace: Identifiable, ObservableObject {
 #endif
 
         // Create the new terminal panel.
-        let newPanel = TerminalPanel(
-            workspaceId: id,
+        let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: splitWorkingDirectory,
-            portOrdinal: portOrdinal,
-            initialCommand: remoteTerminalStartupCommand
-        )
+            initialCommand: remoteTerminalStartupCommand,
+            localTerminalMode: .auto,
+            localDaemonEligible: remoteTerminalStartupCommand == nil
+        )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle
@@ -8941,7 +9709,8 @@ final class Workspace: Identifiable, ObservableObject {
         focus: Bool? = nil,
         workingDirectory: String? = nil,
         initialInput: String? = nil,
-        startupEnvironment: [String: String] = [:]
+        startupEnvironment: [String: String] = [:],
+        localTerminalMode: LocalTerminalMode = .auto
     ) -> TerminalPanel? {
         let shouldFocusNewTab = focus ?? (bonsplitController.focusedPaneId == paneId)
         let previousFocusedPanelId = focusedPanelId
@@ -8951,16 +9720,18 @@ final class Workspace: Identifiable, ObservableObject {
         let remoteTerminalStartupCommand = remoteTerminalStartupCommand()
 
         // Create new terminal panel
-        let newPanel = TerminalPanel(
-            workspaceId: id,
+        guard let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: workingDirectory,
-            portOrdinal: portOrdinal,
             initialCommand: remoteTerminalStartupCommand,
             initialInput: initialInput,
-            additionalEnvironment: startupEnvironment
-        )
+            additionalEnvironment: startupEnvironment,
+            localTerminalMode: localTerminalMode,
+            localDaemonEligible: remoteTerminalStartupCommand == nil
+        ) else {
+            return nil
+        }
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle
@@ -10323,12 +11094,11 @@ final class Workspace: Identifiable, ObservableObject {
             preferredPanelId: focusedPanelId,
             inPane: bonsplitController.focusedPaneId
         )
-        let newPanel = TerminalPanel(
-            workspaceId: id,
+        let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_TAB,
             configTemplate: inheritedConfig,
-            portOrdinal: portOrdinal
-        )
+            localTerminalMode: .auto
+        )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle
@@ -11176,14 +11946,13 @@ final class Workspace: Identifiable, ObservableObject {
     ) -> TerminalPanel? {
         let inheritedConfig = inheritedTerminalConfig(inPane: paneId)
 
-        let newPanel = TerminalPanel(
-            workspaceId: id,
+        let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: workingDirectory,
-            portOrdinal: portOrdinal,
-            initialInput: initialInput
-        )
+            initialInput: initialInput,
+            localTerminalMode: .auto
+        )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle
@@ -12185,12 +12954,11 @@ extension Workspace: BonsplitDelegate {
                     // empty pane during drag-to-split of a single-tab pane.
                     let inheritedConfig = inheritedTerminalConfig(inPane: originalPane)
 
-                    let replacementPanel = TerminalPanel(
-                        workspaceId: id,
+                    let replacementPanel = makeTerminalPanel(
                         context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
                         configTemplate: inheritedConfig,
-                        portOrdinal: portOrdinal
-                    )
+                        localTerminalMode: .auto
+                    )!
                     configureTerminalPanel(replacementPanel)
                     panels[replacementPanel.id] = replacementPanel
                     panelTitles[replacementPanel.id] = replacementPanel.displayTitle
@@ -12252,12 +13020,11 @@ extension Workspace: BonsplitDelegate {
             inPane: originalPane
         )
 
-        let newPanel = TerminalPanel(
-            workspaceId: id,
+        let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
-            portOrdinal: portOrdinal
-        )
+            localTerminalMode: .auto
+        )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle

@@ -1718,6 +1718,16 @@ struct CMUXCLI {
             return
         }
 
+        if command == "local-daemon" {
+            try runLocalDaemon(commandArgs: commandArgs)
+            return
+        }
+
+        if command == "local-attach" {
+            try runLocalAttach(commandArgs: commandArgs)
+            return
+        }
+
         // If the argument looks like a path (not a known command), open a workspace there.
         if looksLikePath(command) {
             try openPath(command, socketPath: resolvedSocketPath)
@@ -6808,6 +6818,19 @@ struct CMUXCLI {
     /// Return the help/usage text for a subcommand, or nil if the command is unknown.
     private func subcommandUsage(_ command: String) -> String? {
         switch command {
+        case "local-daemon":
+            return """
+            Usage: cmux local-daemon serve [--socket <path>]
+                   cmux local-daemon rpc [--socket <path>] <method> [json-params]
+
+            Start or inspect the local PTY daemon used for detach/attach development.
+            """
+        case "local-attach":
+            return """
+            Usage: cmux local-attach --session <id> [--socket <path>] [--attachment-id <id>] [--last-acked-seq <n>]
+
+            Attach stdin/stdout to a local daemon-backed PTY session.
+            """
         case "ping":
             return """
             Usage: cmux ping
@@ -14344,6 +14367,14 @@ struct CMUXCLI {
         return URL(fileURLWithPath: expanded).standardizedFileURL
     }
 
+    private func runLocalDaemon(commandArgs: [String]) throws {
+        try LocalTerminalDaemonTool(commandArgs: commandArgs).run()
+    }
+
+    private func runLocalAttach(commandArgs: [String]) throws {
+        try LocalTerminalAttachTool(commandArgs: commandArgs).run()
+    }
+
     private func usage() -> String {
         return """
         cmux - control cmux via Unix socket
@@ -14370,6 +14401,9 @@ struct CMUXCLI {
           omx [omx-args...]
           omc [omc-args...]
           codex <install-hooks|uninstall-hooks>
+          local-daemon serve [--socket <path>]
+          local-daemon rpc [--socket <path>] <method> [json-params]
+          local-attach --session <id> [--socket <path>] [--attachment-id <id>] [--last-acked-seq <n>]
           ping
           version
           capabilities
@@ -14503,6 +14537,1451 @@ struct CMUXCLI {
         formatDebugTerminalsPayload(payload, idFormat: idFormat)
     }
 #endif
+}
+
+private struct LocalTerminalAttachment {
+    var cols: Int
+    var rows: Int
+    var updatedAt: Date
+}
+
+private struct LocalTerminalChunk {
+    let startSeq: UInt64
+    let endSeq: UInt64
+    let data: Data
+
+    func suffix(after afterSeq: UInt64) -> LocalTerminalChunk? {
+        guard endSeq > afterSeq else { return nil }
+        let clampedStart = max(startSeq, afterSeq)
+        let startOffset = Int(clampedStart - startSeq)
+        guard startOffset < data.count else { return nil }
+        let suffix = data.subdata(in: startOffset..<data.count)
+        return LocalTerminalChunk(startSeq: clampedStart, endSeq: endSeq, data: suffix)
+    }
+}
+
+private struct LocalTerminalProcessSnapshot {
+    let pid: Int32
+    let ppid: Int32
+    let pgid: Int32
+    let tpgid: Int32
+    let tty: String
+    let executableName: String
+    let command: String
+}
+
+private struct LocalTerminalForegroundProcessMetadata {
+    let pid: Int32
+    let executableName: String
+    let command: String
+    let workingDirectory: String?
+    let title: String
+}
+
+private final class LocalTerminalSession {
+    let sessionID: String
+    let process: Process
+    let masterHandle: FileHandle
+    let masterFD: Int32
+    let ttyName: String?
+    let requestedCommand: String?
+    let requestedWorkingDirectory: String?
+    let requestedEnvironment: [String: String]
+    let createdAt: Date
+    let retainedLogFileURL: URL
+    let retainedByteLimit: Int
+    let coldAttachTailByteLimit: Int
+
+    var attachments: [String: LocalTerminalAttachment]
+    var retainedLogHandle: FileHandle
+    var retainedStartSeq: UInt64
+    var retainedByteCount: Int
+    var nextSeq: UInt64
+    var lastKnownCols: Int
+    var lastKnownRows: Int
+    var effectiveCols: Int
+    var effectiveRows: Int
+    var state: String
+    var terminationStatus: Int32?
+    var eofObserved: Bool
+
+    init(
+        sessionID: String,
+        process: Process,
+        masterHandle: FileHandle,
+        masterFD: Int32,
+        ttyName: String?,
+        requestedCommand: String?,
+        requestedWorkingDirectory: String?,
+        requestedEnvironment: [String: String],
+        retainedLogFileURL: URL,
+        retainedByteLimit: Int,
+        coldAttachTailByteLimit: Int,
+        initialCols: Int,
+        initialRows: Int
+    ) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: retainedLogFileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if fileManager.fileExists(atPath: retainedLogFileURL.path) {
+            try fileManager.removeItem(at: retainedLogFileURL)
+        }
+        guard fileManager.createFile(atPath: retainedLogFileURL.path, contents: Data()) else {
+            throw CLIError(message: "Failed to create retained VT log at \(retainedLogFileURL.path)")
+        }
+        let retainedLogHandle = try FileHandle(forUpdating: retainedLogFileURL)
+
+        self.sessionID = sessionID
+        self.process = process
+        self.masterHandle = masterHandle
+        self.masterFD = masterFD
+        self.ttyName = ttyName
+        self.requestedCommand = requestedCommand
+        self.requestedWorkingDirectory = requestedWorkingDirectory
+        self.requestedEnvironment = requestedEnvironment
+        self.createdAt = Date()
+        self.retainedLogFileURL = retainedLogFileURL
+        self.retainedByteLimit = max(retainedByteLimit, 65_536)
+        self.coldAttachTailByteLimit = max(min(coldAttachTailByteLimit, max(retainedByteLimit, 65_536)), 1)
+        self.attachments = [:]
+        self.retainedLogHandle = retainedLogHandle
+        self.retainedStartSeq = 0
+        self.retainedByteCount = 0
+        self.nextSeq = 0
+        self.lastKnownCols = initialCols
+        self.lastKnownRows = initialRows
+        self.effectiveCols = initialCols
+        self.effectiveRows = initialRows
+        self.state = "running"
+        self.terminationStatus = nil
+        self.eofObserved = false
+    }
+
+    deinit {
+        masterHandle.readabilityHandler = nil
+        try? retainedLogHandle.close()
+    }
+
+    func appendOutput(_ data: Data) {
+        guard !data.isEmpty else { return }
+        nextSeq += UInt64(data.count)
+        do {
+            try retainedLogHandle.seekToEnd()
+            try retainedLogHandle.write(contentsOf: data)
+            retainedByteCount += data.count
+            try trimRetainedLogIfNeeded()
+        } catch {
+            // Keep the daemon alive even if persistence fails; callers can still hot-attach.
+        }
+    }
+
+    private func trimRetainedLogIfNeeded() throws {
+        guard retainedByteCount > retainedByteLimit else { return }
+        let fileData = try Data(contentsOf: retainedLogFileURL)
+        guard fileData.count > retainedByteLimit else {
+            retainedByteCount = fileData.count
+            return
+        }
+        let tail = Data(fileData.suffix(retainedByteLimit))
+        let droppedBytes = fileData.count - tail.count
+        try tail.write(to: retainedLogFileURL, options: .atomic)
+        try? retainedLogHandle.close()
+        retainedLogHandle = try FileHandle(forUpdating: retainedLogFileURL)
+        try retainedLogHandle.seekToEnd()
+        retainedStartSeq += UInt64(droppedBytes)
+        retainedByteCount = tail.count
+    }
+
+    private func readRetainedData(offset: Int, count: Int) -> Data {
+        guard offset >= 0, count > 0 else { return Data() }
+        guard let reader = try? FileHandle(forReadingFrom: retainedLogFileURL) else {
+            return Data()
+        }
+        defer { try? reader.close() }
+        do {
+            try reader.seek(toOffset: UInt64(offset))
+            return try reader.read(upToCount: count) ?? Data()
+        } catch {
+            return Data()
+        }
+    }
+
+    func updateAttachment(_ attachmentID: String, cols: Int, rows: Int, now: Date, staleAfter: TimeInterval) {
+        attachments[attachmentID] = LocalTerminalAttachment(cols: cols, rows: rows, updatedAt: now)
+        pruneStaleAttachments(now: now, staleAfter: staleAfter)
+        recomputeEffectiveSize()
+    }
+
+    func refreshAttachment(_ attachmentID: String, now: Date, staleAfter: TimeInterval) {
+        if var attachment = attachments[attachmentID] {
+            attachment.updatedAt = now
+            attachments[attachmentID] = attachment
+        }
+        pruneStaleAttachments(now: now, staleAfter: staleAfter)
+        recomputeEffectiveSize()
+    }
+
+    func detachAttachment(_ attachmentID: String, now: Date, staleAfter: TimeInterval) {
+        attachments.removeValue(forKey: attachmentID)
+        pruneStaleAttachments(now: now, staleAfter: staleAfter)
+        recomputeEffectiveSize()
+    }
+
+    func pruneStaleAttachments(now: Date, staleAfter: TimeInterval) {
+        attachments = attachments.filter { _, attachment in
+            now.timeIntervalSince(attachment.updatedAt) <= staleAfter
+        }
+    }
+
+    func recomputeEffectiveSize() {
+        if attachments.isEmpty {
+            effectiveCols = lastKnownCols
+            effectiveRows = lastKnownRows
+        } else {
+            let cols = attachments.values.map(\.cols).min() ?? lastKnownCols
+            let rows = attachments.values.map(\.rows).min() ?? lastKnownRows
+            effectiveCols = cols
+            effectiveRows = rows
+            lastKnownCols = cols
+            lastKnownRows = rows
+        }
+        Self.applyTerminalSize(fileDescriptor: masterFD, cols: effectiveCols, rows: effectiveRows)
+    }
+
+    func read(afterSeq: UInt64, limitBytes: Int) -> (data: Data, startSeq: UInt64?, endSeq: UInt64, truncated: Bool) {
+        let earliestSeq = retainedStartSeq
+        let truncated = afterSeq < earliestSeq
+        let cursor = max(afterSeq, earliestSeq)
+        guard limitBytes > 0 else {
+            return (Data(), nil, cursor, truncated)
+        }
+        guard cursor < nextSeq else {
+            return (Data(), nil, cursor, truncated)
+        }
+
+        let offset = Int(cursor - retainedStartSeq)
+        let availableByteCount = max(0, retainedByteCount - offset)
+        guard availableByteCount > 0 else {
+            return (Data(), nil, cursor, truncated)
+        }
+
+        let output = readRetainedData(offset: offset, count: min(limitBytes, availableByteCount))
+        let responseEnd = cursor + UInt64(output.count)
+        return (
+            output,
+            output.isEmpty ? nil : cursor,
+            responseEnd,
+            truncated
+        )
+    }
+
+    func coldAttachReplayStartSeq() -> UInt64 {
+        guard nextSeq > UInt64(coldAttachTailByteLimit) else {
+            return retainedStartSeq
+        }
+        return max(retainedStartSeq, nextSeq - UInt64(coldAttachTailByteLimit))
+    }
+
+    func runtimeMetadataPayload() -> [String: Any] {
+        guard let foreground = Self.sampleForegroundProcessMetadata(
+            rootPID: Int32(process.processIdentifier),
+            ttyName: ttyName
+        ) else {
+            return [:]
+        }
+        return [
+            "foreground_process_pid": foreground.pid,
+            "foreground_process_name": foreground.executableName,
+            "foreground_process_command": foreground.command,
+            "working_directory": (foreground.workingDirectory as Any?) ?? NSNull(),
+            "title": foreground.title,
+        ]
+    }
+
+    func statusPayload(now: Date) -> [String: Any] {
+        let runtimeMetadata = runtimeMetadataPayload()
+        let attachmentsPayload = attachments.keys.sorted().compactMap { attachmentID -> [String: Any]? in
+            guard let attachment = attachments[attachmentID] else { return nil }
+            return [
+                "attachment_id": attachmentID,
+                "cols": attachment.cols,
+                "rows": attachment.rows,
+                "age_seconds": now.timeIntervalSince(attachment.updatedAt)
+            ]
+        }
+        return [
+            "session_id": sessionID,
+            "state": state,
+            "tty_name": (ttyName as Any?) ?? NSNull(),
+            "working_directory": runtimeMetadata["working_directory"] ?? (requestedWorkingDirectory as Any?) ?? NSNull(),
+            "requested_command": (requestedCommand as Any?) ?? NSNull(),
+            "foreground_process_pid": runtimeMetadata["foreground_process_pid"] ?? NSNull(),
+            "foreground_process_name": runtimeMetadata["foreground_process_name"] ?? NSNull(),
+            "foreground_process_command": runtimeMetadata["foreground_process_command"] ?? NSNull(),
+            "title": runtimeMetadata["title"] ?? (requestedCommand as Any?) ?? NSNull(),
+            "effective_cols": effectiveCols,
+            "effective_rows": effectiveRows,
+            "last_known_cols": lastKnownCols,
+            "last_known_rows": lastKnownRows,
+            "next_seq": nextSeq,
+            "buffered_bytes": retainedByteCount,
+            "retained_start_seq": retainedStartSeq,
+            "cold_attach_replay_start_seq": coldAttachReplayStartSeq(),
+            "attachments": attachmentsPayload,
+            "created_at": ISO8601DateFormatter().string(from: createdAt),
+            "termination_status": terminationStatus.map { NSNumber(value: $0) } ?? NSNull(),
+            "eof": eofObserved
+        ]
+    }
+
+    func close() {
+        masterHandle.readabilityHandler = nil
+        if process.isRunning {
+            process.terminate()
+        }
+        masterHandle.closeFile()
+        try? retainedLogHandle.close()
+        state = "closed"
+        eofObserved = true
+    }
+
+    static func normalizedTTYName(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let lastComponent = trimmed.split(separator: "/").last {
+            return String(lastComponent)
+        }
+        return trimmed
+    }
+
+    static func sampleForegroundProcessMetadata(
+        rootPID: Int32,
+        ttyName: String?
+    ) -> LocalTerminalForegroundProcessMetadata? {
+        let snapshots = processSnapshots()
+        var foreground = bestDescendantProcess(rootPID: rootPID, snapshots: snapshots)
+        if foreground == nil, let ttyName, let normalizedTTY = normalizedTTYName(ttyName) {
+            foreground = snapshots
+                .filter { snapshot in
+                    normalizedTTYName(snapshot.tty) == normalizedTTY &&
+                        snapshot.pgid > 0 &&
+                        snapshot.tpgid > 0 &&
+                        snapshot.pgid == snapshot.tpgid
+                }
+                .sorted { lhs, rhs in
+                    if lhs.pid != rhs.pid { return lhs.pid > rhs.pid }
+                    return lhs.pgid > rhs.pgid
+                }
+                .first
+        }
+
+        guard let foreground else { return nil }
+        let executableName = foreground.executableName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCommand = foreground.command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let titleSource = executableName.isEmpty
+            ? trimmedCommand.split(separator: " ").first.map(String.init) ?? ""
+            : executableName
+        let title = URL(fileURLWithPath: titleSource).lastPathComponent
+        return LocalTerminalForegroundProcessMetadata(
+            pid: foreground.pid,
+            executableName: executableName.isEmpty ? title : executableName,
+            command: trimmedCommand,
+            workingDirectory: workingDirectory(forPID: foreground.pid),
+            title: title
+        )
+    }
+
+    private static func bestDescendantProcess(
+        rootPID: Int32,
+        snapshots: [LocalTerminalProcessSnapshot]
+    ) -> LocalTerminalProcessSnapshot? {
+        var snapshotByPID: [Int32: LocalTerminalProcessSnapshot] = [:]
+        var childrenByPPID: [Int32: [LocalTerminalProcessSnapshot]] = [:]
+        for snapshot in snapshots {
+            snapshotByPID[snapshot.pid] = snapshot
+            childrenByPPID[snapshot.ppid, default: []].append(snapshot)
+        }
+        guard let root = snapshotByPID[rootPID] else { return nil }
+
+        var descendantIDs: Set<Int32> = [rootPID]
+        var pending: [Int32] = [rootPID]
+        while let current = pending.popLast() {
+            for child in childrenByPPID[current] ?? [] where !descendantIDs.contains(child.pid) {
+                descendantIDs.insert(child.pid)
+                pending.append(child.pid)
+            }
+        }
+
+        let candidates = descendantIDs.compactMap { snapshotByPID[$0] }
+        let leafCandidates = candidates.filter { (childrenByPPID[$0.pid] ?? []).isEmpty }
+        return (leafCandidates.isEmpty ? candidates : leafCandidates).sorted { lhs, rhs in
+            if lhs.pid != rhs.pid { return lhs.pid > rhs.pid }
+            return lhs.ppid > rhs.ppid
+        }.first ?? root
+    }
+
+    private static func processSnapshots() -> [LocalTerminalProcessSnapshot] {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-ww", "-axo", "pid=,ppid=,pgid=,tpgid=,tty=,ucomm=,command="]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return []
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let output = String(data: data, encoding: .utf8) else {
+            return []
+        }
+
+        return output.split(separator: "\n").compactMap(parseProcessSnapshot)
+    }
+
+    private static func parseProcessSnapshot(_ line: Substring) -> LocalTerminalProcessSnapshot? {
+        let parts = line.split(maxSplits: 6, whereSeparator: \.isWhitespace)
+        guard parts.count == 7,
+              let pid = Int32(parts[0]),
+              let ppid = Int32(parts[1]),
+              let pgid = Int32(parts[2]),
+              let tpgid = Int32(parts[3]) else {
+            return nil
+        }
+        return LocalTerminalProcessSnapshot(
+            pid: pid,
+            ppid: ppid,
+            pgid: pgid,
+            tpgid: tpgid,
+            tty: String(parts[4]),
+            executableName: String(parts[5]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            command: String(parts[6]).trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    private static func workingDirectory(forPID pid: Int32) -> String? {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let output = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        for line in output.split(separator: "\n") where line.hasPrefix("n") {
+            let path = String(line.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !path.isEmpty {
+                return path
+            }
+        }
+        return nil
+    }
+
+    static func applyTerminalSize(fileDescriptor: Int32, cols: Int, rows: Int) {
+        guard cols > 0, rows > 0 else { return }
+        var winsizeValue = winsize(
+            ws_row: UInt16(max(1, min(rows, Int(UInt16.max)))),
+            ws_col: UInt16(max(1, min(cols, Int(UInt16.max)))),
+            ws_xpixel: 0,
+            ws_ypixel: 0
+        )
+        _ = withUnsafeMutablePointer(to: &winsizeValue) { pointer in
+            ioctl(fileDescriptor, TIOCSWINSZ, pointer)
+        }
+    }
+}
+
+private final class LocalTerminalDaemonConnection {
+    let fileDescriptor: Int32
+    private weak var server: LocalTerminalDaemonServer?
+    private let queue: DispatchQueue
+    private let writeLock = NSLock()
+    private var bufferedData = Data()
+    private var isClosed = false
+
+    init(fileDescriptor: Int32, server: LocalTerminalDaemonServer) {
+        self.fileDescriptor = fileDescriptor
+        self.server = server
+        self.queue = DispatchQueue(label: "com.cmux.local-daemon.connection.\(UUID().uuidString)")
+    }
+
+    func start() {
+        queue.async { [self] in
+            self.readLoop()
+        }
+    }
+
+    func close() {
+        guard !isClosed else { return }
+        isClosed = true
+        Darwin.close(fileDescriptor)
+        server?.connectionDidClose(self)
+    }
+
+    private func readLoop() {
+        while !isClosed {
+            readAvailable()
+            if isClosed {
+                return
+            }
+        }
+    }
+
+    private func readAvailable() {
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+            guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+            return Darwin.read(fileDescriptor, baseAddress, rawBuffer.count)
+        }
+        if bytesRead > 0 {
+            buffer.withUnsafeBufferPointer { pointer in
+                guard let baseAddress = pointer.baseAddress else { return }
+                bufferedData.append(baseAddress, count: bytesRead)
+            }
+            drainLines()
+            return
+        }
+        close()
+    }
+
+    private func drainLines() {
+        while let newlineRange = bufferedData.firstRange(of: Data([0x0A])) {
+            let lineData = bufferedData.subdata(in: bufferedData.startIndex..<newlineRange.lowerBound)
+            bufferedData.removeSubrange(bufferedData.startIndex..<newlineRange.upperBound)
+            guard !lineData.isEmpty else { continue }
+
+            guard let object = try? JSONSerialization.jsonObject(with: lineData, options: []) as? [String: Any] else {
+                send([
+                    "ok": false,
+                    "error": [
+                        "code": "invalid_request",
+                        "message": "invalid JSON request"
+                    ]
+                ])
+                continue
+            }
+
+            let response = server?.handleRequest(object, connection: self) ?? [
+                "ok": false,
+                "error": [
+                    "code": "server_unavailable",
+                    "message": "local daemon server unavailable"
+                ]
+            ]
+            send(response)
+        }
+    }
+
+    func send(_ object: [String: Any]) {
+        guard !isClosed,
+              JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            return
+        }
+        var frame = data
+        frame.append(0x0A)
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        _ = frame.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+            var remaining = rawBuffer.count
+            var offset = 0
+            while remaining > 0 {
+                let written = Darwin.write(fileDescriptor, baseAddress.advanced(by: offset), remaining)
+                if written <= 0 {
+                    break
+                }
+                remaining -= written
+                offset += written
+            }
+            return offset
+        }
+    }
+}
+
+private struct LocalTerminalDaemonServerConfiguration {
+    let socketPath: String
+    let authToken: String
+    let retainedByteLimit: Int
+    let coldAttachTailByteLimit: Int
+    let sessionLogDirectoryURL: URL
+}
+
+private final class LocalTerminalDaemonServer {
+    private static let staleAttachmentInterval: TimeInterval = 3.0
+
+    private let configuration: LocalTerminalDaemonServerConfiguration
+    private let stateQueue = DispatchQueue(label: "com.cmux.local-daemon.state")
+    private var listenerFD: Int32 = -1
+    private var connections: [ObjectIdentifier: LocalTerminalDaemonConnection] = [:]
+    private var sessions: [String: LocalTerminalSession] = [:]
+    private var nextSessionID: UInt64 = 1
+
+    init(configuration: LocalTerminalDaemonServerConfiguration) {
+        self.configuration = configuration
+    }
+
+    func run() throws {
+        try prepareListener()
+        while true {
+            let clientFD = Darwin.accept(listenerFD, nil, nil)
+            if clientFD >= 0 {
+                let connection = LocalTerminalDaemonConnection(fileDescriptor: clientFD, server: self)
+                stateQueue.sync {
+                    connections[ObjectIdentifier(connection)] = connection
+                }
+                connection.start()
+                continue
+            }
+            if errno == EINTR {
+                continue
+            }
+            throw CLIError(message: "Local daemon accept failed: \(String(cString: strerror(errno)))")
+        }
+    }
+
+    func handleRequest(_ request: [String: Any], connection _: LocalTerminalDaemonConnection) -> [String: Any] {
+        let requestID = request["id"] ?? NSNull()
+        guard let method = request["method"] as? String, !method.isEmpty else {
+            return [
+                "id": requestID,
+                "ok": false,
+                "error": [
+                    "code": "invalid_request",
+                    "message": "method is required"
+                ]
+            ]
+        }
+        guard request["auth_token"] as? String == configuration.authToken else {
+            return [
+                "id": requestID,
+                "ok": false,
+                "error": [
+                    "code": "auth_failed",
+                    "message": "local daemon authentication failed"
+                ]
+            ]
+        }
+        let params = request["params"] as? [String: Any] ?? [:]
+
+        do {
+            let result = try stateQueue.sync {
+                try self.handleRequestLocked(method: method, params: params)
+            }
+            return [
+                "id": requestID,
+                "ok": true,
+                "result": result
+            ]
+        } catch {
+            return [
+                "id": requestID,
+                "ok": false,
+                "error": [
+                    "code": "local_daemon_error",
+                    "message": String(describing: error)
+                ]
+            ]
+        }
+    }
+
+    func connectionDidClose(_ connection: LocalTerminalDaemonConnection) {
+        stateQueue.async {
+            self.connections.removeValue(forKey: ObjectIdentifier(connection))
+        }
+    }
+
+    private func prepareListener() throws {
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: configuration.socketPath).deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+        unlink(configuration.socketPath)
+
+        listenerFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard listenerFD >= 0 else {
+            throw CLIError(message: "Failed to create local daemon socket")
+        }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let maxLength = MemoryLayout.size(ofValue: address.sun_path)
+        let utf8Bytes = Array(configuration.socketPath.utf8)
+        guard utf8Bytes.count < maxLength else {
+            throw CLIError(message: "Local daemon socket path is too long: \(configuration.socketPath)")
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { rawBuffer in
+            rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
+            for (index, value) in utf8Bytes.enumerated() {
+                rawBuffer[index] = value
+            }
+        }
+
+        let bindResult = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.bind(listenerFD, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_un>.stride))
+            }
+        }
+        guard bindResult == 0 else {
+            throw CLIError(message: "Failed to bind local daemon socket at \(configuration.socketPath)")
+        }
+        chmod(configuration.socketPath, 0o600)
+
+        guard listen(listenerFD, 32) == 0 else {
+            throw CLIError(message: "Failed to listen on local daemon socket")
+        }
+    }
+
+    private func handleRequestLocked(method: String, params: [String: Any]) throws -> [String: Any] {
+        switch method {
+        case "hello":
+            return [
+                "name": "cmuxd-local",
+                "version": "dev",
+                "capabilities": [
+                    "session.attach",
+                    "session.poll",
+                    "session.resize.min",
+                    "session.replay.disk"
+                ]
+            ]
+        case "session.list":
+            let now = Date()
+            return [
+                "sessions": sessions.keys.sorted().compactMap { sessionID in
+                    sessions[sessionID]?.statusPayload(now: now)
+                }
+            ]
+        case "session.open":
+            return try openSession(params: params)
+        case "session.status":
+            return try withSession(params: params) { session in
+                session.statusPayload(now: Date())
+            }
+        case "session.attach":
+            return try withSession(params: params) { session in
+                let attachmentID = try Self.requireString(params, key: "attachment_id")
+                let cols = Self.requireInt(params, key: "cols")
+                let rows = Self.requireInt(params, key: "rows")
+                let now = Date()
+                session.updateAttachment(attachmentID, cols: cols, rows: rows, now: now, staleAfter: Self.staleAttachmentInterval)
+                return session.statusPayload(now: now)
+            }
+        case "session.detach":
+            return try withSession(params: params) { session in
+                let attachmentID = try Self.requireString(params, key: "attachment_id")
+                let now = Date()
+                session.detachAttachment(attachmentID, now: now, staleAfter: Self.staleAttachmentInterval)
+                return session.statusPayload(now: now)
+            }
+        case "session.resize":
+            return try withSession(params: params) { session in
+                let attachmentID = try Self.requireString(params, key: "attachment_id")
+                let cols = Self.requireInt(params, key: "cols")
+                let rows = Self.requireInt(params, key: "rows")
+                let now = Date()
+                session.updateAttachment(attachmentID, cols: cols, rows: rows, now: now, staleAfter: Self.staleAttachmentInterval)
+                return session.statusPayload(now: now)
+            }
+        case "session.write":
+            return try withSession(params: params) { session in
+                let attachmentID = (params["attachment_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let attachmentID, !attachmentID.isEmpty {
+                    session.refreshAttachment(attachmentID, now: Date(), staleAfter: Self.staleAttachmentInterval)
+                }
+                let dataBase64 = try Self.requireString(params, key: "data_base64")
+                guard let data = Data(base64Encoded: dataBase64) else {
+                    throw CLIError(message: "session.write requires valid base64 data")
+                }
+                try session.masterHandle.write(contentsOf: data)
+                return [
+                    "written": data.count,
+                    "next_seq": session.nextSeq
+                ]
+            }
+        case "session.read":
+            return try withSession(params: params) { session in
+                let afterSeq = Self.optionalUInt64(params, key: "after_seq") ?? 0
+                let limitBytes = Self.optionalInt(params, key: "limit_bytes") ?? 65_536
+                if let attachmentID = (params["attachment_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !attachmentID.isEmpty {
+                    session.refreshAttachment(attachmentID, now: Date(), staleAfter: Self.staleAttachmentInterval)
+                }
+                let readResult = session.read(afterSeq: afterSeq, limitBytes: limitBytes)
+                return [
+                    "session_id": session.sessionID,
+                    "data_base64": readResult.data.base64EncodedString(),
+                    "start_seq": readResult.startSeq.map { NSNumber(value: $0) } ?? NSNull(),
+                    "end_seq": readResult.endSeq,
+                    "next_seq": session.nextSeq,
+                    "truncated": readResult.truncated,
+                    "eof": session.eofObserved && readResult.endSeq >= session.nextSeq,
+                    "state": session.state
+                ]
+            }
+        case "session.close":
+            let sessionID = try Self.requireString(params, key: "session_id")
+            guard let session = sessions.removeValue(forKey: sessionID) else {
+                throw CLIError(message: "Unknown session \(sessionID)")
+            }
+            session.close()
+            return [
+                "session_id": sessionID,
+                "closed": true
+            ]
+        default:
+            throw CLIError(message: "Unknown local daemon method '\(method)'")
+        }
+    }
+
+    private func openSession(params: [String: Any]) throws -> [String: Any] {
+        let requestedSessionID = (params["session_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionID: String
+        if let requestedSessionID, !requestedSessionID.isEmpty {
+            sessionID = requestedSessionID
+        } else {
+            sessionID = "local-sess-\(nextSessionID)"
+            nextSessionID += 1
+        }
+
+        if let existing = sessions[sessionID] {
+            return existing.statusPayload(now: Date())
+        }
+
+        let cols = max(1, Self.optionalInt(params, key: "cols") ?? 80)
+        let rows = max(1, Self.optionalInt(params, key: "rows") ?? 24)
+        let workingDirectory = (params["working_directory"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = (params["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let environment = (params["environment"] as? [String: String]) ?? [:]
+
+        var masterFD: Int32 = -1
+        var slaveFD: Int32 = -1
+        guard openpty(&masterFD, &slaveFD, nil, nil, nil) == 0 else {
+            throw CLIError(message: "openpty failed: \(String(cString: strerror(errno)))")
+        }
+        LocalTerminalSession.applyTerminalSize(fileDescriptor: slaveFD, cols: cols, rows: rows)
+
+        let masterHandle = FileHandle(fileDescriptor: masterFD, closeOnDealloc: true)
+        let slaveHandle = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: true)
+        let process = Process()
+
+        var resolvedEnvironment = ProcessInfo.processInfo.environment
+        for (key, value) in environment {
+            let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedKey.isEmpty else { continue }
+            resolvedEnvironment[trimmedKey] = value
+        }
+
+        let shell = (resolvedEnvironment["SHELL"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? resolvedEnvironment["SHELL"]!
+            : "/bin/zsh"
+        process.executableURL = URL(fileURLWithPath: shell)
+        if let command, !command.isEmpty {
+            process.arguments = ["-lc", command]
+        } else {
+            process.arguments = ["-l"]
+        }
+        if let workingDirectory, !workingDirectory.isEmpty {
+            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
+        }
+        process.environment = resolvedEnvironment
+        process.standardInput = slaveHandle
+        process.standardOutput = slaveHandle
+        process.standardError = slaveHandle
+
+        let ttyName = ttyname(slaveFD).map { String(cString: $0) }
+        let retainedLogFileURL = configuration.sessionLogDirectoryURL
+            .appendingPathComponent("\(sessionID).vtlog", isDirectory: false)
+
+        let session = try LocalTerminalSession(
+            sessionID: sessionID,
+            process: process,
+            masterHandle: masterHandle,
+            masterFD: masterFD,
+            ttyName: ttyName,
+            requestedCommand: command,
+            requestedWorkingDirectory: workingDirectory,
+            requestedEnvironment: environment,
+            retainedLogFileURL: retainedLogFileURL,
+            retainedByteLimit: configuration.retainedByteLimit,
+            coldAttachTailByteLimit: configuration.coldAttachTailByteLimit,
+            initialCols: cols,
+            initialRows: rows
+        )
+
+        process.terminationHandler = { [weak self, weak session] process in
+            self?.stateQueue.async {
+                guard let session else { return }
+                session.state = "exited"
+                session.terminationStatus = process.terminationStatus
+            }
+        }
+        masterHandle.readabilityHandler = { [weak self, weak session] handle in
+            let data = handle.availableData
+            self?.stateQueue.async {
+                guard let session else { return }
+                if data.isEmpty {
+                    session.eofObserved = true
+                    return
+                }
+                session.appendOutput(data)
+            }
+        }
+
+        try process.run()
+        slaveHandle.closeFile()
+        sessions[sessionID] = session
+        return session.statusPayload(now: Date())
+    }
+
+    private func withSession(
+        params: [String: Any],
+        _ body: (LocalTerminalSession) throws -> [String: Any]
+    ) throws -> [String: Any] {
+        let sessionID = try Self.requireString(params, key: "session_id")
+        guard let session = sessions[sessionID] else {
+            throw CLIError(message: "Unknown session \(sessionID)")
+        }
+        return try body(session)
+    }
+
+    private static func requireString(_ params: [String: Any], key: String) throws -> String {
+        guard let value = (params[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            throw CLIError(message: "Missing or invalid '\(key)'")
+        }
+        return value
+    }
+
+    private static func requireInt(_ params: [String: Any], key: String) -> Int {
+        max(1, optionalInt(params, key: key) ?? 0)
+    }
+
+    private static func optionalInt(_ params: [String: Any], key: String) -> Int? {
+        if let value = params[key] as? Int {
+            return value
+        }
+        if let value = params[key] as? NSNumber {
+            return value.intValue
+        }
+        if let value = params[key] as? String {
+            return Int(value)
+        }
+        return nil
+    }
+
+    private static func optionalUInt64(_ params: [String: Any], key: String) -> UInt64? {
+        if let value = params[key] as? UInt64 {
+            return value
+        }
+        if let value = params[key] as? NSNumber {
+            return value.uint64Value
+        }
+        if let value = params[key] as? String {
+            return UInt64(value)
+        }
+        return nil
+    }
+}
+
+private final class LocalTerminalDaemonClient {
+    private let socketPath: String
+    private let authToken: String
+    private var fileDescriptor: Int32 = -1
+    private var bufferedData = Data()
+    private let requestLock = NSLock()
+
+    init(socketPath: String, authTokenFilePath: String) throws {
+        self.socketPath = socketPath
+        self.authToken = try LocalTerminalDaemonTool.readAuthToken(filePath: authTokenFilePath)
+    }
+
+    func close() {
+        if fileDescriptor >= 0 {
+            Darwin.close(fileDescriptor)
+            fileDescriptor = -1
+        }
+        bufferedData.removeAll(keepingCapacity: false)
+    }
+
+    func sendRequest(method: String, params: [String: Any]) throws -> [String: Any] {
+        try connectIfNeeded()
+        requestLock.lock()
+        defer { requestLock.unlock() }
+
+        let requestID = UUID().uuidString
+        let request: [String: Any] = [
+            "id": requestID,
+            "method": method,
+            "params": params,
+            "auth_token": authToken,
+        ]
+        guard JSONSerialization.isValidJSONObject(request),
+              let data = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]) else {
+            throw CLIError(message: "Failed to encode local daemon request")
+        }
+        var frame = data
+        frame.append(0x0A)
+        try writeAll(frame)
+
+        while true {
+            let line = try readLine()
+            guard let response = try JSONSerialization.jsonObject(with: line, options: []) as? [String: Any] else {
+                throw CLIError(message: "Invalid local daemon response")
+            }
+            if (response["id"] as? String) != requestID {
+                continue
+            }
+            if let ok = response["ok"] as? Bool, ok {
+                return (response["result"] as? [String: Any]) ?? [:]
+            }
+            let errorObject = response["error"] as? [String: Any]
+            let message = (errorObject?["message"] as? String) ?? "local daemon request failed"
+            throw CLIError(message: message)
+        }
+    }
+
+    private func connectIfNeeded() throws {
+        if fileDescriptor >= 0 {
+            return
+        }
+
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw CLIError(message: "Failed to create local daemon client socket")
+        }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let maxLength = MemoryLayout.size(ofValue: address.sun_path)
+        let utf8Bytes = Array(socketPath.utf8)
+        guard utf8Bytes.count < maxLength else {
+            Darwin.close(fd)
+            throw CLIError(message: "Local daemon socket path is too long: \(socketPath)")
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { rawBuffer in
+            rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
+            for (index, value) in utf8Bytes.enumerated() {
+                rawBuffer[index] = value
+            }
+        }
+
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_un>.stride))
+            }
+        }
+        guard result == 0 else {
+            let connectErrno = errno
+            Darwin.close(fd)
+            throw CLIError(
+                message: "Failed to connect to local daemon at \(socketPath) (\(String(cString: strerror(connectErrno))))"
+            )
+        }
+
+        fileDescriptor = fd
+    }
+
+    private func writeAll(_ data: Data) throws {
+        let wrote = try data.withUnsafeBytes { rawBuffer -> Int in
+            guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+            var remaining = rawBuffer.count
+            var offset = 0
+            while remaining > 0 {
+                let written = Darwin.write(fileDescriptor, baseAddress.advanced(by: offset), remaining)
+                if written <= 0 {
+                    throw CLIError(message: "Failed to write request to local daemon")
+                }
+                remaining -= written
+                offset += written
+            }
+            return offset
+        }
+        if wrote != data.count {
+            throw CLIError(message: "Short write to local daemon")
+        }
+    }
+
+    private func readLine() throws -> Data {
+        while true {
+            if let newlineRange = bufferedData.firstRange(of: Data([0x0A])) {
+                let line = bufferedData.subdata(in: bufferedData.startIndex..<newlineRange.lowerBound)
+                bufferedData.removeSubrange(bufferedData.startIndex..<newlineRange.upperBound)
+                return line
+            }
+
+            var buffer = [UInt8](repeating: 0, count: 8192)
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+                return Darwin.read(fileDescriptor, baseAddress, rawBuffer.count)
+            }
+            if bytesRead > 0 {
+                buffer.withUnsafeBufferPointer { pointer in
+                    guard let baseAddress = pointer.baseAddress else { return }
+                    bufferedData.append(baseAddress, count: bytesRead)
+                }
+                continue
+            }
+            close()
+            throw CLIError(message: "Local daemon connection closed")
+        }
+    }
+}
+
+private struct LocalTerminalDaemonTool {
+    let commandArgs: [String]
+
+    func run() throws {
+        let command = commandArgs.first?.lowercased() ?? "help"
+        switch command {
+        case "serve":
+            try LocalTerminalDaemonServer(configuration: try serveConfiguration(args: Array(commandArgs.dropFirst()))).run()
+        case "rpc":
+            try runRPC(args: Array(commandArgs.dropFirst()))
+        default:
+            print(localDaemonUsageText())
+        }
+    }
+
+    private func serveConfiguration(args: [String]) throws -> LocalTerminalDaemonServerConfiguration {
+        var socketPath = Self.defaultSocketPath()
+        var authTokenFilePath: String?
+        var retainedByteLimit = 4_194_304
+        var coldAttachTailByteLimit = 262_144
+
+        var index = 0
+        while index < args.count {
+            switch args[index] {
+            case "--socket":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--socket requires a path")
+                }
+                socketPath = args[index + 1]
+                index += 2
+            case "--auth-token-file":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--auth-token-file requires a path")
+                }
+                authTokenFilePath = args[index + 1]
+                index += 2
+            case "--retained-bytes":
+                guard index + 1 < args.count, let parsed = Int(args[index + 1]), parsed > 0 else {
+                    throw CLIError(message: "--retained-bytes requires a positive integer")
+                }
+                retainedByteLimit = parsed
+                index += 2
+            case "--cold-attach-tail-bytes":
+                guard index + 1 < args.count, let parsed = Int(args[index + 1]), parsed > 0 else {
+                    throw CLIError(message: "--cold-attach-tail-bytes requires a positive integer")
+                }
+                coldAttachTailByteLimit = parsed
+                index += 2
+            case "--help", "-h":
+                print(localDaemonUsageText())
+                throw CLIError(message: "")
+            default:
+                throw CLIError(message: "Unknown local-daemon serve option '\(args[index])'")
+            }
+        }
+
+        let resolvedAuthTokenFilePath = authTokenFilePath ?? Self.defaultAuthTokenFilePath(forSocketPath: socketPath)
+        return LocalTerminalDaemonServerConfiguration(
+            socketPath: socketPath,
+            authToken: try Self.readAuthToken(filePath: resolvedAuthTokenFilePath),
+            retainedByteLimit: max(retainedByteLimit, 65_536),
+            coldAttachTailByteLimit: max(min(coldAttachTailByteLimit, max(retainedByteLimit, 65_536)), 1),
+            sessionLogDirectoryURL: Self.defaultSessionLogDirectory(forSocketPath: socketPath)
+        )
+    }
+
+    private func runRPC(args: [String]) throws {
+        var socketPath = Self.defaultSocketPath()
+        var authTokenFilePath: String?
+        var positional: [String] = []
+        var index = 0
+        while index < args.count {
+            switch args[index] {
+            case "--socket":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--socket requires a path")
+                }
+                socketPath = args[index + 1]
+                index += 2
+            case "--auth-token-file":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--auth-token-file requires a path")
+                }
+                authTokenFilePath = args[index + 1]
+                index += 2
+            default:
+                positional.append(args[index])
+                index += 1
+            }
+        }
+
+        guard let method = positional.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !method.isEmpty else {
+            throw CLIError(message: "Usage: cmux local-daemon rpc [--socket <path>] [--auth-token-file <path>] <method> [json-params]")
+        }
+        let params: [String: Any]
+        if positional.count >= 2 {
+            guard let data = positional[1].data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
+                throw CLIError(message: "local-daemon rpc requires a JSON object for params")
+            }
+            params = object
+        } else {
+            params = [:]
+        }
+
+        let client = try LocalTerminalDaemonClient(
+            socketPath: socketPath,
+            authTokenFilePath: authTokenFilePath ?? Self.defaultAuthTokenFilePath(forSocketPath: socketPath)
+        )
+        defer { client.close() }
+        let result = try client.sendRequest(method: method, params: params)
+        let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    }
+
+    fileprivate static func defaultSocketPath() -> String {
+        let uid = getuid()
+        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let candidate = appSupport.appendingPathComponent("cmux/cmuxd-local.sock").path
+            if candidate.utf8.count < 100 {
+                return candidate
+            }
+        }
+        return "/tmp/cmuxd-local-\(uid).sock"
+    }
+
+    fileprivate static func defaultAuthTokenFilePath(forSocketPath socketPath: String) -> String {
+        let socketURL = URL(fileURLWithPath: socketPath)
+        let basename = socketURL.deletingPathExtension().lastPathComponent
+        return socketURL.deletingLastPathComponent()
+            .appendingPathComponent("\(basename).auth", isDirectory: false)
+            .path
+    }
+
+    fileprivate static func defaultSessionLogDirectory(forSocketPath socketPath: String) -> URL {
+        let socketURL = URL(fileURLWithPath: socketPath)
+        let basename = socketURL.deletingPathExtension().lastPathComponent
+        return socketURL.deletingLastPathComponent()
+            .appendingPathComponent("\(basename).sessions", isDirectory: true)
+    }
+
+    fileprivate static func readAuthToken(filePath: String) throws -> String {
+        let fileURL = URL(fileURLWithPath: filePath)
+        guard let token = try? String(contentsOf: fileURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else {
+            throw CLIError(message: "Missing or invalid local daemon auth token file at \(filePath)")
+        }
+        return token
+    }
+
+    private func localDaemonUsageText() -> String {
+        """
+        Usage:
+          cmux local-daemon serve [--socket <path>] [--auth-token-file <path>] [--retained-bytes <n>] [--cold-attach-tail-bytes <n>]
+          cmux local-daemon rpc [--socket <path>] [--auth-token-file <path>] <method> [json-params]
+        """
+    }
+}
+
+private struct LocalTerminalAttachTool {
+    let commandArgs: [String]
+
+    func run() throws {
+        var socketPath = LocalTerminalDaemonTool.defaultSocketPath()
+        var authTokenFilePath: String?
+        var sessionID: String?
+        var attachmentID = "attach-\(getpid())"
+        var lastAckedSeq: UInt64 = 0
+
+        var index = 0
+        while index < commandArgs.count {
+            switch commandArgs[index] {
+            case "--socket":
+                guard index + 1 < commandArgs.count else {
+                    throw CLIError(message: "--socket requires a path")
+                }
+                socketPath = commandArgs[index + 1]
+                index += 2
+            case "--auth-token-file":
+                guard index + 1 < commandArgs.count else {
+                    throw CLIError(message: "--auth-token-file requires a path")
+                }
+                authTokenFilePath = commandArgs[index + 1]
+                index += 2
+            case "--session":
+                guard index + 1 < commandArgs.count else {
+                    throw CLIError(message: "--session requires an id")
+                }
+                sessionID = commandArgs[index + 1]
+                index += 2
+            case "--attachment-id":
+                guard index + 1 < commandArgs.count else {
+                    throw CLIError(message: "--attachment-id requires a value")
+                }
+                attachmentID = commandArgs[index + 1]
+                index += 2
+            case "--last-acked-seq":
+                guard index + 1 < commandArgs.count, let parsed = UInt64(commandArgs[index + 1]) else {
+                    throw CLIError(message: "--last-acked-seq requires an integer value")
+                }
+                lastAckedSeq = parsed
+                index += 2
+            case "--help", "-h":
+                print("Usage: cmux local-attach --session <id> [--socket <path>] [--auth-token-file <path>] [--attachment-id <id>] [--last-acked-seq <n>]")
+                return
+            default:
+                throw CLIError(message: "Unknown local-attach option '\(commandArgs[index])'")
+            }
+        }
+
+        guard let sessionID, !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CLIError(message: "local-attach requires --session <id>")
+        }
+
+        let client = try LocalTerminalDaemonClient(
+            socketPath: socketPath,
+            authTokenFilePath: authTokenFilePath ?? LocalTerminalDaemonTool.defaultAuthTokenFilePath(forSocketPath: socketPath)
+        )
+        defer {
+            client.close()
+        }
+
+        let initialSize = Self.currentTerminalSize()
+        let attachResponse = try client.sendRequest(
+            method: "session.attach",
+            params: [
+                "session_id": sessionID,
+                "attachment_id": attachmentID,
+                "cols": initialSize.cols,
+                "rows": initialSize.rows
+            ]
+        )
+        if lastAckedSeq == 0 {
+            if let replayStart = attachResponse["cold_attach_replay_start_seq"] as? NSNumber {
+                lastAckedSeq = replayStart.uint64Value
+            } else if let replayStart = attachResponse["cold_attach_replay_start_seq"] as? UInt64 {
+                lastAckedSeq = replayStart
+            } else if let replayStart = attachResponse["cold_attach_replay_start_seq"] as? String,
+                      let parsed = UInt64(replayStart) {
+                lastAckedSeq = parsed
+            }
+        }
+
+        signal(SIGWINCH, SIG_IGN)
+        let resizeQueue = DispatchQueue(label: "com.cmux.local-attach.resize")
+        let resizeSource = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: resizeQueue)
+        resizeSource.setEventHandler {
+            let size = Self.currentTerminalSize()
+            _ = try? client.sendRequest(
+                method: "session.resize",
+                params: [
+                    "session_id": sessionID,
+                    "attachment_id": attachmentID,
+                    "cols": size.cols,
+                    "rows": size.rows
+                ]
+            )
+        }
+        resizeSource.resume()
+
+        let stdinQueue = DispatchQueue(label: "com.cmux.local-attach.stdin")
+        stdinQueue.async {
+            while true {
+                let data = FileHandle.standardInput.availableData
+                if data.isEmpty {
+                    return
+                }
+                _ = try? client.sendRequest(
+                    method: "session.write",
+                    params: [
+                        "session_id": sessionID,
+                        "attachment_id": attachmentID,
+                        "data_base64": data.base64EncodedString()
+                    ]
+                )
+            }
+        }
+
+        while true {
+            let response = try client.sendRequest(
+                method: "session.read",
+                params: [
+                    "session_id": sessionID,
+                    "attachment_id": attachmentID,
+                    "after_seq": lastAckedSeq,
+                    "limit_bytes": 65_536
+                ]
+            )
+
+            if let endSeq = response["end_seq"] as? NSNumber {
+                lastAckedSeq = endSeq.uint64Value
+            } else if let endSeq = response["end_seq"] as? UInt64 {
+                lastAckedSeq = endSeq
+            } else if let endSeq = response["end_seq"] as? String, let parsed = UInt64(endSeq) {
+                lastAckedSeq = parsed
+            }
+
+            if let dataBase64 = response["data_base64"] as? String,
+               let data = Data(base64Encoded: dataBase64),
+               !data.isEmpty {
+                FileHandle.standardOutput.write(data)
+                continue
+            }
+
+            if (response["eof"] as? Bool) == true {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.03)
+        }
+
+        _ = try? client.sendRequest(
+            method: "session.detach",
+            params: [
+                "session_id": sessionID,
+                "attachment_id": attachmentID
+            ]
+        )
+    }
+
+    private static func currentTerminalSize() -> (cols: Int, rows: Int) {
+        var size = winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0)
+        _ = withUnsafeMutablePointer(to: &size) { pointer in
+            ioctl(STDIN_FILENO, TIOCGWINSZ, pointer)
+        }
+        let cols = max(1, Int(size.ws_col))
+        let rows = max(1, Int(size.ws_row))
+        return (cols, rows)
+    }
 }
 
 @main
