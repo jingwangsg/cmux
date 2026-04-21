@@ -22,7 +22,17 @@ GhosttyKit.xcframework.bak-*/
 # Release artifacts
 GhosttyTabs-*.zip
 cmux-macos.dmg
+cmux-macos.pkg
 appcast.xml
+
+# Pkg build
+build-pkg/
+
+# Git worktrees
+.worktrees/
+
+# Superpowers docs
+docs/superpowers/
 
 # Python
 __pycache__/
