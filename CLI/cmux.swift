@@ -14579,8 +14579,14 @@ private struct LocalTerminalForegroundProcessMetadata {
 }
 
 private final class LocalTerminalSession {
+    private static let runtimeMetadataRefreshInterval: TimeInterval = 1.0
+    private static let runtimeMetadataFailureBackoff: TimeInterval = 0.25
+    private static let debugMetadataSampleLock = NSLock()
+    private static var debugForcedEmptyMetadataSamplesRemaining: Int?
+
     let sessionID: String
-    let process: Process
+    let processID: pid_t
+    let executablePath: String
     let masterHandle: FileHandle
     let masterFD: Int32
     let ttyName: String?
@@ -14604,10 +14610,17 @@ private final class LocalTerminalSession {
     var state: String
     var terminationStatus: Int32?
     var eofObserved: Bool
+    private let runtimeMetadataQueue: DispatchQueue
+    private let runtimeMetadataLock = NSLock()
+    private var cachedRuntimeMetadata: [String: Any]
+    private var lastRuntimeMetadataRefreshAt: Date?
+    private var lastRuntimeMetadataAttemptAt: Date?
+    private var runtimeMetadataRefreshInFlight: Bool
 
     init(
         sessionID: String,
-        process: Process,
+        processID: pid_t,
+        executablePath: String,
         masterHandle: FileHandle,
         masterFD: Int32,
         ttyName: String?,
@@ -14634,7 +14647,8 @@ private final class LocalTerminalSession {
         let retainedLogHandle = try FileHandle(forUpdating: retainedLogFileURL)
 
         self.sessionID = sessionID
-        self.process = process
+        self.processID = processID
+        self.executablePath = executablePath
         self.masterHandle = masterHandle
         self.masterFD = masterFD
         self.ttyName = ttyName
@@ -14657,6 +14671,11 @@ private final class LocalTerminalSession {
         self.state = "running"
         self.terminationStatus = nil
         self.eofObserved = false
+        self.runtimeMetadataQueue = DispatchQueue(label: "com.cmux.local-daemon.runtime-metadata.\(sessionID)", qos: .utility)
+        self.cachedRuntimeMetadata = [:]
+        self.lastRuntimeMetadataRefreshAt = nil
+        self.lastRuntimeMetadataAttemptAt = nil
+        self.runtimeMetadataRefreshInFlight = false
     }
 
     deinit {
@@ -14784,24 +14803,101 @@ private final class LocalTerminalSession {
         return max(retainedStartSeq, nextSeq - UInt64(coldAttachTailByteLimit))
     }
 
-    func runtimeMetadataPayload() -> [String: Any] {
-        guard let foreground = Self.sampleForegroundProcessMetadata(
-            rootPID: Int32(process.processIdentifier),
-            ttyName: ttyName
-        ) else {
-            return [:]
-        }
+    private func bootstrapRuntimeMetadataPayload() -> [String: Any] {
+        let trimmedRequestedCommand = requestedCommand?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let shellPath = executablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shellName = shellPath.isEmpty ? "" : URL(fileURLWithPath: shellPath).lastPathComponent
+        let commandString = trimmedRequestedCommand.isEmpty ? shellPath : trimmedRequestedCommand
+        let bootstrapName: String = {
+            guard !trimmedRequestedCommand.isEmpty else { return shellName }
+            let tokens = trimmedRequestedCommand.split(whereSeparator: \.isWhitespace)
+            let nameToken = tokens.first(where: { $0 != "exec" }) ?? tokens.first
+            guard let nameToken else { return shellName }
+            return URL(fileURLWithPath: String(nameToken)).lastPathComponent
+        }()
+        let bootstrapTitle: Any = {
+            if !bootstrapName.isEmpty {
+                return bootstrapName
+            }
+            if !trimmedRequestedCommand.isEmpty {
+                return trimmedRequestedCommand
+            }
+            return NSNull()
+        }()
+
         return [
-            "foreground_process_pid": foreground.pid,
-            "foreground_process_name": foreground.executableName,
-            "foreground_process_command": foreground.command,
-            "working_directory": (foreground.workingDirectory as Any?) ?? NSNull(),
-            "title": foreground.title,
+            "foreground_process_pid": processID > 0 ? NSNumber(value: processID) : NSNull(),
+            "foreground_process_name": bootstrapName.isEmpty ? NSNull() : bootstrapName,
+            "foreground_process_command": commandString.isEmpty ? NSNull() : commandString,
+            "working_directory": (requestedWorkingDirectory as Any?) ?? NSNull(),
+            "title": bootstrapTitle,
         ]
     }
 
+    private func currentRuntimeMetadataPayload() -> [String: Any] {
+        runtimeMetadataLock.lock()
+        defer { runtimeMetadataLock.unlock() }
+        return cachedRuntimeMetadata
+    }
+
+    private func scheduleRuntimeMetadataRefreshIfNeeded(now: Date) {
+        runtimeMetadataLock.lock()
+        let shouldRefresh: Bool
+        if runtimeMetadataRefreshInFlight {
+            shouldRefresh = false
+        } else if let lastRuntimeMetadataRefreshAt,
+                  now.timeIntervalSince(lastRuntimeMetadataRefreshAt) < Self.runtimeMetadataRefreshInterval {
+            shouldRefresh = false
+        } else if let lastRuntimeMetadataAttemptAt,
+                  (lastRuntimeMetadataRefreshAt == nil || lastRuntimeMetadataAttemptAt > (lastRuntimeMetadataRefreshAt ?? .distantPast)),
+                  now.timeIntervalSince(lastRuntimeMetadataAttemptAt) < Self.runtimeMetadataFailureBackoff {
+            shouldRefresh = false
+        } else {
+            runtimeMetadataRefreshInFlight = true
+            lastRuntimeMetadataAttemptAt = now
+            shouldRefresh = true
+        }
+        runtimeMetadataLock.unlock()
+
+        guard shouldRefresh else { return }
+
+        let rootPID = Int32(processID)
+        let sessionTTYName = ttyName
+        runtimeMetadataQueue.async { [weak self] in
+            let didSampleForegroundMetadata: Bool
+            let nextRuntimeMetadata: [String: Any]
+            if let foreground = Self.sampleForegroundProcessMetadata(
+                rootPID: rootPID,
+                ttyName: sessionTTYName
+            ) {
+                didSampleForegroundMetadata = true
+                nextRuntimeMetadata = [
+                    "foreground_process_pid": foreground.pid,
+                    "foreground_process_name": foreground.executableName,
+                    "foreground_process_command": foreground.command,
+                    "working_directory": (foreground.workingDirectory as Any?) ?? NSNull(),
+                    "title": foreground.title,
+                ]
+            } else {
+                didSampleForegroundMetadata = false
+                nextRuntimeMetadata = [:]
+            }
+
+            guard let self else { return }
+            self.runtimeMetadataLock.lock()
+            if didSampleForegroundMetadata {
+                self.cachedRuntimeMetadata = nextRuntimeMetadata
+                self.lastRuntimeMetadataRefreshAt = Date()
+            }
+            self.runtimeMetadataRefreshInFlight = false
+            self.runtimeMetadataLock.unlock()
+        }
+    }
+
     func statusPayload(now: Date) -> [String: Any] {
-        let runtimeMetadata = runtimeMetadataPayload()
+        scheduleRuntimeMetadataRefreshIfNeeded(now: now)
+        let runtimeMetadata = currentRuntimeMetadataPayload()
+        let bootstrapRuntimeMetadata = bootstrapRuntimeMetadataPayload()
         let attachmentsPayload = attachments.keys.sorted().compactMap { attachmentID -> [String: Any]? in
             guard let attachment = attachments[attachmentID] else { return nil }
             return [
@@ -14815,12 +14911,12 @@ private final class LocalTerminalSession {
             "session_id": sessionID,
             "state": state,
             "tty_name": (ttyName as Any?) ?? NSNull(),
-            "working_directory": runtimeMetadata["working_directory"] ?? (requestedWorkingDirectory as Any?) ?? NSNull(),
+            "working_directory": runtimeMetadata["working_directory"] ?? bootstrapRuntimeMetadata["working_directory"] ?? NSNull(),
             "requested_command": (requestedCommand as Any?) ?? NSNull(),
-            "foreground_process_pid": runtimeMetadata["foreground_process_pid"] ?? NSNull(),
-            "foreground_process_name": runtimeMetadata["foreground_process_name"] ?? NSNull(),
-            "foreground_process_command": runtimeMetadata["foreground_process_command"] ?? NSNull(),
-            "title": runtimeMetadata["title"] ?? (requestedCommand as Any?) ?? NSNull(),
+            "foreground_process_pid": runtimeMetadata["foreground_process_pid"] ?? bootstrapRuntimeMetadata["foreground_process_pid"] ?? NSNull(),
+            "foreground_process_name": runtimeMetadata["foreground_process_name"] ?? bootstrapRuntimeMetadata["foreground_process_name"] ?? NSNull(),
+            "foreground_process_command": runtimeMetadata["foreground_process_command"] ?? bootstrapRuntimeMetadata["foreground_process_command"] ?? NSNull(),
+            "title": runtimeMetadata["title"] ?? bootstrapRuntimeMetadata["title"] ?? NSNull(),
             "effective_cols": effectiveCols,
             "effective_rows": effectiveRows,
             "last_known_cols": lastKnownCols,
@@ -14838,8 +14934,8 @@ private final class LocalTerminalSession {
 
     func close() {
         masterHandle.readabilityHandler = nil
-        if process.isRunning {
-            process.terminate()
+        if state == "running", processID > 0 {
+            kill(processID, SIGTERM)
         }
         masterHandle.closeFile()
         try? retainedLogHandle.close()
@@ -14861,6 +14957,26 @@ private final class LocalTerminalSession {
         rootPID: Int32,
         ttyName: String?
     ) -> LocalTerminalForegroundProcessMetadata? {
+        if let forcedSamplesValue = ProcessInfo.processInfo.environment["CMUX_LOCAL_DAEMON_DEBUG_FORCE_EMPTY_METADATA_SAMPLES"],
+           let forcedSamplesCount = Int(forcedSamplesValue),
+           forcedSamplesCount > 0 {
+            debugMetadataSampleLock.lock()
+            if debugForcedEmptyMetadataSamplesRemaining == nil {
+                debugForcedEmptyMetadataSamplesRemaining = forcedSamplesCount
+            }
+            if let remaining = debugForcedEmptyMetadataSamplesRemaining, remaining > 0 {
+                debugForcedEmptyMetadataSamplesRemaining = remaining - 1
+                debugMetadataSampleLock.unlock()
+                return nil
+            }
+            debugMetadataSampleLock.unlock()
+        }
+        if let sampleDelayValue = ProcessInfo.processInfo.environment["CMUX_LOCAL_DAEMON_DEBUG_METADATA_SAMPLE_DELAY_MS"],
+           let sampleDelayMilliseconds = Int(sampleDelayValue),
+           sampleDelayMilliseconds > 0 {
+            Thread.sleep(forTimeInterval: Double(sampleDelayMilliseconds) / 1000.0)
+        }
+
         let snapshots = processSnapshots()
         var foreground = bestDescendantProcess(rootPID: rootPID, snapshots: snapshots)
         if foreground == nil, let ttyName, let normalizedTTY = normalizedTTYName(ttyName) {
@@ -15273,15 +15389,21 @@ private final class LocalTerminalDaemonServer {
         case "session.list":
             let now = Date()
             return [
-                "sessions": sessions.keys.sorted().compactMap { sessionID in
-                    sessions[sessionID]?.statusPayload(now: now)
+                "sessions": sessions.keys.sorted().map { sessionID in
+                    let session = sessions[sessionID]!
+                    session.pruneStaleAttachments(now: now, staleAfter: Self.staleAttachmentInterval)
+                    session.recomputeEffectiveSize()
+                    return session.statusPayload(now: now)
                 }
             ]
         case "session.open":
             return try openSession(params: params)
         case "session.status":
             return try withSession(params: params) { session in
-                session.statusPayload(now: Date())
+                let now = Date()
+                session.pruneStaleAttachments(now: now, staleAfter: Self.staleAttachmentInterval)
+                session.recomputeEffectiveSize()
+                return session.statusPayload(now: now)
             }
         case "session.attach":
             return try withSession(params: params) { session in
@@ -15379,17 +15501,6 @@ private final class LocalTerminalDaemonServer {
         let command = (params["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let environment = (params["environment"] as? [String: String]) ?? [:]
 
-        var masterFD: Int32 = -1
-        var slaveFD: Int32 = -1
-        guard openpty(&masterFD, &slaveFD, nil, nil, nil) == 0 else {
-            throw CLIError(message: "openpty failed: \(String(cString: strerror(errno)))")
-        }
-        LocalTerminalSession.applyTerminalSize(fileDescriptor: slaveFD, cols: cols, rows: rows)
-
-        let masterHandle = FileHandle(fileDescriptor: masterFD, closeOnDealloc: true)
-        let slaveHandle = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: true)
-        let process = Process()
-
         var resolvedEnvironment = ProcessInfo.processInfo.environment
         for (key, value) in environment {
             let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -15400,27 +15511,59 @@ private final class LocalTerminalDaemonServer {
         let shell = (resolvedEnvironment["SHELL"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             ? resolvedEnvironment["SHELL"]!
             : "/bin/zsh"
-        process.executableURL = URL(fileURLWithPath: shell)
-        if let command, !command.isEmpty {
-            process.arguments = ["-lc", command]
-        } else {
-            process.arguments = ["-l"]
-        }
-        if let workingDirectory, !workingDirectory.isEmpty {
-            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
-        }
-        process.environment = resolvedEnvironment
-        process.standardInput = slaveHandle
-        process.standardOutput = slaveHandle
-        process.standardError = slaveHandle
+        let childArguments: [String] = {
+            if let command, !command.isEmpty {
+                return [shell, "-lc", command]
+            }
+            return [shell, "-l"]
+        }()
 
-        let ttyName = ttyname(slaveFD).map { String(cString: $0) }
+        var masterFD: Int32 = -1
+        var ttyNameBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        var terminalSize = winsize(
+            ws_row: UInt16(max(1, min(rows, Int(UInt16.max)))),
+            ws_col: UInt16(max(1, min(cols, Int(UInt16.max)))),
+            ws_xpixel: 0,
+            ws_ypixel: 0
+        )
+        let childPID = ttyNameBuffer.withUnsafeMutableBufferPointer { ttyNamePointer in
+            withUnsafeMutablePointer(to: &masterFD) { masterFDPointer in
+                withUnsafeMutablePointer(to: &terminalSize) { sizePointer in
+                    forkpty(masterFDPointer, ttyNamePointer.baseAddress, nil, sizePointer)
+                }
+            }
+        }
+        guard childPID >= 0 else {
+            throw CLIError(message: "forkpty failed: \(String(cString: strerror(errno)))")
+        }
+        if childPID == 0 {
+            if let workingDirectory, !workingDirectory.isEmpty {
+                _ = chdir(workingDirectory)
+            }
+            for (key, value) in resolvedEnvironment {
+                setenv(key, value, 1)
+            }
+            let argv = childArguments.map { strdup($0) } + [nil]
+            _ = argv.withUnsafeBufferPointer { pointer in
+                execv(shell, UnsafeMutablePointer(mutating: pointer.baseAddress))
+            }
+            let message = "cmux local-daemon exec failed: \(String(cString: strerror(errno)))\n"
+            FileHandle.standardError.write(Data(message.utf8))
+            _exit(127)
+        }
+
+        let masterHandle = FileHandle(fileDescriptor: masterFD, closeOnDealloc: true)
+        let ttyName: String? = ttyNameBuffer.withUnsafeBufferPointer { pointer in
+            guard let baseAddress = pointer.baseAddress, baseAddress.pointee != 0 else { return nil }
+            return String(cString: baseAddress)
+        }
         let retainedLogFileURL = configuration.sessionLogDirectoryURL
             .appendingPathComponent("\(sessionID).vtlog", isDirectory: false)
 
         let session = try LocalTerminalSession(
             sessionID: sessionID,
-            process: process,
+            processID: childPID,
+            executablePath: shell,
             masterHandle: masterHandle,
             masterFD: masterFD,
             ttyName: ttyName,
@@ -15434,11 +15577,25 @@ private final class LocalTerminalDaemonServer {
             initialRows: rows
         )
 
-        process.terminationHandler = { [weak self, weak session] process in
+        DispatchQueue.global(qos: .utility).async { [weak self, weak session] in
+            var status: Int32 = 0
+            let waitedPID = waitpid(childPID, &status, 0)
             self?.stateQueue.async {
                 guard let session else { return }
                 session.state = "exited"
-                session.terminationStatus = process.terminationStatus
+                guard waitedPID > 0 else {
+                    session.terminationStatus = nil
+                    return
+                }
+                let waitStatus = Int32(status)
+                let signalBits = waitStatus & 0x7f
+                if signalBits == 0 {
+                    session.terminationStatus = (waitStatus >> 8) & 0xff
+                } else if signalBits != 0x7f {
+                    session.terminationStatus = 128 + signalBits
+                } else {
+                    session.terminationStatus = waitStatus
+                }
             }
         }
         masterHandle.readabilityHandler = { [weak self, weak session] handle in
@@ -15453,8 +15610,6 @@ private final class LocalTerminalDaemonServer {
             }
         }
 
-        try process.run()
-        slaveHandle.closeFile()
         sessions[sessionID] = session
         return session.statusPayload(now: Date())
     }
@@ -15853,6 +16008,11 @@ private struct LocalTerminalDaemonTool {
 private struct LocalTerminalAttachTool {
     let commandArgs: [String]
 
+    private struct TerminalModeSnapshot {
+        let fileDescriptor: Int32
+        let termios: termios
+    }
+
     func run() throws {
         var socketPath = LocalTerminalDaemonTool.defaultSocketPath()
         var authTokenFilePath: String?
@@ -15915,6 +16075,18 @@ private struct LocalTerminalAttachTool {
         )
         defer {
             client.close()
+        }
+
+        let terminalModeSnapshot = try Self.makeRawTerminalIfNeeded(fileDescriptor: STDIN_FILENO)
+        defer {
+            if let terminalModeSnapshot {
+                var originalTermios = terminalModeSnapshot.termios
+                _ = tcsetattr(
+                    terminalModeSnapshot.fileDescriptor,
+                    TCSANOW,
+                    &originalTermios
+                )
+            }
         }
 
         let initialSize = Self.currentTerminalSize()
@@ -16022,6 +16194,23 @@ private struct LocalTerminalAttachTool {
         let cols = max(1, Int(size.ws_col))
         let rows = max(1, Int(size.ws_row))
         return (cols, rows)
+    }
+
+    private static func makeRawTerminalIfNeeded(fileDescriptor: Int32) throws -> TerminalModeSnapshot? {
+        guard isatty(fileDescriptor) == 1 else { return nil }
+
+        var originalTermios = termios()
+        guard tcgetattr(fileDescriptor, &originalTermios) == 0 else {
+            throw CLIError(message: "tcgetattr failed: \(String(cString: strerror(errno)))")
+        }
+
+        var rawTermios = originalTermios
+        cfmakeraw(&rawTermios)
+        guard tcsetattr(fileDescriptor, TCSANOW, &rawTermios) == 0 else {
+            throw CLIError(message: "tcsetattr failed: \(String(cString: strerror(errno)))")
+        }
+
+        return TerminalModeSnapshot(fileDescriptor: fileDescriptor, termios: originalTermios)
     }
 }
 

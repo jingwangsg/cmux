@@ -2659,6 +2659,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             let feed = env["CMUX_UI_TEST_FEED_URL"] ?? "<nil>"
             UpdateLogStore.shared.append("ui test env: trigger=\(trigger) feed=\(feed)")
         }
+
+        // WindowGroup does not always materialize a window on relaunch after the user
+        // has closed the last window. If the app is running with zero windows shortly
+        // after launch, create a main window so normal startup/session-restore can proceed.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            if NSApp.windows.isEmpty {
+                self.openNewMainWindow(nil)
+            }
+        }
+
         if env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"] == "1" {
             UpdateLogStore.shared.append("ui test trigger update check detected")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
