@@ -7368,6 +7368,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func confirmLocalTerminalDaemonRestart() -> Bool {
         if let override = Self.localTerminalDaemonRestartConfirmationOverrideForTesting {
+            #if DEBUG
+            dlog("daemon.restart.confirm path=override")
+            #endif
             return override()
         }
 
@@ -7383,24 +7386,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )
         alert.addButton(withTitle: String(localized: "debug.localTerminalDaemon.restartConfirm.confirm", defaultValue: "Restart"))
         alert.addButton(withTitle: String(localized: "common.cancel", defaultValue: "Cancel"))
-        return alert.runModal() == .alertFirstButtonReturn
+        #if DEBUG
+        dlog("daemon.restart.confirm show_alert")
+        #endif
+        let response = alert.runModal()
+        let confirmed = response == .alertFirstButtonReturn
+        #if DEBUG
+        dlog("daemon.restart.confirm response=\(response.rawValue) confirmed=\(confirmed)")
+        #endif
+        return confirmed
     }
 
     private func performLocalTerminalDaemonRestart(
         restartOperation: @escaping () throws -> String
     ) {
+        #if DEBUG
+        dlog("daemon.restart.perform dispatch_async_start")
+        #endif
         DispatchQueue.global(qos: .userInitiated).async {
+            #if DEBUG
+            dlog("daemon.restart.perform operation_begin")
+            #endif
             do {
                 let socketPath = try restartOperation()
+                #if DEBUG
+                dlog("daemon.restart.perform success socket=\(socketPath)")
+                #endif
                 NSLog("Local terminal daemon ready at %@", socketPath)
             } catch {
                 let message = error.localizedDescription
+                #if DEBUG
+                dlog("daemon.restart.perform failure error=\(message)")
+                #endif
                 DispatchQueue.main.async { [weak self] in
                     if let handler = Self.localTerminalDaemonRestartFailureHandlerOverrideForTesting {
+                        #if DEBUG
+                        dlog("daemon.restart.perform failure path=test_override")
+                        #endif
                         handler(message)
                         return
                     }
 
+                    #if DEBUG
+                    dlog("daemon.restart.perform failure show_alert")
+                    #endif
                     self?.presentCLIPathAlert(
                         title: String(
                             localized: "debug.localTerminalDaemon.restartFailed.title",
@@ -7415,11 +7444,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func restartLocalTerminalDaemon(_ sender: Any?) {
-        guard confirmLocalTerminalDaemonRestart() else { return }
+        #if DEBUG
+        let senderDesc: String = {
+            if sender == nil { return "nil" }
+            if let item = sender as? NSMenuItem { return "menuItem(title=\(item.title))" }
+            return String(describing: type(of: sender!))
+        }()
+        dlog("daemon.restart.action_entry sender=\(senderDesc)")
+        #endif
+        guard confirmLocalTerminalDaemonRestart() else {
+            #if DEBUG
+            dlog("daemon.restart.action_entry cancelled_by_user")
+            #endif
+            return
+        }
         performLocalTerminalDaemonRestart {
             if let override = Self.localTerminalDaemonRestartOperationOverrideForTesting {
+                #if DEBUG
+                dlog("daemon.restart.operation path=override")
+                #endif
                 return try override()
             }
+            #if DEBUG
+            dlog("daemon.restart.operation path=workspace")
+            #endif
             return try Workspace.restartLocalTerminalDaemonFromApp()
         }
     }

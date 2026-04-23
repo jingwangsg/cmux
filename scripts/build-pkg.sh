@@ -46,9 +46,9 @@ done
 echo "Building Release app..."
 rm -rf "$BUILD_DIR"
 if [[ "$SIGN" == "true" ]]; then
-  xcodebuild -scheme cmux -configuration Release -derivedDataPath "$BUILD_DIR" CODE_SIGNING_ALLOWED=NO build 2>&1 | tail -5
+  xcodebuild -scheme cmux -configuration Release -derivedDataPath "$BUILD_DIR" -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO build 2>&1 | tail -5
 else
-  xcodebuild -scheme cmux -configuration Release -derivedDataPath "$BUILD_DIR" CODE_SIGNING_ALLOWED=NO build 2>&1 | tail -5
+  xcodebuild -scheme cmux -configuration Release -derivedDataPath "$BUILD_DIR" -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO build 2>&1 | tail -5
 fi
 echo "Build succeeded"
 

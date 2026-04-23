@@ -493,6 +493,9 @@ struct cmuxApp: App {
                 }
 
                 Button(Workspace.localTerminalDaemonControlTitle()) {
+                    #if DEBUG
+                    dlog("daemon.restart.click source=debug_menu")
+                    #endif
                     appDelegate.restartLocalTerminalDaemon(nil)
                 }
 
@@ -4502,10 +4505,6 @@ struct SettingsView: View {
     @State private var workspaceTabPaletteEntries = WorkspaceTabColorSettings.palette()
     @State private var trustedDirectoriesDraft: String = CmuxDirectoryTrust.shared.allTrustedPaths.joined(separator: "\n")
 
-    private var appDelegateBridge: AppDelegate? {
-        NSApp.delegate as? AppDelegate
-    }
-
     @ViewBuilder
     private var localTerminalDaemonSettingsCard: some View {
         SettingsCard {
@@ -4532,7 +4531,10 @@ struct SettingsView: View {
                         .frame(width: 60, alignment: .trailing)
 
                     Button(Workspace.localTerminalDaemonControlTitle()) {
-                        appDelegateBridge?.restartLocalTerminalDaemon(nil)
+                        #if DEBUG
+                        dlog("daemon.restart.click source=settings shared=\(AppDelegate.shared == nil ? "nil" : "ok")")
+                        #endif
+                        AppDelegate.shared?.restartLocalTerminalDaemon(nil)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)

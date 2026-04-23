@@ -7526,41 +7526,94 @@ final class Workspace: Identifiable, ObservableObject {
     nonisolated static func restartLocalTerminalDaemonFromApp(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> String {
+        #if DEBUG
+        dlog("daemon.restart.workspace entry")
+        #endif
         guard shouldUseLocalTerminalDaemon(environment: environment) else {
+            #if DEBUG
+            dlog("daemon.restart.workspace guard=shouldUseLocalTerminalDaemon=false disable=\(environment["CMUX_LOCAL_DAEMON_DISABLE"] ?? "nil") allow=\(environment["CMUX_LOCAL_DAEMON_ALLOW_TESTING"] ?? "nil")")
+            #endif
             throw LocalTerminalDaemonControlError(
                 key: "debug.localTerminalDaemon.error.disabled",
                 defaultValue: "Local terminal daemon is disabled in this environment."
             )
         }
         guard let cliPath = bundledCLIPath() else {
+            #if DEBUG
+            dlog("daemon.restart.workspace guard=bundledCLIPath=nil")
+            #endif
             throw LocalTerminalDaemonControlError(
                 key: "debug.localTerminalDaemon.error.missingCLI",
                 defaultValue: "Bundled cmux CLI not found."
             )
         }
+        #if DEBUG
+        dlog("daemon.restart.workspace cliPath=\(cliPath)")
+        #endif
 
         let registration = localTerminalDaemonRegistrationForTesting(environment: environment)
+        #if DEBUG
+        dlog("daemon.restart.workspace registration label=\(registration.launchAgentLabel) socket=\(registration.socketPath) plist=\(registration.launchAgentPlistPath) authToken=\(registration.authTokenFilePath)")
+        #endif
 
+        #if DEBUG
+        dlog("daemon.restart.workspace acquire_lock")
+        #endif
         localTerminalDaemonLaunchLock.lock()
-        defer { localTerminalDaemonLaunchLock.unlock() }
+        defer {
+            localTerminalDaemonLaunchLock.unlock()
+            #if DEBUG
+            dlog("daemon.restart.workspace release_lock")
+            #endif
+        }
+        #if DEBUG
+        dlog("daemon.restart.workspace lock_acquired")
+        #endif
 
         guard ensureLocalTerminalDaemonAuthTokenFile(registration.authTokenFilePath) else {
+            #if DEBUG
+            dlog("daemon.restart.workspace guard=ensureAuthTokenFile=false path=\(registration.authTokenFilePath)")
+            #endif
             throw LocalTerminalDaemonControlError(
                 key: "debug.localTerminalDaemon.error.authToken",
                 defaultValue: "Failed to prepare local daemon auth token file."
             )
         }
+        #if DEBUG
+        dlog("daemon.restart.workspace authToken=ok")
+        #endif
         guard writeLocalTerminalLaunchAgentPlist(registration: registration, cliPath: cliPath) else {
+            #if DEBUG
+            dlog("daemon.restart.workspace guard=writeLaunchAgentPlist=false path=\(registration.launchAgentPlistPath)")
+            #endif
             throw LocalTerminalDaemonControlError(
                 key: "debug.localTerminalDaemon.error.plist",
                 defaultValue: "Failed to write local daemon LaunchAgent plist."
             )
         }
+        #if DEBUG
+        dlog("daemon.restart.workspace plist=ok")
+        #endif
 
         let launchctlTarget = localTerminalLaunchctlTarget(label: registration.launchAgentLabel)
-        if isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
+        let alreadyLoaded = isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel)
+        #if DEBUG
+        dlog("daemon.restart.workspace target=\(launchctlTarget) alreadyLoaded=\(alreadyLoaded)")
+        #endif
+        if alreadyLoaded {
+            #if DEBUG
+            dlog("daemon.restart.workspace bootout begin")
+            #endif
             let bootoutResult = runLocalLaunchctl(arguments: ["bootout", launchctlTarget], timeout: 3.0)
+            #if DEBUG
+            let bootoutStatus = bootoutResult.map { "\($0.status)" } ?? "nil"
+            let bootoutStderr = bootoutResult.flatMap { String(data: $0.stderr, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            dlog("daemon.restart.workspace bootout status=\(bootoutStatus) stderr=\(bootoutStderr)")
+            #endif
             if bootoutResult?.status != 0 && isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
+                #if DEBUG
+                dlog("daemon.restart.workspace guard=bootout_failed")
+                #endif
                 throw LocalTerminalDaemonControlError(
                     key: "debug.localTerminalDaemon.error.bootout",
                     defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootout", result: bootoutResult)
@@ -7568,34 +7621,70 @@ final class Workspace: Identifiable, ObservableObject {
             }
         }
 
+        #if DEBUG
+        dlog("daemon.restart.workspace bootstrap begin")
+        #endif
         let bootstrapResult = runLocalLaunchctl(
             arguments: ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
             timeout: 3.0
         )
+        #if DEBUG
+        let bootstrapStatus = bootstrapResult.map { "\($0.status)" } ?? "nil"
+        let bootstrapStderr = bootstrapResult.flatMap { String(data: $0.stderr, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        dlog("daemon.restart.workspace bootstrap status=\(bootstrapStatus) stderr=\(bootstrapStderr)")
+        #endif
         if bootstrapResult?.status != 0 && !isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
+            #if DEBUG
+            dlog("daemon.restart.workspace guard=bootstrap_failed")
+            #endif
             throw LocalTerminalDaemonControlError(
                 key: "debug.localTerminalDaemon.error.bootstrap",
                 defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootstrap", result: bootstrapResult)
             )
         }
 
+        #if DEBUG
+        dlog("daemon.restart.workspace kickstart begin")
+        #endif
+        // launchctl kickstart -k blocks until the old instance has exited and the new one has started,
+        // which can exceed any reasonable per-command timeout (daemon exit timeout alone is 5s).
+        // Match startLocalTerminalDaemonIfNeeded's pattern: ignore the kickstart exit code and rely
+        // on waitForLocalDaemonSocket below as the authoritative readiness check.
         let kickstartResult = runLocalLaunchctl(arguments: ["kickstart", "-k", launchctlTarget], timeout: 3.0)
-        guard kickstartResult?.status == 0 else {
-            throw LocalTerminalDaemonControlError(
-                key: "debug.localTerminalDaemon.error.kickstart",
-                defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl kickstart", result: kickstartResult)
-            )
-        }
+        #if DEBUG
+        let kickstartStatus = kickstartResult.map { "\($0.status)" } ?? "nil"
+        let kickstartStderr = kickstartResult.flatMap { String(data: $0.stderr, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        dlog("daemon.restart.workspace kickstart status=\(kickstartStatus) stderr=\(kickstartStderr)")
+        #endif
 
-        guard waitForLocalDaemonSocket(
+        #if DEBUG
+        dlog("daemon.restart.workspace waitForSocket begin timeout=\(localTerminalDaemonBootstrapReadyTimeout)")
+        #endif
+        let ready = waitForLocalDaemonSocket(
             registration.socketPath,
             timeout: localTerminalDaemonBootstrapReadyTimeout
-        ) else {
+        )
+        #if DEBUG
+        dlog("daemon.restart.workspace waitForSocket ready=\(ready)")
+        #endif
+        guard ready else {
+            #if DEBUG
+            dlog("daemon.restart.workspace guard=socket_not_ready path=\(registration.socketPath) kickstartStatus=\(kickstartResult.map { "\($0.status)" } ?? "nil")")
+            #endif
+            let detail: String
+            if let result = kickstartResult, result.status != 0 {
+                detail = localTerminalDaemonLaunchctlFailureMessage(action: "launchctl kickstart", result: result)
+            } else {
+                detail = "Local terminal daemon did not become ready at \(registration.socketPath)."
+            }
             throw LocalTerminalDaemonControlError(
                 key: "debug.localTerminalDaemon.error.notReady",
-                defaultValue: "Local terminal daemon did not become ready at \(registration.socketPath)."
+                defaultValue: detail
             )
         }
+        #if DEBUG
+        dlog("daemon.restart.workspace success socket=\(registration.socketPath)")
+        #endif
         return registration.socketPath
     }
 
