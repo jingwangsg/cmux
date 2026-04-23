@@ -16111,12 +16111,19 @@ private final class LocalTerminalDaemonServer {
         }
         masterHandle.readabilityHandler = { [weak self, weak session] handle in
             let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                self?.stateQueue.async {
+                    guard let session else { return }
+                    if !session.eofObserved {
+                        localTrace("session.eof id=\(session.sessionID)")
+                    }
+                    session.eofObserved = true
+                }
+                return
+            }
             self?.stateQueue.async {
                 guard let session else { return }
-                if data.isEmpty {
-                    session.eofObserved = true
-                    return
-                }
                 session.appendOutput(data)
             }
         }

@@ -61,6 +61,16 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
         )
     }
 
+    private func cpuPercent(forPID pid: Int32) -> Double? {
+        let result = runProcess(
+            executablePath: "/bin/ps",
+            arguments: ["-p", String(pid), "-o", "%cpu="],
+            timeout: 2
+        )
+        guard !result.timedOut, result.status == 0 else { return nil }
+        return Double(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     private func writeShellFile(at url: URL, lines: [String]) throws {
         try lines.joined(separator: "\n")
             .appending("\n")
@@ -810,6 +820,81 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
             (statusResult.stderr + statusResult.stdout).contains("Unknown session"),
             statusResult.stderr + statusResult.stdout
         )
+    }
+
+    func testBundledCLILocalDaemonDoesNotSpinAfterSessionEOF() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("eofspin")
+        let authTokenFilePath = localDaemonAuthTokenFilePath(for: socketPath)
+        try writeLocalDaemonAuthTokenFile(at: authTokenFilePath)
+
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cliPath)
+        daemon.arguments = [
+            "local-daemon",
+            "serve",
+            "--socket", socketPath,
+            "--auth-token-file", authTokenFilePath,
+        ]
+        daemon.standardInput = FileHandle.nullDevice
+        daemon.standardOutput = FileHandle.nullDevice
+        daemon.standardError = FileHandle.nullDevice
+        try daemon.run()
+        defer {
+            if daemon.isRunning {
+                daemon.terminate()
+            }
+            daemon.waitUntilExit()
+            unlink(socketPath)
+            unlink(authTokenFilePath)
+        }
+
+        XCTAssertTrue(waitForConnectableUnixSocket(at: socketPath, timeout: 5), "Daemon socket never became connectable")
+
+        let openResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket", socketPath,
+                "--auth-token-file", authTokenFilePath,
+                "session.open",
+                #"{"session_id":"eof-spin","command":"printf 'done\n'","cols":80,"rows":24}"#,
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(openResult.timedOut, openResult.stderr)
+        XCTAssertEqual(openResult.status, 0, openResult.stderr)
+        Thread.sleep(forTimeInterval: 1.2)
+
+        let statusResult = runProcess(
+            executablePath: cliPath,
+            arguments: [
+                "local-daemon",
+                "rpc",
+                "--socket", socketPath,
+                "--auth-token-file", authTokenFilePath,
+                "session.status",
+                #"{"session_id":"eof-spin"}"#,
+            ],
+            timeout: 5
+        )
+
+        XCTAssertFalse(statusResult.timedOut, statusResult.stderr)
+        XCTAssertEqual(statusResult.status, 0, statusResult.stderr)
+        guard let statusData = statusResult.stdout.data(using: .utf8),
+              let statusPayload = try JSONSerialization.jsonObject(with: statusData) as? [String: Any] else {
+            return XCTFail("Expected JSON payload from session.status, got \(statusResult.stdout)")
+        }
+        XCTAssertEqual(statusPayload["state"] as? String, "exited")
+        XCTAssertEqual(statusPayload["eof"] as? Bool, true)
+
+        Thread.sleep(forTimeInterval: 1.0)
+        guard let cpu = cpuPercent(forPID: daemon.processIdentifier) else {
+            return XCTFail("Failed to read local daemon CPU usage")
+        }
+        XCTAssertLessThan(cpu, 50.0, "Exited local session should not leave daemon spinning; cpu=\(cpu)")
     }
 
     func testBundledCLILocalDaemonMarksRecoveredSessionAsOrphanedAfterRestart() throws {
