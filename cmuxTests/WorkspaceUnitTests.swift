@@ -3019,6 +3019,80 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
         XCTAssertEqual(serverResult.request["auth_token"] as? String, "bootout-auth-token")
     }
 
+    func testLocalTerminalLaunchConfigurationDoesNotBestEffortAttachRecoveredOrphanAfterStartupRace() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-orphan-race-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true, attributes: nil)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        try "orphan-race-auth-token\n".write(
+            to: URL(fileURLWithPath: authTokenFilePath),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let environment = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase2-orphan-race-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+        let request = LocalTerminalLaunchRequest(
+            panelID: UUID(),
+            mode: .attachExisting("orphaned-session-id"),
+            requestedWorkingDirectory: nil,
+            requestedCommand: nil,
+            requestedEnvironment: [:]
+        )
+
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        var connectivityChecks = 0
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            connectivityChecks += 1
+            return connectivityChecks > 1
+        }
+        var launchctlCommands: [[String]] = []
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            launchctlCommands.append(arguments)
+            return (status: 0, stdout: Data(), stderr: Data())
+        }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        let serverResult = try withFakeLocalTerminalDaemonServer(
+            socketPath: socketPath,
+            responseResult: [
+                "session_id": "orphaned-session-id",
+                "state": "orphaned",
+            ]
+        ) {
+            let launchConfiguration = Workspace.localTerminalLaunchConfigurationForTesting(
+                request: request,
+                environment: environment
+            )
+            XCTAssertNil(
+                launchConfiguration,
+                "Recovered orphan sessions must fall through to daemon replay/snapshot fallback, not a doomed local-attach command"
+            )
+        }
+
+        XCTAssertTrue(launchctlCommands.isEmpty, "test simulates the daemon becoming ready during startup wait")
+        XCTAssertEqual(serverResult.request["method"] as? String, "session.status")
+        XCTAssertEqual(serverResult.request["auth_token"] as? String, "orphan-race-auth-token")
+    }
+
     func testRestartLocalTerminalDaemonFromAppBootsOutAndBootstrapsLaunchAgent() throws {
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("cmux-local-daemon-restart-\(UUID().uuidString)", isDirectory: true)

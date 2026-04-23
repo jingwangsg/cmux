@@ -109,6 +109,49 @@ final class LocalDaemonSessionsCLITests: XCTestCase {
         return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     }
 
+    private func runReplayCommand(cli: String, socket: String, authTokenFile: URL, sessionID: String) throws -> [String: Any] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: cli)
+        process.arguments = [
+            "local-daemon", "replay",
+            "--socket", socket,
+            "--auth-token-file", authTokenFile.path,
+            "--session", sessionID,
+        ]
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        )
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func test_sessionsTable_rendersShellSafeReplayHint() {
+        let rendered = CMUXCLI.renderLocalDaemonSessionsTableForTesting(payload: [
+            "sessions": [
+                [
+                    "session_id": "orphan-'quoted'",
+                    "state": "orphaned",
+                    "attachments": [],
+                    "next_seq": 4,
+                    "working_directory": "/tmp",
+                ]
+            ]
+        ], replaySocketPath: "/tmp/socket-'quoted'.sock", replayAuthTokenFilePath: "/tmp/auth-'quoted'.txt")
+
+        XCTAssertTrue(rendered.contains(
+            "cmux local-daemon replay --socket '/tmp/socket-'\\''quoted'\\''.sock' --auth-token-file '/tmp/auth-'\\''quoted'\\''.txt' --session 'orphan-'\\''quoted'\\'''"
+        ))
+        XCTAssertFalse(rendered.contains("rpc session.replay"))
+    }
+
     func test_sessionsSubcommand_rendersHeaderAndRows() throws {
         let cli = try bundledCLIPath()
         let authTokenFile = try writeAuthTokenFile()
@@ -154,10 +197,44 @@ final class LocalDaemonSessionsCLITests: XCTestCase {
         XCTAssertTrue(rendered.contains("orphaned"))
         XCTAssertTrue(rendered.contains("running"))
         XCTAssertTrue(
-            rendered.contains("cmux local-daemon rpc session.replay") ||
-            rendered.contains("session.replay"),
-            "orphaned sessions should point at session.replay"
+            rendered.contains("cmux local-daemon replay --socket '\(socket)' --auth-token-file '\(authTokenFile.path)' --session 'orphan-1'"),
+            "orphaned sessions should point at the first-class replay command"
         )
+    }
+
+    func test_replaySubcommand_returnsOrphanReplayPayload() throws {
+        let cli = try bundledCLIPath()
+        let authTokenFile = try writeAuthTokenFile()
+        try writeOrphan(id: "orphan-replay")
+
+        let socket = tempDir.appendingPathComponent("daemon.sock").path
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cli)
+        daemon.arguments = [
+            "local-daemon", "serve",
+            "--socket", socket,
+            "--auth-token-file", authTokenFile.path,
+            "--session-log-dir", tempDir.path,
+        ]
+        try daemon.run()
+        defer {
+            daemon.terminate()
+            daemon.waitUntilExit()
+        }
+
+        waitForSocket(socket)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: socket))
+
+        let payload = try runReplayCommand(
+            cli: cli,
+            socket: socket,
+            authTokenFile: authTokenFile,
+            sessionID: "orphan-replay"
+        )
+        XCTAssertEqual(payload["session_id"] as? String, "orphan-replay")
+        XCTAssertEqual(payload["eof"] as? Bool, true)
+        let tailBase64 = try XCTUnwrap(payload["tail_base64"] as? String)
+        XCTAssertEqual(Data(base64Encoded: tailBase64), Data("orphan".utf8))
     }
 
     func test_sessionsSubcommand_emptyPayloadPrintsPlaceholder() throws {

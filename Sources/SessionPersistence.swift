@@ -509,6 +509,17 @@ enum SessionScrollbackReplayStore {
         return [environmentKey: replayFileURL.path]
     }
 
+    static func replayEnvironment(
+        forVTData data: Data,
+        tempDirectory: URL = FileManager.default.temporaryDirectory
+    ) -> [String: String] {
+        guard !data.isEmpty,
+              let replayFileURL = writeReplayFile(data: data, tempDirectory: tempDirectory) else {
+            return [:]
+        }
+        return [environmentKey: replayFileURL.path]
+    }
+
     private static func normalizedScrollback(_ scrollback: String?) -> String? {
         guard let scrollback else { return nil }
         guard scrollback.contains(where: { !$0.isWhitespace }) else { return nil }
@@ -531,6 +542,10 @@ enum SessionScrollbackReplayStore {
 
     private static func writeReplayFile(contents: String, tempDirectory: URL) -> URL? {
         guard let data = contents.data(using: .utf8) else { return nil }
+        return writeReplayFile(data: data, tempDirectory: tempDirectory)
+    }
+
+    private static func writeReplayFile(data: Data, tempDirectory: URL) -> URL? {
         let directory = tempDirectory.appendingPathComponent(directoryName, isDirectory: true)
 
         do {
@@ -541,7 +556,7 @@ enum SessionScrollbackReplayStore {
             )
             let fileURL = directory
                 .appendingPathComponent(UUID().uuidString, isDirectory: false)
-                .appendingPathExtension("txt")
+                .appendingPathExtension("replay")
             try data.write(to: fileURL, options: .atomic)
             return fileURL
         } catch {

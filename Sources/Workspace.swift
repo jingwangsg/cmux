@@ -674,6 +674,26 @@ extension Workspace {
                 applySessionPanelMetadata(snapshot, toPanelId: terminalPanel.id)
                 return terminalPanel.id
             }
+            if daemonAttachAllowed,
+               restoreStrategy == .daemonAttach,
+               let localSessionID,
+               !localSessionID.isEmpty,
+               let replayRestore = Self.localTerminalReplayRestore(sessionID: localSessionID),
+               let terminalPanel = newTerminalSurface(
+                    inPane: paneId,
+                    focus: false,
+                    workingDirectory: workingDirectory,
+                    startupEnvironment: replayRestore.environment,
+                    localTerminalMode: .disabled
+               ) {
+                Self.debugLocalTerminalTrace(
+                    "locald.app.restore panel=\(snapshot.id.uuidString.prefix(8)) " +
+                    "result=daemonReplay session=\(localSessionID) eof=\(replayRestore.eof ? 1 : 0)"
+                )
+                restoredTerminalScrollbackByPanelId.removeValue(forKey: terminalPanel.id)
+                applySessionPanelMetadata(snapshot, toPanelId: terminalPanel.id)
+                return terminalPanel.id
+            }
             let fallbackReason: String = {
                 if !daemonAttachAllowed {
                     return "disabled-env"
@@ -6555,6 +6575,11 @@ struct LocalTerminalLaunchConfiguration: Equatable {
     let daemonAuthTokenFilePath: String
 }
 
+private struct LocalTerminalReplayRestore {
+    let environment: [String: String]
+    let eof: Bool
+}
+
 struct LocalTerminalDaemonRegistration: Equatable {
     let instanceID: String
     let socketPath: String
@@ -6727,6 +6752,7 @@ final class Workspace: Identifiable, ObservableObject {
     nonisolated(unsafe) static var runSSHControlMasterCommandOverrideForTesting: (([String]) -> Void)?
     nonisolated(unsafe) static var localTerminalLaunchConfigurationOverrideForTesting: ((LocalTerminalLaunchRequest) -> LocalTerminalLaunchConfiguration?)?
     nonisolated(unsafe) static var localTerminalStatusPayloadOverrideForTesting: ((String) -> [String: Any]?)?
+    nonisolated(unsafe) static var localTerminalReplayPayloadOverrideForTesting: ((String) -> [String: Any]?)?
     nonisolated(unsafe) static var localTerminalBundledCLIPathOverrideForTesting: (() -> String?)?
     nonisolated(unsafe) static var localTerminalSocketConnectivityOverrideForTesting: ((String) -> Bool)?
     nonisolated(unsafe) static var localTerminalLaunchctlResultOverrideForTesting: (([String]) -> (status: Int32, stdout: Data, stderr: Data)?)?
@@ -8014,6 +8040,47 @@ final class Workspace: Identifiable, ObservableObject {
         )
     }
 
+    nonisolated private static func localTerminalReplayPayload(sessionID: String) -> [String: Any]? {
+        if let override = localTerminalReplayPayloadOverrideForTesting {
+            return override(sessionID)
+        }
+        let registration = localTerminalDaemonRegistrationForTesting()
+        return runLocalTerminalDaemonRPC(
+            registration: registration,
+            method: "session.replay",
+            params: ["session_id": sessionID]
+        )
+    }
+
+    nonisolated private static func localTerminalReplayRestore(sessionID: String) -> LocalTerminalReplayRestore? {
+        guard let payload = localTerminalReplayPayload(sessionID: sessionID) else {
+            debugLocalTerminalTrace("locald.app.replay.fail session=\(sessionID) reason=payload")
+            return nil
+        }
+
+        var replayData = Data()
+        for key in ["checkpoint_vt_base64", "tail_base64"] {
+            guard let encoded = payload[key] as? String,
+                  !encoded.isEmpty,
+                  let data = Data(base64Encoded: encoded) else {
+                continue
+            }
+            replayData.append(data)
+        }
+        let environment = SessionScrollbackReplayStore.replayEnvironment(forVTData: replayData)
+        guard !environment.isEmpty else {
+            debugLocalTerminalTrace("locald.app.replay.fail session=\(sessionID) reason=empty")
+            return nil
+        }
+        debugLocalTerminalTrace(
+            "locald.app.replay.ready session=\(sessionID) bytes=\(replayData.count) eof=\((payload["eof"] as? Bool) == true ? 1 : 0)"
+        )
+        return LocalTerminalReplayRestore(
+            environment: environment,
+            eof: (payload["eof"] as? Bool) == true
+        )
+    }
+
     nonisolated private static func resolveLocalTerminalLaunchConfiguration(
         request: LocalTerminalLaunchRequest,
         environment: [String: String] = ProcessInfo.processInfo.environment
@@ -8032,7 +8099,7 @@ final class Workspace: Identifiable, ObservableObject {
             return nil
         }
         let registration = localTerminalDaemonRegistrationForTesting(environment: environment)
-        let bestEffortAttachConfiguration = { (sessionID: String) in
+        let attachConfiguration = { (sessionID: String) in
             LocalTerminalLaunchConfiguration(
                 sessionID: sessionID,
                 initialCommand: localAttachCommand(
@@ -8099,12 +8166,20 @@ final class Workspace: Identifiable, ObservableObject {
             )
 
         case .attachExisting(let sessionID):
-            guard canConnectToLocalDaemonSocket(registration.socketPath) else {
+            if !canConnectToLocalDaemonSocket(registration.socketPath) {
                 debugLocalTerminalTrace(
-                    "locald.app.resolve mode=attach session=\(sessionID) result=daemon_unavailable_best_effort"
+                    "locald.app.resolve mode=attach session=\(sessionID) result=daemon_unavailable_start"
                 )
                 startLocalTerminalDaemonInBackgroundIfNeeded(environment: environment)
-                return bestEffortAttachConfiguration(sessionID)
+                guard waitForLocalDaemonSocket(
+                    registration.socketPath,
+                    timeout: localTerminalDaemonKickstartReadyTimeout
+                ) else {
+                    debugLocalTerminalTrace(
+                        "locald.app.resolve mode=attach session=\(sessionID) result=daemon_unavailable"
+                    )
+                    return nil
+                }
             }
             guard let statusResult = runLocalTerminalDaemonRPC(
                     registration: registration,
@@ -8112,9 +8187,9 @@ final class Workspace: Identifiable, ObservableObject {
                     params: ["session_id": sessionID]
                   ) else {
                 debugLocalTerminalTrace(
-                    "locald.app.resolve mode=attach session=\(sessionID) result=status_failed_best_effort"
+                    "locald.app.resolve mode=attach session=\(sessionID) result=status_failed"
                 )
-                return bestEffortAttachConfiguration(sessionID)
+                return nil
             }
             guard let state = statusResult["state"] as? String,
                   state == "running" else {
@@ -8124,7 +8199,7 @@ final class Workspace: Identifiable, ObservableObject {
                 return nil
             }
             debugLocalTerminalTrace("locald.app.resolve mode=attach session=\(sessionID) result=attach")
-            return bestEffortAttachConfiguration(sessionID)
+            return attachConfiguration(sessionID)
         }
     }
 

@@ -3834,6 +3834,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         initialCommand
     }
 
+    func debugAdditionalEnvironment() -> [String: String] {
+        additionalEnvironment
+    }
+
     func debugPortalHostLease() -> (hostId: String?, paneId: UUID?, inWindow: Bool?, area: CGFloat?) {
         guard let activePortalHostLease else {
             return (nil, nil, nil, nil)

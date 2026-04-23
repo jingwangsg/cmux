@@ -1773,7 +1773,11 @@ struct CMUXCLI {
 #endif
     }
 
-    static func renderLocalDaemonSessionsTableForTesting(payload: [String: Any]) -> String {
+    static func renderLocalDaemonSessionsTableForTesting(
+        payload: [String: Any],
+        replaySocketPath: String? = nil,
+        replayAuthTokenFilePath: String? = nil
+    ) -> String {
         let sessions = (payload["sessions"] as? [[String: Any]]) ?? []
         guard !sessions.isEmpty else {
             return "no sessions\n"
@@ -1789,13 +1793,41 @@ struct CMUXCLI {
                 ?? 0
             let cwd = (session["working_directory"] as? String) ?? ""
             let hint = state == "orphaned"
-                ? "cmux local-daemon rpc session.replay {\"session_id\":\"\(id)\"}"
+                ? localDaemonReplayHint(
+                    sessionID: id,
+                    socketPath: replaySocketPath,
+                    authTokenFilePath: replayAuthTokenFilePath
+                )
                 : ""
             return [id, state, String(attachments), formatLocalDaemonBytes(bytes), cwd, hint]
         }
 
         let headers = ["SESSION ID", "STATE", "ATTACHED", "BYTES", "CWD", "HINT"]
         return renderAlignedTable(headers: headers, rows: rows)
+    }
+
+    private static func localDaemonReplayHint(
+        sessionID: String,
+        socketPath: String?,
+        authTokenFilePath: String?
+    ) -> String {
+        var parts = ["cmux", "local-daemon", "replay"]
+        if let socketPath, !socketPath.isEmpty {
+            parts.append("--socket")
+            parts.append(shellQuotedLocalDaemonArgument(socketPath))
+        }
+        if let authTokenFilePath, !authTokenFilePath.isEmpty {
+            parts.append("--auth-token-file")
+            parts.append(shellQuotedLocalDaemonArgument(authTokenFilePath))
+        }
+        parts.append("--session")
+        parts.append(shellQuotedLocalDaemonArgument(sessionID))
+        return parts.joined(separator: " ")
+    }
+
+    private static func shellQuotedLocalDaemonArgument(_ raw: String) -> String {
+        guard !raw.isEmpty else { return "''" }
+        return "'" + raw.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private static func formatLocalDaemonBytes(_ value: Int) -> String {
@@ -7045,8 +7077,9 @@ struct CMUXCLI {
         switch command {
         case "local-daemon":
             return """
-            Usage: cmux local-daemon serve [--socket <path>]
+            Usage: cmux local-daemon serve [--socket <path>] [--auth-token-file <path>] [--session-log-dir <path>] [--retained-bytes <n>] [--cold-attach-tail-bytes <n>] [--orphan-retention-days <days>]
                    cmux local-daemon sessions [--socket <path>] [--auth-token-file <path>]
+                   cmux local-daemon replay --session <id> [--socket <path>] [--auth-token-file <path>]
                    cmux local-daemon rpc [--socket <path>] <method> [json-params]
 
             Start or inspect the local PTY daemon used for detach/attach development.
@@ -14627,7 +14660,9 @@ struct CMUXCLI {
           omx [omx-args...]
           omc [omc-args...]
           codex <install-hooks|uninstall-hooks>
-          local-daemon serve [--socket <path>]
+          local-daemon serve [--socket <path>] [--session-log-dir <path>] [--retained-bytes <n>] [--cold-attach-tail-bytes <n>] [--orphan-retention-days <days>]
+          local-daemon sessions [--socket <path>]
+          local-daemon replay --session <id> [--socket <path>]
           local-daemon rpc [--socket <path>] <method> [json-params]
           local-attach --session <id> [--socket <path>] [--attachment-id <id>] [--last-acked-seq <n>]
           ping
@@ -14836,7 +14871,7 @@ private struct LocalTerminalRecoveredSession {
         [
             "session_id": manifest.sessionID,
             "state": "orphaned",
-            "recoverable": false,
+            "recoverable": true,
             "tty_name": manifest.ttyName ?? NSNull(),
             "requested_command": manifest.requestedCommand ?? NSNull(),
             "working_directory": manifest.requestedWorkingDirectory ?? NSNull(),
@@ -15453,10 +15488,17 @@ private final class LocalTerminalSession {
         }
         masterHandle.closeFile()
         try? retainedLogHandle.close()
-        try? FileManager.default.removeItem(at: manifestFileURL)
+        removePersistenceFiles()
         state = "closed"
         eofObserved = true
         localTrace("session.close id=\(sessionID)")
+    }
+
+    private func removePersistenceFiles() {
+        let fileManager = FileManager.default
+        for url in [retainedLogFileURL, checkpointVTFileURL, checkpointMetadataFileURL, manifestFileURL] {
+            try? fileManager.removeItem(at: url)
+        }
     }
 
     static func normalizedTTYName(_ raw: String?) -> String? {
@@ -15766,7 +15808,9 @@ private struct LocalTerminalDaemonServerConfiguration {
 }
 
 private final class LocalTerminalDaemonServer {
+    private static let generatedSessionIDPrefix = "local-sess-"
     private static let staleAttachmentInterval: TimeInterval = 3.0
+    private static let sessionArtifactExtensions = ["manifest.json", "vtlog", "checkpoint.vt", "checkpoint.json"]
 
     private let configuration: LocalTerminalDaemonServerConfiguration
     private let stateQueue = DispatchQueue(label: "com.cmux.local-daemon.state")
@@ -15820,24 +15864,34 @@ private final class LocalTerminalDaemonServer {
         }
 
         let retention = configuration.orphanRetentionSeconds
-        let cutoff = retention > 0 ? Date().addingTimeInterval(-retention) : nil
+        let cutoff = Date().addingTimeInterval(-retention)
+        var artifactsByBase: [URL: [URL]] = [:]
+        for url in urls {
+            guard let base = Self.sessionArtifactBaseURL(for: url) else { continue }
+            artifactsByBase[base, default: []].append(url)
+        }
 
-        for url in urls where url.lastPathComponent.hasSuffix(".manifest.json") {
-            if let cutoff,
-               let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-               mtime < cutoff {
-                pruneOrphanFiles(manifestURL: url)
-                localTrace("daemon.gc.prune manifest=\(url.lastPathComponent) age>\(retention)s")
+        for base in artifactsByBase.keys.sorted(by: { $0.path < $1.path }) {
+            let manifestURL = base.appendingPathExtension("manifest.json")
+            let artifactURLs = artifactsByBase[base] ?? []
+            if artifactURLs.allSatisfy({ Self.artifactIsOlderThanCutoff($0, cutoff: cutoff) }) {
+                pruneOrphanFiles(manifestURL: manifestURL)
+                localTrace("daemon.gc.prune base=\(base.lastPathComponent) age>\(retention)s")
                 continue
             }
-            guard let data = try? Data(contentsOf: url),
+
+            guard artifactURLs.contains(where: { $0.lastPathComponent == manifestURL.lastPathComponent }) else {
+                continue
+            }
+            guard let data = try? Data(contentsOf: manifestURL),
                   let manifest = try? JSONDecoder().decode(LocalTerminalSessionManifest.self, from: data) else {
                 continue
             }
             recoveredSessions[manifest.sessionID] = LocalTerminalRecoveredSession(
                 manifest: manifest,
-                manifestFileURL: url
+                manifestFileURL: manifestURL
             )
+            reserveGeneratedSessionID(after: manifest.sessionID)
             localTrace(
                 "daemon.recover id=\(manifest.sessionID) checkpointSeq=\(manifest.checkpointSeq) " +
                 "retainedStart=\(manifest.retainedStartSeq) nextSeq=\(manifest.nextSeq)"
@@ -15845,13 +15899,37 @@ private final class LocalTerminalDaemonServer {
         }
     }
 
+    private func reserveGeneratedSessionID(after sessionID: String) {
+        guard sessionID.hasPrefix(Self.generatedSessionIDPrefix) else { return }
+        let suffix = sessionID.dropFirst(Self.generatedSessionIDPrefix.count)
+        guard let numericID = UInt64(String(suffix)) else { return }
+        nextSessionID = max(nextSessionID, numericID + 1)
+    }
+
+    private static func sessionArtifactBaseURL(for url: URL) -> URL? {
+        for artifactExtension in sessionArtifactExtensions {
+            if url.lastPathComponent.hasSuffix(".\(artifactExtension)") {
+                return artifactExtension.contains(".")
+                    ? url.deletingPathExtension().deletingPathExtension()
+                    : url.deletingPathExtension()
+            }
+        }
+        return nil
+    }
+
+    private static func artifactIsOlderThanCutoff(_ url: URL, cutoff: Date) -> Bool {
+        guard let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else {
+            return true
+        }
+        return mtime < cutoff
+    }
+
     private func pruneOrphanFiles(manifestURL: URL) {
         let base = manifestURL
             .deletingPathExtension()
             .deletingPathExtension()
-        let suffixes = ["manifest.json", "vtlog", "checkpoint.vt", "checkpoint.json"]
         let fileManager = FileManager.default
-        for suffix in suffixes {
+        for suffix in Self.sessionArtifactExtensions {
             let target = base.appendingPathExtension(suffix)
             try? fileManager.removeItem(at: target)
         }
@@ -16095,7 +16173,7 @@ private final class LocalTerminalDaemonServer {
             if let session = sessions.removeValue(forKey: sessionID) {
                 session.close()
             } else if let recovered = recoveredSessions.removeValue(forKey: sessionID) {
-                try? FileManager.default.removeItem(at: recovered.manifestFileURL)
+                pruneOrphanFiles(manifestURL: recovered.manifestFileURL)
             } else {
                 throw CLIError(message: "Unknown session \(sessionID)")
             }
@@ -16165,13 +16243,20 @@ private final class LocalTerminalDaemonServer {
         if let requestedSessionID, !requestedSessionID.isEmpty {
             sessionID = requestedSessionID
         } else {
-            sessionID = "local-sess-\(nextSessionID)"
-            nextSessionID += 1
+            var generatedSessionID: String
+            repeat {
+                generatedSessionID = "\(Self.generatedSessionIDPrefix)\(nextSessionID)"
+                nextSessionID += 1
+            } while sessions[generatedSessionID] != nil || recoveredSessions[generatedSessionID] != nil
+            sessionID = generatedSessionID
         }
 
         if let existing = sessions[sessionID] {
             localTrace("session.open.reuse id=\(sessionID) state=\(existing.state)")
             return existing.statusPayload(now: Date())
+        }
+        if recoveredSessions[sessionID] != nil {
+            throw CLIError(message: "Session \(sessionID) is orphaned after daemon restart; close it before reusing the id")
         }
 
         let cols = max(1, Self.optionalInt(params, key: "cols") ?? 80)
@@ -16538,6 +16623,8 @@ private struct LocalTerminalDaemonTool {
             try LocalTerminalDaemonServer(configuration: try serveConfiguration(args: Array(commandArgs.dropFirst()))).run()
         case "sessions":
             try runSessions(args: Array(commandArgs.dropFirst()))
+        case "replay":
+            try runReplay(args: Array(commandArgs.dropFirst()))
         case "rpc":
             try runRPC(args: Array(commandArgs.dropFirst()))
         default:
@@ -16718,7 +16805,62 @@ private struct LocalTerminalDaemonTool {
         defer { client.close() }
         localTrace("tool.local-daemon.sessions socket=\(socketPath)")
         let payload = try client.sendRequest(method: "session.list", params: [:])
-        FileHandle.standardOutput.write(Data(CMUXCLI.renderLocalDaemonSessionsTableForTesting(payload: payload).utf8))
+        let resolvedAuthTokenFilePath = authTokenFilePath ?? Self.defaultAuthTokenFilePath(forSocketPath: socketPath)
+        FileHandle.standardOutput.write(Data(CMUXCLI.renderLocalDaemonSessionsTableForTesting(
+            payload: payload,
+            replaySocketPath: socketPath,
+            replayAuthTokenFilePath: resolvedAuthTokenFilePath
+        ).utf8))
+    }
+
+    private func runReplay(args: [String]) throws {
+        var socketPath = Self.defaultSocketPath()
+        var authTokenFilePath: String?
+        var sessionID: String?
+        var index = 0
+        while index < args.count {
+            switch args[index] {
+            case "--socket":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--socket requires a path")
+                }
+                socketPath = args[index + 1]
+                index += 2
+            case "--auth-token-file":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--auth-token-file requires a path")
+                }
+                authTokenFilePath = args[index + 1]
+                index += 2
+            case "--session":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--session requires an id")
+                }
+                sessionID = args[index + 1]
+                index += 2
+            case "--help", "-h":
+                print(localDaemonUsageText())
+                throw CLIError(message: "")
+            default:
+                throw CLIError(message: "Unknown local-daemon replay option '\(args[index])'")
+            }
+        }
+
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionID.isEmpty else {
+            throw CLIError(message: "local-daemon replay requires --session <id>")
+        }
+
+        let client = try LocalTerminalDaemonClient(
+            socketPath: socketPath,
+            authTokenFilePath: authTokenFilePath ?? Self.defaultAuthTokenFilePath(forSocketPath: socketPath)
+        )
+        defer { client.close() }
+        localTrace("tool.local-daemon.replay socket=\(socketPath) session=\(sessionID)")
+        let result = try client.sendRequest(method: "session.replay", params: ["session_id": sessionID])
+        let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
     }
 
     fileprivate static func defaultSocketPath() -> String {
@@ -16792,8 +16934,9 @@ private struct LocalTerminalDaemonTool {
     private func localDaemonUsageText() -> String {
         """
         Usage:
-          cmux local-daemon serve [--socket <path>] [--auth-token-file <path>] [--session-log-dir <path>] [--retained-bytes <n>] [--cold-attach-tail-bytes <n>] [--orphan-retention-days <days>] [--exit-after-startup-for-testing]
+          cmux local-daemon serve [--socket <path>] [--auth-token-file <path>] [--session-log-dir <path>] [--retained-bytes <n>] [--cold-attach-tail-bytes <n>] [--orphan-retention-days <days>]
           cmux local-daemon sessions [--socket <path>] [--auth-token-file <path>]
+          cmux local-daemon replay --session <id> [--socket <path>] [--auth-token-file <path>]
           cmux local-daemon rpc [--socket <path>] [--auth-token-file <path>] <method> [json-params]
         """
     }

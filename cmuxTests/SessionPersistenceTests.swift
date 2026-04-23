@@ -246,6 +246,90 @@ final class SessionPersistenceTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testWorkspaceRestoreReplaysOrphanedDaemonSessionBeforeSnapshotScrollback() throws {
+        let restoredPanelID = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!
+        let checkpoint = Data("\u{1B}[2J\u{1B}[Hfresh daemon checkpoint\n".utf8)
+        let tail = Data("fresh daemon tail\n".utf8)
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        let previousReplayOverride = Workspace.localTerminalReplayPayloadOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            switch request.mode {
+            case .attachExisting(let sessionID):
+                XCTAssertEqual(sessionID, "orphaned-local-session")
+                return nil
+            case .create:
+                return nil
+            }
+        }
+        Workspace.localTerminalReplayPayloadOverrideForTesting = { sessionID in
+            XCTAssertEqual(sessionID, "orphaned-local-session")
+            return [
+                "session_id": sessionID,
+                "eof": true,
+                "checkpoint_vt_base64": checkpoint.base64EncodedString(),
+                "tail_base64": tail.base64EncodedString(),
+                "next_seq": checkpoint.count + tail.count,
+            ]
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+            Workspace.localTerminalReplayPayloadOverrideForTesting = previousReplayOverride
+        }
+
+        let snapshot = SessionWorkspaceSnapshot(
+            processTitle: "Terminal",
+            customTitle: nil,
+            customDescription: nil,
+            customColor: nil,
+            isPinned: false,
+            terminalScrollBarHidden: nil,
+            currentDirectory: "/tmp/demo",
+            focusedPanelId: restoredPanelID,
+            layout: .pane(SessionPaneLayoutSnapshot(panelIds: [restoredPanelID], selectedPanelId: restoredPanelID)),
+            panels: [
+                SessionPanelSnapshot(
+                    id: restoredPanelID,
+                    type: .terminal,
+                    title: "Terminal",
+                    customTitle: nil,
+                    directory: "/tmp/demo",
+                    isPinned: false,
+                    isManuallyUnread: false,
+                    gitBranch: nil,
+                    listeningPorts: [],
+                    ttyName: nil,
+                    terminal: SessionTerminalPanelSnapshot(
+                        workingDirectory: "/tmp/demo",
+                        scrollback: "stale saved app snapshot\n",
+                        localSessionID: "orphaned-local-session"
+                    ),
+                    browser: nil,
+                    markdown: nil
+                )
+            ],
+            statusEntries: [],
+            logEntries: [],
+            progress: nil,
+            gitBranch: nil
+        )
+
+        let workspace = Workspace()
+        workspace.restoreSessionSnapshot(snapshot)
+
+        let panelID = try XCTUnwrap(workspace.focusedPanelId)
+        let panel = try XCTUnwrap(workspace.terminalPanel(for: panelID))
+        XCTAssertNil(panel.localSessionID, "orphan replay should restore into a fresh non-daemon terminal")
+        let replayPath = try XCTUnwrap(
+            panel.surface.debugAdditionalEnvironment()[SessionScrollbackReplayStore.environmentKey]
+        )
+        let replayData = try Data(contentsOf: URL(fileURLWithPath: replayPath))
+        var expectedReplayData = checkpoint
+        expectedReplayData.append(tail)
+        XCTAssertEqual(replayData, expectedReplayData)
+        XCTAssertFalse(String(data: replayData, encoding: .utf8)?.contains("stale saved app snapshot") == true)
+    }
+
     func testSaveAndLoadRoundTripWithCustomSnapshotPath() throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("cmux-session-tests-\(UUID().uuidString)", isDirectory: true)
@@ -513,6 +597,23 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertTrue(contents.contains("\(red)RED\(reset)"))
         XCTAssertTrue(contents.hasPrefix(reset))
         XCTAssertTrue(contents.hasSuffix(reset))
+    }
+
+    func testScrollbackReplayEnvironmentCanWriteRawVTBytes() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-vt-replay-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let source = Data([0x1B, 0x5B, 0x32, 0x4A, 0xFF, 0x0A])
+        let environment = SessionScrollbackReplayStore.replayEnvironment(
+            forVTData: source,
+            tempDirectory: tempDir
+        )
+
+        let path = try XCTUnwrap(environment[SessionScrollbackReplayStore.environmentKey])
+        let replayData = try Data(contentsOf: URL(fileURLWithPath: path))
+        XCTAssertEqual(replayData, source)
     }
 
     func testTruncatedScrollbackAvoidsLeadingPartialANSICSISequence() {
