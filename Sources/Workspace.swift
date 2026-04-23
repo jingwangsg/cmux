@@ -8282,7 +8282,12 @@ final class Workspace: Identifiable, ObservableObject {
             initialInput: initialInput,
             initialEnvironmentOverrides: launchConfiguration == nil ? initialEnvironmentOverrides : [:],
             additionalEnvironment: launchConfiguration == nil ? additionalEnvironment : [:],
-            localSessionID: launchConfiguration?.sessionID
+            localSessionID: launchConfiguration?.sessionID,
+            // Daemon-attach layer is a dumb stdio forwarder (`cmux local-attach`),
+            // not an interactive login shell. Skip Ghostty's login(1) wrapper so
+            // we don't get a stray "Last login:" motd banner before the daemon's
+            // real session output streams in.
+            bypassLoginWrapper: launchConfiguration != nil
         )
     }
 

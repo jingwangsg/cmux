@@ -101,7 +101,8 @@ final class TerminalPanel: Panel, ObservableObject {
         initialInput: String? = nil,
         initialEnvironmentOverrides: [String: String] = [:],
         additionalEnvironment: [String: String] = [:],
-        localSessionID: String? = nil
+        localSessionID: String? = nil,
+        bypassLoginWrapper: Bool = false
     ) {
         let surface = TerminalSurface(
             id: id,
@@ -112,7 +113,8 @@ final class TerminalPanel: Panel, ObservableObject {
             initialCommand: initialCommand,
             initialInput: initialInput,
             initialEnvironmentOverrides: initialEnvironmentOverrides,
-            additionalEnvironment: additionalEnvironment
+            additionalEnvironment: additionalEnvironment,
+            bypassLoginWrapper: bypassLoginWrapper
         )
         surface.portOrdinal = portOrdinal
         self.init(workspaceId: workspaceId, surface: surface, localSessionID: localSessionID)
