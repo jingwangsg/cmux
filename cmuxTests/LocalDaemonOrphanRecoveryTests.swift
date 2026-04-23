@@ -112,4 +112,91 @@ final class LocalDaemonOrphanRecoveryTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: stale.checkpointVT.path))
         XCTAssertFalse(fm.fileExists(atPath: stale.checkpointMeta.path))
     }
+
+    func test_sessionReplay_returnsCheckpointAndTailForOrphans() throws {
+        let cli = try bundledCLIPath()
+        let authTokenFile = try writeAuthTokenFile(named: "locald.auth")
+        let id = "replay-\(UUID().uuidString.prefix(6))"
+        let base = tempDir.appendingPathComponent(id, isDirectory: false)
+        let manifest = base.appendingPathExtension("manifest.json")
+        let log = base.appendingPathExtension("vtlog")
+        let checkpointVT = base.appendingPathExtension("checkpoint.vt")
+        let checkpointMeta = base.appendingPathExtension("checkpoint.json")
+
+        let logBytes = Data("hello from the orphan\n".utf8)
+        let checkpointBytes = Data("\u{1B}[2J\u{1B}[Hrestored".utf8)
+        try JSONSerialization.data(withJSONObject: [
+            "session_id": id,
+            "process_id": 1234,
+            "created_at": "2026-01-01T00:00:00Z",
+            "checkpoint_seq": 3,
+            "retained_start_seq": 3,
+            "next_seq": UInt64(3 + logBytes.count),
+            "requested_command": "/bin/zsh",
+        ]).write(to: manifest)
+        try logBytes.write(to: log)
+        try checkpointBytes.write(to: checkpointVT)
+        try JSONSerialization.data(withJSONObject: [
+            "sequence": 3,
+            "cols": 80,
+            "rows": 24,
+        ]).write(to: checkpointMeta)
+
+        let socket = tempDir.appendingPathComponent("daemon.sock").path
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cli)
+        daemon.arguments = [
+            "local-daemon", "serve",
+            "--socket", socket,
+            "--auth-token-file", authTokenFile.path,
+            "--session-log-dir", tempDir.path,
+        ]
+        try daemon.run()
+        defer {
+            daemon.terminate()
+            daemon.waitUntilExit()
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        while !FileManager.default.fileExists(atPath: socket), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: socket), "daemon socket must appear within 5s")
+
+        let rpc = Process()
+        rpc.executableURL = URL(fileURLWithPath: cli)
+        rpc.arguments = [
+            "local-daemon", "rpc",
+            "--socket", socket,
+            "--auth-token-file", authTokenFile.path,
+            "session.replay",
+            "{\"session_id\":\"\(id)\"}",
+        ]
+        let out = Pipe()
+        let err = Pipe()
+        rpc.standardOutput = out
+        rpc.standardError = err
+        try rpc.run()
+        rpc.waitUntilExit()
+        XCTAssertEqual(
+            rpc.terminationStatus,
+            0,
+            String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        )
+
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        let json = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(json["session_id"] as? String, id)
+        XCTAssertEqual(json["eof"] as? Bool, true)
+        XCTAssertEqual(json["checkpoint_cols"] as? Int, 80)
+        XCTAssertEqual(json["checkpoint_rows"] as? Int, 24)
+
+        let checkpointB64 = try XCTUnwrap(json["checkpoint_vt_base64"] as? String)
+        XCTAssertEqual(Data(base64Encoded: checkpointB64), checkpointBytes)
+
+        let tailB64 = try XCTUnwrap(json["tail_base64"] as? String)
+        XCTAssertEqual(Data(base64Encoded: tailB64), logBytes)
+    }
 }

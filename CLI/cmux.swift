@@ -1773,6 +1773,58 @@ struct CMUXCLI {
 #endif
     }
 
+    static func renderLocalDaemonSessionsTableForTesting(payload: [String: Any]) -> String {
+        let sessions = (payload["sessions"] as? [[String: Any]]) ?? []
+        guard !sessions.isEmpty else {
+            return "no sessions\n"
+        }
+
+        let rows: [[String]] = sessions.map { session in
+            let id = (session["session_id"] as? String) ?? "?"
+            let state = (session["state"] as? String) ?? "?"
+            let attachments = ((session["attachments"] as? [[String: Any]]) ?? []).count
+            let bytes = (session["retained_byte_count"] as? Int)
+                ?? (session["buffered_bytes"] as? Int)
+                ?? (session["next_seq"] as? Int)
+                ?? 0
+            let cwd = (session["working_directory"] as? String) ?? ""
+            let hint = state == "orphaned"
+                ? "cmux local-daemon rpc session.replay {\"session_id\":\"\(id)\"}"
+                : ""
+            return [id, state, String(attachments), formatLocalDaemonBytes(bytes), cwd, hint]
+        }
+
+        let headers = ["SESSION ID", "STATE", "ATTACHED", "BYTES", "CWD", "HINT"]
+        return renderAlignedTable(headers: headers, rows: rows)
+    }
+
+    private static func formatLocalDaemonBytes(_ value: Int) -> String {
+        let units: [(Double, String)] = [
+            (1_073_741_824, "G"),
+            (1_048_576, "M"),
+            (1024, "K"),
+        ]
+        for (threshold, suffix) in units where Double(value) >= threshold {
+            return String(format: "%.1f%@", Double(value) / threshold, suffix)
+        }
+        return "\(value)B"
+    }
+
+    private static func renderAlignedTable(headers: [String], rows: [[String]]) -> String {
+        let allRows = [headers] + rows
+        let widths = (0..<headers.count).map { column in
+            allRows.map { $0[column].count }.max() ?? 0
+        }
+        func render(_ cells: [String]) -> String {
+            zip(cells, widths)
+                .map { cell, width in
+                    cell.padding(toLength: width, withPad: " ", startingAt: 0)
+                }
+                .joined(separator: "  ") + "\n"
+        }
+        return allRows.map(render).joined()
+    }
+
     func run() throws {
         let processEnv = ProcessInfo.processInfo.environment
         let envSocketPath: String? = {
@@ -6994,6 +7046,7 @@ struct CMUXCLI {
         case "local-daemon":
             return """
             Usage: cmux local-daemon serve [--socket <path>]
+                   cmux local-daemon sessions [--socket <path>] [--auth-token-file <path>]
                    cmux local-daemon rpc [--socket <path>] <method> [json-params]
 
             Start or inspect the local PTY daemon used for detach/attach development.
@@ -14892,6 +14945,14 @@ private final class LocalTerminalSession {
     private var lastCheckpointAt: Date?
     private(set) var lastStateChangeAt: Date
 
+    struct ReplaySnapshot {
+        let cols: Int?
+        let rows: Int?
+        let checkpointVT: Data
+        let tail: Data
+        let nextSeq: UInt64
+    }
+
     init(
         sessionID: String,
         processID: pid_t,
@@ -15226,6 +15287,18 @@ private final class LocalTerminalSession {
             )
         }
         return delta
+    }
+
+    func captureReplaySnapshot() throws -> ReplaySnapshot {
+        let checkpointData = (try? Data(contentsOf: checkpointVTFileURL)) ?? Data()
+        let logData = (try? Data(contentsOf: retainedLogFileURL)) ?? Data()
+        return ReplaySnapshot(
+            cols: checkpointMetadata?.cols,
+            rows: checkpointMetadata?.rows,
+            checkpointVT: checkpointData,
+            tail: logData,
+            nextSeq: nextSeq
+        )
     }
 
     func markExited(_ terminationStatus: Int32?) {
@@ -15897,6 +15970,7 @@ private final class LocalTerminalDaemonServer {
                 "name": "cmuxd-local",
                 "version": "dev",
                 "capabilities": [
+                    "session.replay",
                     "session.attach",
                     "session.poll",
                     "session.resize.min",
@@ -16007,6 +16081,15 @@ private final class LocalTerminalDaemonServer {
                     "state": session.state
                 ]
             }
+        case "session.replay", "session.replay.disk":
+            let sessionID = try Self.requireString(params, key: "session_id")
+            if let session = sessions[sessionID] {
+                return try replayLiveSnapshot(session: session)
+            }
+            if let recovered = recoveredSessions[sessionID] {
+                return try replayOrphanedSession(recovered: recovered)
+            }
+            throw CLIError(message: "Unknown session \(sessionID)")
         case "session.close":
             let sessionID = try Self.requireString(params, key: "session_id")
             if let session = sessions.removeValue(forKey: sessionID) {
@@ -16023,6 +16106,57 @@ private final class LocalTerminalDaemonServer {
         default:
             throw CLIError(message: "Unknown local daemon method '\(method)'")
         }
+    }
+
+    private func replayLiveSnapshot(session: LocalTerminalSession) throws -> [String: Any] {
+        session.pruneStaleAttachments(now: Date(), staleAfter: Self.staleAttachmentInterval)
+        let snapshot = try session.captureReplaySnapshot()
+        localTrace(
+            "daemon.replay source=live session=\(session.sessionID) " +
+            "checkpointBytes=\(snapshot.checkpointVT.count) tailBytes=\(snapshot.tail.count)"
+        )
+        return [
+            "session_id": session.sessionID,
+            "eof": false,
+            "checkpoint_cols": snapshot.cols as Any,
+            "checkpoint_rows": snapshot.rows as Any,
+            "checkpoint_vt_base64": snapshot.checkpointVT.base64EncodedString(),
+            "tail_base64": snapshot.tail.base64EncodedString(),
+            "next_seq": NSNumber(value: snapshot.nextSeq),
+        ]
+    }
+
+    private func replayOrphanedSession(recovered: LocalTerminalRecoveredSession) throws -> [String: Any] {
+        let base = recovered.manifestFileURL
+            .deletingPathExtension()
+            .deletingPathExtension()
+        let logURL = base.appendingPathExtension("vtlog")
+        let checkpointVTURL = base.appendingPathExtension("checkpoint.vt")
+        let checkpointMetaURL = base.appendingPathExtension("checkpoint.json")
+
+        let logData = (try? Data(contentsOf: logURL)) ?? Data()
+        let checkpointData = (try? Data(contentsOf: checkpointVTURL)) ?? Data()
+        var cols: Int?
+        var rows: Int?
+        if let metaData = try? Data(contentsOf: checkpointMetaURL),
+           let object = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any] {
+            cols = object["cols"] as? Int
+            rows = object["rows"] as? Int
+        }
+
+        localTrace(
+            "daemon.replay source=orphan session=\(recovered.manifest.sessionID) " +
+            "checkpointBytes=\(checkpointData.count) tailBytes=\(logData.count)"
+        )
+        return [
+            "session_id": recovered.manifest.sessionID,
+            "eof": true,
+            "checkpoint_cols": cols as Any,
+            "checkpoint_rows": rows as Any,
+            "checkpoint_vt_base64": checkpointData.base64EncodedString(),
+            "tail_base64": logData.base64EncodedString(),
+            "next_seq": NSNumber(value: recovered.manifest.nextSeq),
+        ]
     }
 
     private func openSession(params: [String: Any]) throws -> [String: Any] {
@@ -16402,6 +16536,8 @@ private struct LocalTerminalDaemonTool {
         switch command {
         case "serve":
             try LocalTerminalDaemonServer(configuration: try serveConfiguration(args: Array(commandArgs.dropFirst()))).run()
+        case "sessions":
+            try runSessions(args: Array(commandArgs.dropFirst()))
         case "rpc":
             try runRPC(args: Array(commandArgs.dropFirst()))
         default:
@@ -16549,6 +16685,42 @@ private struct LocalTerminalDaemonTool {
         FileHandle.standardOutput.write(Data("\n".utf8))
     }
 
+    private func runSessions(args: [String]) throws {
+        var socketPath = Self.defaultSocketPath()
+        var authTokenFilePath: String?
+        var index = 0
+        while index < args.count {
+            switch args[index] {
+            case "--socket":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--socket requires a path")
+                }
+                socketPath = args[index + 1]
+                index += 2
+            case "--auth-token-file":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--auth-token-file requires a path")
+                }
+                authTokenFilePath = args[index + 1]
+                index += 2
+            case "--help", "-h":
+                print(localDaemonUsageText())
+                throw CLIError(message: "")
+            default:
+                throw CLIError(message: "Unknown local-daemon sessions option '\(args[index])'")
+            }
+        }
+
+        let client = try LocalTerminalDaemonClient(
+            socketPath: socketPath,
+            authTokenFilePath: authTokenFilePath ?? Self.defaultAuthTokenFilePath(forSocketPath: socketPath)
+        )
+        defer { client.close() }
+        localTrace("tool.local-daemon.sessions socket=\(socketPath)")
+        let payload = try client.sendRequest(method: "session.list", params: [:])
+        FileHandle.standardOutput.write(Data(CMUXCLI.renderLocalDaemonSessionsTableForTesting(payload: payload).utf8))
+    }
+
     fileprivate static func defaultSocketPath() -> String {
         if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
             let candidate = appSupport.appendingPathComponent("cmux/cmuxd-local.sock").path
@@ -16621,6 +16793,7 @@ private struct LocalTerminalDaemonTool {
         """
         Usage:
           cmux local-daemon serve [--socket <path>] [--auth-token-file <path>] [--session-log-dir <path>] [--retained-bytes <n>] [--cold-attach-tail-bytes <n>] [--orphan-retention-days <days>] [--exit-after-startup-for-testing]
+          cmux local-daemon sessions [--socket <path>] [--auth-token-file <path>]
           cmux local-daemon rpc [--socket <path>] [--auth-token-file <path>] <method> [json-params]
         """
     }
