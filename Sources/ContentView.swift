@@ -1494,6 +1494,11 @@ private final class WindowCommandPaletteOverlayController: NSObject {
 
     func update(rootView: AnyView, isVisible: Bool) {
         guard ensureInstalled() else { return }
+        // Called from a .background(WindowAccessor { ... }) closure that re-runs
+        // on every parent-view body eval (display-sync cadence). The palette is
+        // hidden in the vast majority of frames; skip the full cleanup path when
+        // we'd just be rewriting the same invisible state.
+        if !isVisible && !isPaletteVisible { return }
         let shouldPromote = CommandPaletteOverlayPromotionPolicy.shouldPromote(
             previouslyVisible: isPaletteVisible,
             isVisible: isVisible

@@ -14799,7 +14799,12 @@ private struct LocalTerminalRecoveredSession {
 
 #if DEBUG
 private enum LocalTerminalTraceLog {
-    private static let formatter = ISO8601DateFormatter()
+    private static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        f.timeZone = TimeZone.current
+        return f
+    }()
 
     private static func logPath() -> String? {
         if let explicit = ProcessInfo.processInfo.environment["CMUX_DEBUG_LOG"]?
@@ -16574,6 +16579,8 @@ private struct LocalTerminalAttachTool {
     }
 
     func run() throws {
+        let attachEntryTime = CACurrentMediaTime()
+        localTrace("tool.local-attach.entry pid=\(getpid())")
         var socketPath = LocalTerminalDaemonTool.defaultSocketPath()
         var authTokenFilePath: String?
         var sessionID: String?
@@ -16625,13 +16632,20 @@ private struct LocalTerminalAttachTool {
             throw CLIError(message: "local-attach requires --session <id>")
         }
 
-        localTrace(
-            "tool.local-attach.start session=\(sessionID) attachment=\(attachmentID) " +
-            "socket=\(socketPath) lastAcked=\(lastAckedSeq)"
-        )
+        let argsParsedTime = CACurrentMediaTime()
+        localTrace(String(
+            format: "tool.local-attach.start session=%@ attachment=%@ socket=%@ lastAcked=%d entryToArgsMs=%.2f",
+            sessionID, attachmentID, socketPath, Int(lastAckedSeq),
+            (argsParsedTime - attachEntryTime) * 1000
+        ))
         try LocalTerminalDaemonTool.waitForSafeSocketPath(path: socketPath, timeout: 10)
         let probeClient = try SocketClient.waitForConnectableSocket(path: socketPath, timeout: 10)
         probeClient.close()
+        let socketReadyTime = CACurrentMediaTime()
+        localTrace(String(
+            format: "tool.local-attach.socketReady session=%@ entryToSocketMs=%.2f",
+            sessionID, (socketReadyTime - attachEntryTime) * 1000
+        ))
 
         let client = try LocalTerminalDaemonClient(
             socketPath: socketPath,
@@ -16663,12 +16677,16 @@ private struct LocalTerminalAttachTool {
                 "rows": initialSize.rows
             ]
         )
-        localTrace(
-            "tool.local-attach.attached session=\(sessionID) attachment=\(attachmentID) " +
-            "replayStart=\(String(describing: attachResponse["cold_attach_replay_start_seq"])) " +
-            "checkpointSeq=\(String(describing: attachResponse["checkpoint_seq"])) " +
-            "checkpointScreen=\(String(describing: attachResponse["checkpoint_active_screen"]))"
-        )
+        let attachedTime = CACurrentMediaTime()
+        localTrace(String(
+            format: "tool.local-attach.attached session=%@ attachment=%@ entryToAttachedMs=%.2f " +
+            "replayStart=%@ checkpointSeq=%@ checkpointScreen=%@",
+            sessionID, attachmentID,
+            (attachedTime - attachEntryTime) * 1000,
+            String(describing: attachResponse["cold_attach_replay_start_seq"]),
+            String(describing: attachResponse["checkpoint_seq"]),
+            String(describing: attachResponse["checkpoint_active_screen"])
+        ))
         if lastAckedSeq == 0 {
             if let replayStart = attachResponse["cold_attach_replay_start_seq"] as? NSNumber {
                 lastAckedSeq = replayStart.uint64Value
@@ -16715,6 +16733,7 @@ private struct LocalTerminalAttachTool {
             }
         }
 
+        var firstDataLogged = false
         while true {
             let response = try client.sendRequest(
                 method: "session.read",
@@ -16740,6 +16759,16 @@ private struct LocalTerminalAttachTool {
                 let startSeq = (response["start_seq"] as? NSNumber)?.uint64Value
                     ?? (response["start_seq"] as? UInt64)
                     ?? 0
+                if !firstDataLogged {
+                    firstDataLogged = true
+                    let firstDataTime = CACurrentMediaTime()
+                    localTrace(String(
+                        format: "tool.local-attach.firstData session=%@ attachment=%@ entryToFirstDataMs=%.2f bytes=%d",
+                        sessionID, attachmentID,
+                        (firstDataTime - attachEntryTime) * 1000,
+                        data.count
+                    ))
+                }
                 localTrace(
                     "tool.local-attach.read session=\(sessionID) bytes=\(data.count) startSeq=\(startSeq) " +
                     "endSeq=\(lastAckedSeq) eof=\((response["eof"] as? Bool) == true ? 1 : 0)"

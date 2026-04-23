@@ -4229,10 +4229,17 @@ final class TerminalSurface: Identifiable, ObservableObject {
             }
 #if DEBUG
             dlog("surface.attach.create surface=\(id.uuidString.prefix(5))")
+            let attachCreateStart = CACurrentMediaTime()
 #endif
             createSurface(for: view)
 #if DEBUG
-            dlog("surface.attach.create.done surface=\(id.uuidString.prefix(5)) hasSurface=\(surface != nil ? 1 : 0)")
+            let attachCreateMs = (CACurrentMediaTime() - attachCreateStart) * 1000
+            dlog(String(
+                format: "surface.attach.create.done surface=%@ hasSurface=%d elapsedMs=%.2f",
+                String(id.uuidString.prefix(5)),
+                surface != nil ? 1 : 0,
+                attachCreateMs
+            ))
 #endif
         } else if let screen = view.window?.screen ?? NSScreen.main,
                   let displayID = screen.displayID,
@@ -9314,12 +9321,15 @@ final class GhosttySurfaceScrollView: NSView {
                   readySurfaceId == self.surfaceView.terminalSurface?.id else {
                 return
             }
+#if DEBUG
+            dlog("find.surfaceDidBecomeReady.observed surface=\(String(readySurfaceId.uuidString.prefix(5)))")
+#endif
             // Session restore can request focus before the runtime surface exists.
             // Re-run the normal first-responder/focus path once the surface is live.
             guard self.isActive || self.surfaceView.desiredFocus || self.isSurfaceViewFirstResponder() else {
                 return
             }
-            self.scheduleAutomaticFirstResponderApply(reason: "surfaceDidBecomeReady")
+            self.scheduleAutomaticFirstResponderApply(reason: "surfaceDidBecomeReady", allowSync: true)
         })
 
         observers.append(NotificationCenter.default.addObserver(
@@ -9671,7 +9681,7 @@ final class GhosttySurfaceScrollView: NSView {
 #if DEBUG
             dlog("find.window.didBecomeKey surface=\(self.surfaceView.terminalSurface?.id.uuidString.prefix(5) ?? "nil") searchActive=\(searchActive) focusTarget=\(self.searchFocusTarget) firstResponder=\(String(describing: self.window?.firstResponder))")
 #endif
-            self.scheduleAutomaticFirstResponderApply(reason: "didBecomeKey")
+            self.scheduleAutomaticFirstResponderApply(reason: "didBecomeKey", allowSync: true)
         })
         windowObservers.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification,
@@ -9695,7 +9705,7 @@ final class GhosttySurfaceScrollView: NSView {
             }
         })
         if window.isKeyWindow {
-            scheduleAutomaticFirstResponderApply(reason: "viewDidMoveToWindow")
+            scheduleAutomaticFirstResponderApply(reason: "viewDidMoveToWindow", allowSync: true)
         }
     }
 
@@ -10355,32 +10365,33 @@ final class GhosttySurfaceScrollView: NSView {
 
     func setVisibleInUI(_ visible: Bool) {
         let wasVisible = surfaceView.isVisibleInUI
+        // Representable updateNSView runs on every SwiftUI body eval and
+        // calls this on the hot (still-visible) surface each time. Early-bail
+        // on no-op so we don't keep rescheduling first-responder applies at
+        // display-sync cadence.
+        guard wasVisible != visible else { return }
         surfaceView.setVisibleInUI(visible)
         isHidden = !visible
-        if wasVisible != visible, lastRequestedPortalOcclusionVisible != visible {
+        if lastRequestedPortalOcclusionVisible != visible {
             lastRequestedPortalOcclusionVisible = visible
             surfaceView.terminalSurface?.setOcclusion(visible)
         }
 #if DEBUG
-        if wasVisible != visible {
-            let transition = "\(wasVisible ? 1 : 0)->\(visible ? 1 : 0)"
-            let suffix = debugVisibilityStateSuffix(transition: transition)
-            debugLogWorkspaceSwitchTiming(
-                event: "ws.term.visible",
-                suffix: suffix
-            )
-        }
+        let transition = "\(wasVisible ? 1 : 0)->\(visible ? 1 : 0)"
+        let suffix = debugVisibilityStateSuffix(transition: transition)
+        debugLogWorkspaceSwitchTiming(
+            event: "ws.term.visible",
+            suffix: suffix
+        )
 #endif
-        if wasVisible != visible {
-            NotificationCenter.default.post(
-                name: .terminalPortalVisibilityDidChange,
-                object: self,
-                userInfo: [
-                    GhosttyNotificationKey.surfaceId: surfaceView.terminalSurface?.id as Any,
-                    GhosttyNotificationKey.tabId: surfaceView.tabId as Any
-                ]
-            )
-        }
+        NotificationCenter.default.post(
+            name: .terminalPortalVisibilityDidChange,
+            object: self,
+            userInfo: [
+                GhosttyNotificationKey.surfaceId: surfaceView.terminalSurface?.id as Any,
+                GhosttyNotificationKey.tabId: surfaceView.tabId as Any
+            ]
+        )
         if !visible {
             // If we were focused, yield first responder.
             if let window, let fr = window.firstResponder as? NSView,
@@ -10407,16 +10418,18 @@ final class GhosttySurfaceScrollView: NSView {
 
     func setActive(_ active: Bool) {
         let wasActive = isActive
+        // Same hot-path as setVisibleInUI: representable updateNSView fires
+        // this on every body eval for the active surface. Skip the rescheduled
+        // first-responder apply when nothing actually changed.
+        guard wasActive != active else { return }
         isActive = active
 #if DEBUG
-        if wasActive != active {
-            let transition = "\(wasActive ? 1 : 0)->\(active ? 1 : 0)"
-            let suffix = debugVisibilityStateSuffix(transition: transition)
-            debugLogWorkspaceSwitchTiming(
-                event: "ws.term.active",
-                suffix: suffix
-            )
-        }
+        let transition = "\(wasActive ? 1 : 0)->\(active ? 1 : 0)"
+        let suffix = debugVisibilityStateSuffix(transition: transition)
+        debugLogWorkspaceSwitchTiming(
+            event: "ws.term.active",
+            suffix: suffix
+        )
 #endif
         if active {
             scheduleAutomaticFirstResponderApply(reason: "setActive")
@@ -10809,15 +10822,33 @@ final class GhosttySurfaceScrollView: NSView {
         return fr === surfaceView || fr.isDescendant(of: surfaceView)
     }
 
-    private func scheduleAutomaticFirstResponderApply(reason: String) {
+    private func scheduleAutomaticFirstResponderApply(reason: String, allowSync: Bool = false) {
+        // Fast path: callers that know they're on the main thread and NOT inside
+        // a SwiftUI updateNSView / AppKit nested-callback chain can opt into
+        // running the apply synchronously, bypassing the main-queue async hop.
+        // This matters when the main queue is backed up behind SwiftUI work
+        // (new-workspace reconcile, old-workspace dismantle) — the deferred
+        // apply otherwise sits at the tail of the queue for ~100ms.
+        if allowSync, Thread.isMainThread, !pendingAutomaticFirstResponderApply {
+#if DEBUG
+            let surfaceShort = String(surfaceView.terminalSurface?.id.uuidString.prefix(5) ?? "nil")
+            dlog("find.applyFirstResponder.defer surface=\(surfaceShort) reason=\(reason) queueMs=0.00 sync=1")
+#endif
+            applyFirstResponderIfNeeded()
+            return
+        }
         guard !pendingAutomaticFirstResponderApply else { return }
         pendingAutomaticFirstResponderApply = true
+#if DEBUG
+        let scheduleTime = CACurrentMediaTime()
+#endif
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pendingAutomaticFirstResponderApply = false
 #if DEBUG
             let surfaceShort = String(self.surfaceView.terminalSurface?.id.uuidString.prefix(5) ?? "nil")
-            dlog("find.applyFirstResponder.defer surface=\(surfaceShort) reason=\(reason)")
+            let queueMs = (CACurrentMediaTime() - scheduleTime) * 1000
+            dlog(String(format: "find.applyFirstResponder.defer surface=%@ reason=%@ queueMs=%.2f", surfaceShort, reason, queueMs))
 #endif
             self.applyFirstResponderIfNeeded()
         }
