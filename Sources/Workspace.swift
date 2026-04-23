@@ -654,8 +654,13 @@ extension Workspace {
                 "strategy=\(String(describing: snapshot.terminal?.restoreStrategy)) " +
                 "localSession=\(snapshot.terminal?.localSessionID ?? "nil")"
             )
-            if snapshot.terminal?.restoreStrategy == .daemonAttach,
-               let localSessionID = snapshot.terminal?.localSessionID,
+            let daemonAttachAllowed = Self.shouldUseLocalTerminalDaemon()
+            let restoreStrategy = snapshot.terminal?.restoreStrategy
+            let localSessionID = snapshot.terminal?.localSessionID
+            if daemonAttachAllowed,
+               restoreStrategy == .daemonAttach,
+               let localSessionID,
+               !localSessionID.isEmpty,
                let terminalPanel = newTerminalSurface(
                     inPane: paneId,
                     focus: false,
@@ -669,8 +674,21 @@ extension Workspace {
                 applySessionPanelMetadata(snapshot, toPanelId: terminalPanel.id)
                 return terminalPanel.id
             }
+            let fallbackReason: String = {
+                if !daemonAttachAllowed {
+                    return "disabled-env"
+                }
+                if restoreStrategy != .daemonAttach {
+                    return "legacy-strategy"
+                }
+                if let localSessionID, !localSessionID.isEmpty {
+                    return "attach-failed"
+                }
+                return "missing-id"
+            }()
             Self.debugLocalTerminalTrace(
-                "locald.app.restore panel=\(snapshot.id.uuidString.prefix(8)) result=scrollbackReplay"
+                "locald.app.restore panel=\(snapshot.id.uuidString.prefix(8)) " +
+                "result=scrollbackReplay reason=\(fallbackReason)"
             )
             let replayEnvironment = SessionScrollbackReplayStore.replayEnvironment(
                 for: snapshot.terminal?.scrollback
@@ -7094,10 +7112,21 @@ final class Workspace: Identifiable, ObservableObject {
     nonisolated private static func shouldUseLocalTerminalDaemon(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
+        if let rawDisable = environment["CMUX_DISABLE_LOCAL_DAEMON"] {
+            let normalized = rawDisable.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let truthy: Set<String> = ["1", "true", "yes", "on"]
+            if truthy.contains(normalized) {
+                debugLocalTerminalTrace(
+                    "locald.disabled.env key=CMUX_DISABLE_LOCAL_DAEMON raw=\"\(rawDisable)\""
+                )
+                return false
+            }
+        }
         if environment["CMUX_LOCAL_DAEMON_ALLOW_TESTING"] == "1" {
             return true
         }
         if environment["CMUX_LOCAL_DAEMON_DISABLE"] == "1" {
+            debugLocalTerminalTrace("locald.disabled.env key=CMUX_LOCAL_DAEMON_DISABLE raw=\"1\"")
             return false
         }
         if NSClassFromString("XCTestCase") != nil {
@@ -7531,7 +7560,12 @@ final class Workspace: Identifiable, ObservableObject {
         #endif
         guard shouldUseLocalTerminalDaemon(environment: environment) else {
             #if DEBUG
-            dlog("daemon.restart.workspace guard=shouldUseLocalTerminalDaemon=false disable=\(environment["CMUX_LOCAL_DAEMON_DISABLE"] ?? "nil") allow=\(environment["CMUX_LOCAL_DAEMON_ALLOW_TESTING"] ?? "nil")")
+            dlog(
+                "daemon.restart.workspace guard=shouldUseLocalTerminalDaemon=false " +
+                "disable=\(environment["CMUX_LOCAL_DAEMON_DISABLE"] ?? "nil") " +
+                "rollback=\(environment["CMUX_DISABLE_LOCAL_DAEMON"] ?? "nil") " +
+                "allow=\(environment["CMUX_LOCAL_DAEMON_ALLOW_TESTING"] ?? "nil")"
+            )
             #endif
             throw LocalTerminalDaemonControlError(
                 key: "debug.localTerminalDaemon.error.disabled",

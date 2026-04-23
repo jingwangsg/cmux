@@ -3215,6 +3215,130 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
         throw XCTSkip("Debug-only regression test")
 #endif
     }
+
+    func test_localTerminalDaemon_disabledByEnvFlag() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-disable-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        let baseEnv: [String: String] = [
+            "HOME": NSHomeDirectory(),
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase2-disable-flag",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return true
+        }
+        var commands: [[String]] = []
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            commands.append(arguments)
+            switch arguments.first {
+            case "print":
+                return (status: 1, stdout: Data(), stderr: Data())
+            default:
+                return (status: 0, stdout: Data(), stderr: Data())
+            }
+        }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        let enabledSocketPath = try Workspace.restartLocalTerminalDaemonFromApp(environment: baseEnv)
+        XCTAssertEqual(enabledSocketPath, socketPath)
+        XCTAssertFalse(commands.isEmpty, "baseline must attempt launchctl work when the daemon is enabled")
+
+        commands.removeAll()
+        XCTAssertThrowsError(
+            try Workspace.restartLocalTerminalDaemonFromApp(
+                environment: baseEnv.merging(["CMUX_DISABLE_LOCAL_DAEMON": "1"]) { _, new in new }
+            )
+        )
+        XCTAssertTrue(commands.isEmpty, "disable flag must short-circuit before daemon control work begins")
+    }
+
+    func test_localTerminalDaemon_disableFlag_parsing() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-disable-parse-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        let cases: [(String, Bool)] = [
+            ("1", false),
+            ("true", false),
+            ("TRUE", false),
+            ("yes", false),
+            ("on", false),
+            ("0", true),
+            ("false", true),
+            ("", true),
+        ]
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return true
+        }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        for (value, expectedEnabled) in cases {
+            var commands: [[String]] = []
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+                commands.append(arguments)
+                switch arguments.first {
+                case "print":
+                    return (status: 1, stdout: Data(), stderr: Data())
+                default:
+                    return (status: 0, stdout: Data(), stderr: Data())
+                }
+            }
+            let env = [
+                "HOME": NSHomeDirectory(),
+                "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+                "CMUX_LOCAL_DAEMON_INSTANCE": "phase2-disable-parse-\(value)",
+                "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+                "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+                "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+                "CMUX_DISABLE_LOCAL_DAEMON": value,
+            ]
+            if expectedEnabled {
+                let resolvedSocketPath = try Workspace.restartLocalTerminalDaemonFromApp(environment: env)
+                XCTAssertEqual(resolvedSocketPath, socketPath)
+                XCTAssertFalse(commands.isEmpty, "enabled case \(value) should reach daemon control")
+            } else {
+                XCTAssertThrowsError(
+                    try Workspace.restartLocalTerminalDaemonFromApp(environment: env),
+                    "CMUX_DISABLE_LOCAL_DAEMON=\"\(value)\" should disable the daemon"
+                )
+                XCTAssertTrue(commands.isEmpty, "disabled case \(value) must short-circuit before launchctl work")
+            }
+        }
+    }
 }
 
 
