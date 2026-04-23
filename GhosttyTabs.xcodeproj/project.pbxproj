@@ -147,6 +147,7 @@
 					2BB56A710BB1FC50367E5BCF /* TabManagerSessionSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10D684CFFB8CDEF89CE2D9E1 /* TabManagerSessionSnapshotTests.swift */; };
 					C1A2B3C4D5E6F70800000001 /* CmuxConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A2B3C4D5E6F70800000002 /* CmuxConfigTests.swift */; };
 					A5001660 /* GhosttyVTBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001661 /* GhosttyVTBridgeTests.swift */; };
+					A5203000A1B2C3D4E5F60718 /* LocalDaemonOrphanRecoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5203001A1B2C3D4E5F60718 /* LocalDaemonOrphanRecoveryTests.swift */; };
 					F1000013A1B2C3D4E5F60718 /* libghostty-vt.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A5001021 /* libghostty-vt.a */; };
 		/* End PBXBuildFile section */
 
@@ -360,6 +361,7 @@
 				491751CE2321474474F27DCF /* TerminalControllerSocketSecurityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalControllerSocketSecurityTests.swift; sourceTree = "<group>"; };
 				10D684CFFB8CDEF89CE2D9E1 /* TabManagerSessionSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManagerSessionSnapshotTests.swift; sourceTree = "<group>"; };
 				C1A2B3C4D5E6F70800000002 /* CmuxConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CmuxConfigTests.swift; sourceTree = "<group>"; };
+				A5203001A1B2C3D4E5F60718 /* LocalDaemonOrphanRecoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalDaemonOrphanRecoveryTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -653,6 +655,7 @@
 					10D684CFFB8CDEF89CE2D9E1 /* TabManagerSessionSnapshotTests.swift */,
 					C1A2B3C4D5E6F70800000002 /* CmuxConfigTests.swift */,
 					A5001661 /* GhosttyVTBridgeTests.swift */,
+					A5203001A1B2C3D4E5F60718 /* LocalDaemonOrphanRecoveryTests.swift */,
 					FE002001 /* FileExplorerRootResolverTests.swift */,
 					FE002002 /* FileExplorerStoreTests.swift */,
 				);
@@ -963,6 +966,7 @@
 					2BB56A710BB1FC50367E5BCF /* TabManagerSessionSnapshotTests.swift in Sources */,
 					C1A2B3C4D5E6F70800000001 /* CmuxConfigTests.swift in Sources */,
 					A5001660 /* GhosttyVTBridgeTests.swift in Sources */,
+					A5203000A1B2C3D4E5F60718 /* LocalDaemonOrphanRecoveryTests.swift in Sources */,
 					FE002101 /* FileExplorerRootResolverTests.swift in Sources */,
 					FE002102 /* FileExplorerStoreTests.swift in Sources */,
 				);

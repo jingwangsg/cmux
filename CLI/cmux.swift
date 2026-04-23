@@ -15686,6 +15686,8 @@ private struct LocalTerminalDaemonServerConfiguration {
     let retainedByteLimit: Int
     let coldAttachTailByteLimit: Int
     let sessionLogDirectoryURL: URL
+    let orphanRetentionSeconds: TimeInterval
+    let exitAfterStartupForTesting: Bool
     let checkpointDebounceInterval: TimeInterval
     let exitedSessionGraceInterval: TimeInterval
 }
@@ -15710,6 +15712,10 @@ private final class LocalTerminalDaemonServer {
         stateQueue.sync {
             loadRecoveredSessionsIfNeeded()
         }
+        if configuration.exitAfterStartupForTesting {
+            localTrace("daemon.run exit_after_startup_for_testing=1")
+            return
+        }
         localTrace(
             "daemon.run socket=\(configuration.socketPath) sessionDir=\(configuration.sessionLogDirectoryURL.path) " +
             "retainedLimit=\(configuration.retainedByteLimit) coldTail=\(configuration.coldAttachTailByteLimit)"
@@ -15732,14 +15738,25 @@ private final class LocalTerminalDaemonServer {
     }
 
     private func loadRecoveredSessionsIfNeeded() {
-        guard let urls = try? FileManager.default.contentsOfDirectory(
+        let fileManager = FileManager.default
+        guard let urls = try? fileManager.contentsOfDirectory(
             at: configuration.sessionLogDirectoryURL,
-            includingPropertiesForKeys: nil
+            includingPropertiesForKeys: [.contentModificationDateKey]
         ) else {
             return
         }
 
+        let retention = configuration.orphanRetentionSeconds
+        let cutoff = retention > 0 ? Date().addingTimeInterval(-retention) : nil
+
         for url in urls where url.lastPathComponent.hasSuffix(".manifest.json") {
+            if let cutoff,
+               let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+               mtime < cutoff {
+                pruneOrphanFiles(manifestURL: url)
+                localTrace("daemon.gc.prune manifest=\(url.lastPathComponent) age>\(retention)s")
+                continue
+            }
             guard let data = try? Data(contentsOf: url),
                   let manifest = try? JSONDecoder().decode(LocalTerminalSessionManifest.self, from: data) else {
                 continue
@@ -15752,6 +15769,18 @@ private final class LocalTerminalDaemonServer {
                 "daemon.recover id=\(manifest.sessionID) checkpointSeq=\(manifest.checkpointSeq) " +
                 "retainedStart=\(manifest.retainedStartSeq) nextSeq=\(manifest.nextSeq)"
             )
+        }
+    }
+
+    private func pruneOrphanFiles(manifestURL: URL) {
+        let base = manifestURL
+            .deletingPathExtension()
+            .deletingPathExtension()
+        let suffixes = ["manifest.json", "vtlog", "checkpoint.vt", "checkpoint.json"]
+        let fileManager = FileManager.default
+        for suffix in suffixes {
+            let target = base.appendingPathExtension(suffix)
+            try? fileManager.removeItem(at: target)
         }
     }
 
@@ -16385,6 +16414,9 @@ private struct LocalTerminalDaemonTool {
         var authTokenFilePath: String?
         var retainedByteLimit = 4_194_304
         var coldAttachTailByteLimit = 262_144
+        var sessionLogDirectoryURL: URL?
+        var orphanRetentionSeconds: TimeInterval = 7 * 24 * 3600
+        var exitAfterStartupForTesting = false
 
         var index = 0
         while index < args.count {
@@ -16401,6 +16433,12 @@ private struct LocalTerminalDaemonTool {
                 }
                 authTokenFilePath = args[index + 1]
                 index += 2
+            case "--session-log-dir":
+                guard index + 1 < args.count else {
+                    throw CLIError(message: "--session-log-dir requires a path")
+                }
+                sessionLogDirectoryURL = URL(fileURLWithPath: args[index + 1], isDirectory: true)
+                index += 2
             case "--retained-bytes":
                 guard index + 1 < args.count, let parsed = Int(args[index + 1]), parsed > 0 else {
                     throw CLIError(message: "--retained-bytes requires a positive integer")
@@ -16413,6 +16451,17 @@ private struct LocalTerminalDaemonTool {
                 }
                 coldAttachTailByteLimit = parsed
                 index += 2
+            case "--orphan-retention-days":
+                guard index + 1 < args.count,
+                      let days = Double(args[index + 1]),
+                      days >= 0 else {
+                    throw CLIError(message: "--orphan-retention-days requires a non-negative number")
+                }
+                orphanRetentionSeconds = days * 24 * 3600
+                index += 2
+            case "--exit-after-startup-for-testing":
+                exitAfterStartupForTesting = true
+                index += 1
             case "--help", "-h":
                 print(localDaemonUsageText())
                 throw CLIError(message: "")
@@ -16422,6 +16471,11 @@ private struct LocalTerminalDaemonTool {
         }
 
         let resolvedAuthTokenFilePath = authTokenFilePath ?? Self.defaultAuthTokenFilePath(forSocketPath: socketPath)
+        if let raw = ProcessInfo.processInfo.environment["CMUX_LOCAL_DAEMON_ORPHAN_RETENTION_DAYS"],
+           let days = Double(raw),
+           days >= 0 {
+            orphanRetentionSeconds = days * 24 * 3600
+        }
         let checkpointDebounceMilliseconds = Double(
             ProcessInfo.processInfo.environment["CMUX_LOCAL_DAEMON_CHECKPOINT_DEBOUNCE_MS"] ?? ""
         )
@@ -16435,7 +16489,9 @@ private struct LocalTerminalDaemonTool {
             authToken: try Self.readAuthToken(filePath: resolvedAuthTokenFilePath),
             retainedByteLimit: max(retainedByteLimit, 65_536),
             coldAttachTailByteLimit: max(min(coldAttachTailByteLimit, max(retainedByteLimit, 65_536)), 1),
-            sessionLogDirectoryURL: Self.defaultSessionLogDirectory(forSocketPath: socketPath),
+            sessionLogDirectoryURL: sessionLogDirectoryURL ?? Self.defaultSessionLogDirectory(forSocketPath: socketPath),
+            orphanRetentionSeconds: orphanRetentionSeconds,
+            exitAfterStartupForTesting: exitAfterStartupForTesting,
             checkpointDebounceInterval: checkpointDebounceInterval,
             exitedSessionGraceInterval: exitedSessionGraceInterval
         )
@@ -16564,7 +16620,7 @@ private struct LocalTerminalDaemonTool {
     private func localDaemonUsageText() -> String {
         """
         Usage:
-          cmux local-daemon serve [--socket <path>] [--auth-token-file <path>] [--retained-bytes <n>] [--cold-attach-tail-bytes <n>]
+          cmux local-daemon serve [--socket <path>] [--auth-token-file <path>] [--session-log-dir <path>] [--retained-bytes <n>] [--cold-attach-tail-bytes <n>] [--orphan-retention-days <days>] [--exit-after-startup-for-testing]
           cmux local-daemon rpc [--socket <path>] [--auth-token-file <path>] <method> [json-params]
         """
     }
