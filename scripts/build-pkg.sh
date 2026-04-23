@@ -40,6 +40,7 @@ done
 
 # --- Build GhosttyKit (if needed) ---
 ./scripts/ensure-ghosttykit.sh
+./scripts/ensure-ghosttyvt.sh
 
 # --- Build app (Release) ---
 echo "Building Release app..."

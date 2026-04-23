@@ -471,7 +471,13 @@ extension Workspace {
             terminalSnapshot = SessionTerminalPanelSnapshot(
                 workingDirectory: panelDirectories[panelId],
                 scrollback: resolvedScrollback,
-                localSessionID: terminalPanel.localSessionID
+                localSessionID: terminalPanel.localSessionID,
+                restoreStrategy: terminalPanel.localSessionID == nil ? .scrollbackReplay : .daemonAttach
+            )
+            Self.debugLocalTerminalTrace(
+                "locald.app.snapshot panel=\(panelId.uuidString.prefix(8)) localSession=\(terminalPanel.localSessionID ?? "nil") " +
+                "restoreStrategy=\(terminalSnapshot?.restoreStrategy.rawValue ?? "nil") " +
+                "scrollbackChars=\(resolvedScrollback?.count ?? 0)"
             )
             browserSnapshot = nil
             markdownSnapshot = nil
@@ -643,7 +649,13 @@ extension Workspace {
         switch snapshot.type {
         case .terminal:
             let workingDirectory = snapshot.terminal?.workingDirectory ?? snapshot.directory ?? currentDirectory
-            if let localSessionID = snapshot.terminal?.localSessionID,
+            Self.debugLocalTerminalTrace(
+                "locald.app.restore panel=\(snapshot.id.uuidString.prefix(8)) " +
+                "strategy=\(String(describing: snapshot.terminal?.restoreStrategy)) " +
+                "localSession=\(snapshot.terminal?.localSessionID ?? "nil")"
+            )
+            if snapshot.terminal?.restoreStrategy == .daemonAttach,
+               let localSessionID = snapshot.terminal?.localSessionID,
                let terminalPanel = newTerminalSurface(
                     inPane: paneId,
                     focus: false,
@@ -651,9 +663,15 @@ extension Workspace {
                     startupEnvironment: [:],
                     localTerminalMode: .attachExisting(localSessionID)
                ) {
+                Self.debugLocalTerminalTrace(
+                    "locald.app.restore panel=\(snapshot.id.uuidString.prefix(8)) result=attachExisting session=\(localSessionID)"
+                )
                 applySessionPanelMetadata(snapshot, toPanelId: terminalPanel.id)
                 return terminalPanel.id
             }
+            Self.debugLocalTerminalTrace(
+                "locald.app.restore panel=\(snapshot.id.uuidString.prefix(8)) result=scrollbackReplay"
+            )
             let replayEnvironment = SessionScrollbackReplayStore.replayEnvironment(
                 for: snapshot.terminal?.scrollback
             )
@@ -7197,6 +7215,12 @@ final class Workspace: Identifiable, ObservableObject {
         return nonEmptyTrimmedString(value)
     }
 
+    nonisolated private static func debugLocalTerminalTrace(_ message: @autoclosure () -> String) {
+#if DEBUG
+        dlog(message())
+#endif
+    }
+
     nonisolated static func localTerminalLaunchAgentPropertyListForTesting(
         registration: LocalTerminalDaemonRegistration,
         cliPath: String
@@ -7697,10 +7721,16 @@ final class Workspace: Identifiable, ObservableObject {
         params: [String: Any],
         timeout: TimeInterval
     ) -> [String: Any]? {
+        debugLocalTerminalTrace(
+            "locald.app.rpc.send method=\(method) socket=\(registration.socketPath) " +
+            "session=\((params["session_id"] as? String) ?? "nil")"
+        )
         guard isSafeLocalDaemonSocketPath(registration.socketPath) else {
+            debugLocalTerminalTrace("locald.app.rpc.fail method=\(method) reason=unsafe_socket")
             return nil
         }
         guard let authToken = readLocalTerminalDaemonAuthToken(registration.authTokenFilePath) else {
+            debugLocalTerminalTrace("locald.app.rpc.fail method=\(method) reason=missing_auth")
             return nil
         }
 
@@ -7758,7 +7788,10 @@ final class Workspace: Identifiable, ObservableObject {
                 Darwin.connect(socketFD, sockaddrPointer, addressLength)
             }
         }
-        guard connected == 0 else { return nil }
+        guard connected == 0 else {
+            debugLocalTerminalTrace("locald.app.rpc.fail method=\(method) reason=connect")
+            return nil
+        }
 
         let request: [String: Any] = [
             "id": UUID().uuidString,
@@ -7767,6 +7800,7 @@ final class Workspace: Identifiable, ObservableObject {
             "auth_token": authToken,
         ]
         guard let payload = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]) else {
+            debugLocalTerminalTrace("locald.app.rpc.fail method=\(method) reason=encode")
             return nil
         }
 
@@ -7786,7 +7820,10 @@ final class Workspace: Identifiable, ObservableObject {
             }
             return true
         }
-        guard wrote else { return nil }
+        guard wrote else {
+            debugLocalTerminalTrace("locald.app.rpc.fail method=\(method) reason=write")
+            return nil
+        }
 
         var bufferedData = Data()
         while true {
@@ -7794,8 +7831,12 @@ final class Workspace: Identifiable, ObservableObject {
                 let line = bufferedData.subdata(in: bufferedData.startIndex..<newlineRange.lowerBound)
                 guard let response = try? JSONSerialization.jsonObject(with: line, options: []) as? [String: Any],
                       let ok = response["ok"] as? Bool, ok else {
+                    debugLocalTerminalTrace("locald.app.rpc.fail method=\(method) reason=response")
                     return nil
                 }
+                debugLocalTerminalTrace(
+                    "locald.app.rpc.recv method=\(method) ok=1 session=\((params["session_id"] as? String) ?? "nil")"
+                )
                 return response["result"] as? [String: Any]
             }
 
@@ -7804,7 +7845,10 @@ final class Workspace: Identifiable, ObservableObject {
                 guard let baseAddress = rawBuffer.baseAddress else { return -1 }
                 return Darwin.read(socketFD, baseAddress, rawBuffer.count)
             }
-            guard bytesRead > 0 else { return nil }
+            guard bytesRead > 0 else {
+                debugLocalTerminalTrace("locald.app.rpc.fail method=\(method) reason=closed")
+                return nil
+            }
             buffer.withUnsafeBufferPointer { pointer in
                 guard let baseAddress = pointer.baseAddress else { return }
                 bufferedData.append(baseAddress, count: bytesRead)
@@ -7856,10 +7900,12 @@ final class Workspace: Identifiable, ObservableObject {
         }
 
         guard shouldUseLocalTerminalDaemon(environment: environment) else {
+            debugLocalTerminalTrace("locald.app.resolve mode=\(request.mode) result=disabled")
             return nil
         }
 
         guard let cliPath = bundledCLIPath() else {
+            debugLocalTerminalTrace("locald.app.resolve mode=\(request.mode) result=missing_cli")
             return nil
         }
         let registration = localTerminalDaemonRegistrationForTesting(environment: environment)
@@ -7880,6 +7926,10 @@ final class Workspace: Identifiable, ObservableObject {
         switch request.mode {
         case .create:
             guard canConnectToLocalDaemonSocket(registration.socketPath) else {
+                debugLocalTerminalTrace(
+                    "locald.app.resolve mode=create panel=\(request.panelID.uuidString.prefix(8)) " +
+                    "result=daemon_unavailable socket=\(registration.socketPath)"
+                )
                 startLocalTerminalDaemonInBackgroundIfNeeded(environment: environment)
                 return nil
             }
@@ -7904,8 +7954,15 @@ final class Workspace: Identifiable, ObservableObject {
                 params: params
             ),
             let resolvedSessionID = openResult["session_id"] as? String else {
+                debugLocalTerminalTrace(
+                    "locald.app.resolve mode=create panel=\(request.panelID.uuidString.prefix(8)) result=open_failed"
+                )
                 return nil
             }
+            debugLocalTerminalTrace(
+                "locald.app.resolve mode=create panel=\(request.panelID.uuidString.prefix(8)) " +
+                "session=\(resolvedSessionID) checkpointSeq=\(String(describing: openResult["checkpoint_seq"]))"
+            )
             return LocalTerminalLaunchConfiguration(
                 sessionID: resolvedSessionID,
                 initialCommand: localAttachCommand(
@@ -7920,6 +7977,9 @@ final class Workspace: Identifiable, ObservableObject {
 
         case .attachExisting(let sessionID):
             guard canConnectToLocalDaemonSocket(registration.socketPath) else {
+                debugLocalTerminalTrace(
+                    "locald.app.resolve mode=attach session=\(sessionID) result=daemon_unavailable_best_effort"
+                )
                 startLocalTerminalDaemonInBackgroundIfNeeded(environment: environment)
                 return bestEffortAttachConfiguration(sessionID)
             }
@@ -7928,12 +7988,19 @@ final class Workspace: Identifiable, ObservableObject {
                     method: "session.status",
                     params: ["session_id": sessionID]
                   ) else {
+                debugLocalTerminalTrace(
+                    "locald.app.resolve mode=attach session=\(sessionID) result=status_failed_best_effort"
+                )
                 return bestEffortAttachConfiguration(sessionID)
             }
             guard let state = statusResult["state"] as? String,
                   state == "running" else {
+                debugLocalTerminalTrace(
+                    "locald.app.resolve mode=attach session=\(sessionID) result=reject state=\(String(describing: statusResult["state"]))"
+                )
                 return nil
             }
+            debugLocalTerminalTrace("locald.app.resolve mode=attach session=\(sessionID) result=attach")
             return bestEffortAttachConfiguration(sessionID)
         }
     }
@@ -8193,8 +8260,16 @@ final class Workspace: Identifiable, ObservableObject {
         }
 
         if case .attachExisting = localTerminalMode, launchConfiguration == nil {
+            Self.debugLocalTerminalTrace(
+                "locald.app.panel.create panel=\(panelID.uuidString.prefix(8)) mode=\(localTerminalMode) result=nil"
+            )
             return nil
         }
+
+        Self.debugLocalTerminalTrace(
+            "locald.app.panel.create panel=\(panelID.uuidString.prefix(8)) mode=\(localTerminalMode) " +
+            "launchSession=\(launchConfiguration?.sessionID ?? "nil") warmup=\(shouldShowLocalDaemonWarmupStatus ? 1 : 0)"
+        )
 
         return TerminalPanel(
             id: panelID,

@@ -17,6 +17,166 @@ struct CLIError: Error, CustomStringConvertible {
     var description: String { message }
 }
 
+private struct LocalTerminalCheckpointMetadata: Equatable {
+    let sequence: UInt64
+    let activeScreen: String
+    let cols: Int
+    let rows: Int
+    let totalRows: Int
+    let scrollbackRows: Int
+    let cursorVisible: Bool
+}
+
+private struct LocalTerminalCheckpointSnapshot {
+    let metadata: LocalTerminalCheckpointMetadata
+    let vtData: Data
+}
+
+private final class LocalTerminalCheckpointBuilder {
+    private let handle: UnsafeMutableRawPointer
+
+    init(cols: Int, rows: Int, maxScrollbackRows: Int = 20_000) throws {
+        let sanitizedCols = UInt16(max(1, min(cols, Int(UInt16.max))))
+        let sanitizedRows = UInt16(max(1, min(rows, Int(UInt16.max))))
+        guard let handle = cmux_ghostty_vt_builder_create(
+            sanitizedCols,
+            sanitizedRows,
+            maxScrollbackRows
+        ) else {
+            throw CLIError(message: "Failed to create ghostty-vt checkpoint builder")
+        }
+        self.handle = handle
+    }
+
+    deinit {
+        cmux_ghostty_vt_builder_destroy(handle)
+    }
+
+    func resize(cols: Int, rows: Int) throws {
+        let sanitizedCols = UInt16(max(1, min(cols, Int(UInt16.max))))
+        let sanitizedRows = UInt16(max(1, min(rows, Int(UInt16.max))))
+        guard cmux_ghostty_vt_builder_resize(handle, sanitizedCols, sanitizedRows) else {
+            throw CLIError(message: "Failed to resize ghostty-vt checkpoint builder")
+        }
+    }
+
+    func ingest(_ data: Data) {
+        guard data.isEmpty == false else { return }
+        data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            cmux_ghostty_vt_builder_ingest(handle, baseAddress, rawBuffer.count)
+        }
+    }
+
+    func capture(sequence: UInt64) throws -> LocalTerminalCheckpointSnapshot {
+        var metadata = CMUXGhosttyVTCheckpointMetadata()
+        var bytes: UnsafeMutablePointer<UInt8>?
+        var length: Int = 0
+
+        guard cmux_ghostty_vt_builder_capture(handle, &metadata, &bytes, &length),
+              let bytes else {
+            throw CLIError(message: "Failed to capture ghostty-vt checkpoint")
+        }
+        defer {
+            cmux_ghostty_vt_bytes_free(bytes, length)
+        }
+
+        let activeScreen = metadata.active_screen == 1
+            ? "alternate"
+            : "primary"
+
+        return LocalTerminalCheckpointSnapshot(
+            metadata: LocalTerminalCheckpointMetadata(
+                sequence: sequence,
+                activeScreen: activeScreen,
+                cols: Int(metadata.cols),
+                rows: Int(metadata.rows),
+                totalRows: Int(metadata.total_rows),
+                scrollbackRows: Int(metadata.scrollback_rows),
+                cursorVisible: metadata.cursor_visible
+            ),
+            vtData: Data(bytes: bytes, count: length)
+        )
+    }
+
+    static func captureForTesting(
+        vtBytes: Data,
+        cols: Int,
+        rows: Int,
+        sequence: UInt64
+    ) throws -> LocalTerminalCheckpointSnapshot {
+        let builder = try LocalTerminalCheckpointBuilder(cols: cols, rows: rows)
+        builder.ingest(vtBytes)
+        return try builder.capture(sequence: sequence)
+    }
+}
+
+private func runDebugVTCapture(commandArgs: [String]) throws {
+    var inputBase64: String?
+    var cols = 80
+    var rows = 24
+    var sequence: UInt64 = 0
+
+    var index = 0
+    while index < commandArgs.count {
+        switch commandArgs[index] {
+        case "--input-base64":
+            guard index + 1 < commandArgs.count else {
+                throw CLIError(message: "--input-base64 requires a value")
+            }
+            inputBase64 = commandArgs[index + 1]
+            index += 2
+        case "--cols":
+            guard index + 1 < commandArgs.count, let parsed = Int(commandArgs[index + 1]) else {
+                throw CLIError(message: "--cols requires an integer")
+            }
+            cols = parsed
+            index += 2
+        case "--rows":
+            guard index + 1 < commandArgs.count, let parsed = Int(commandArgs[index + 1]) else {
+                throw CLIError(message: "--rows requires an integer")
+            }
+            rows = parsed
+            index += 2
+        case "--sequence":
+            guard index + 1 < commandArgs.count, let parsed = UInt64(commandArgs[index + 1]) else {
+                throw CLIError(message: "--sequence requires an integer")
+            }
+            sequence = parsed
+            index += 2
+        default:
+            throw CLIError(message: "Unknown debug-vt-capture option '\(commandArgs[index])'")
+        }
+    }
+
+    guard let inputBase64,
+          let vtBytes = Data(base64Encoded: inputBase64) else {
+        throw CLIError(message: "debug-vt-capture requires valid --input-base64 data")
+    }
+
+    let snapshot = try LocalTerminalCheckpointBuilder.captureForTesting(
+        vtBytes: vtBytes,
+        cols: cols,
+        rows: rows,
+        sequence: sequence
+    )
+
+    let payload: [String: Any] = [
+        "sequence": snapshot.metadata.sequence,
+        "active_screen": snapshot.metadata.activeScreen,
+        "cols": snapshot.metadata.cols,
+        "rows": snapshot.metadata.rows,
+        "total_rows": snapshot.metadata.totalRows,
+        "scrollback_rows": snapshot.metadata.scrollbackRows,
+        "cursor_visible": snapshot.metadata.cursorVisible,
+        "vt_base64": snapshot.vtData.base64EncodedString(),
+        "vt_text": String(decoding: snapshot.vtData, as: UTF8.self),
+    ]
+    let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+}
+
 private final class CLISocketSentryTelemetry {
     private let command: String
     private let subcommand: String
@@ -1715,6 +1875,19 @@ struct CMUXCLI {
 
         if command == "remote-daemon-status" {
             try runRemoteDaemonStatus(commandArgs: commandArgs, jsonOutput: jsonOutput)
+            return
+        }
+
+        if command == "debug-vt-capture" {
+            try runDebugVTCapture(commandArgs: commandArgs)
+            return
+        }
+
+        if command == "debug-vt-link-probe" {
+            guard cmux_ghostty_vt_can_create_terminal() else {
+                throw CLIError(message: "ghostty-vt probe failed")
+            }
+            print("OK")
             return
         }
 
@@ -14578,6 +14751,94 @@ private struct LocalTerminalForegroundProcessMetadata {
     let title: String
 }
 
+private struct LocalTerminalSessionManifest: Codable {
+    let sessionID: String
+    let processID: Int32
+    let ttyName: String?
+    let requestedCommand: String?
+    let requestedWorkingDirectory: String?
+    let createdAt: String
+    let checkpointSeq: UInt64
+    let retainedStartSeq: UInt64
+    let nextSeq: UInt64
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case processID = "process_id"
+        case ttyName = "tty_name"
+        case requestedCommand = "requested_command"
+        case requestedWorkingDirectory = "requested_working_directory"
+        case createdAt = "created_at"
+        case checkpointSeq = "checkpoint_seq"
+        case retainedStartSeq = "retained_start_seq"
+        case nextSeq = "next_seq"
+    }
+}
+
+private struct LocalTerminalRecoveredSession {
+    let manifest: LocalTerminalSessionManifest
+    let manifestFileURL: URL
+
+    func statusPayload() -> [String: Any] {
+        [
+            "session_id": manifest.sessionID,
+            "state": "orphaned",
+            "recoverable": false,
+            "tty_name": manifest.ttyName ?? NSNull(),
+            "requested_command": manifest.requestedCommand ?? NSNull(),
+            "working_directory": manifest.requestedWorkingDirectory ?? NSNull(),
+            "checkpoint_seq": NSNumber(value: manifest.checkpointSeq),
+            "retained_start_seq": NSNumber(value: manifest.retainedStartSeq),
+            "next_seq": NSNumber(value: manifest.nextSeq),
+            "attachments": [],
+            "created_at": manifest.createdAt,
+            "eof": true,
+        ]
+    }
+}
+
+#if DEBUG
+private enum LocalTerminalTraceLog {
+    private static let formatter = ISO8601DateFormatter()
+
+    private static func logPath() -> String? {
+        if let explicit = ProcessInfo.processInfo.environment["CMUX_DEBUG_LOG"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicit.isEmpty {
+            return explicit
+        }
+        guard let marker = try? String(contentsOfFile: "/tmp/cmux-last-debug-log-path", encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = marker.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func write(_ message: @autoclosure () -> String) {
+        guard let path = logPath() else { return }
+        let line = "\(formatter.string(from: Date())) [cmux-local] pid=\(getpid()) \(message())\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        guard let handle = FileHandle(forWritingAtPath: path) else { return }
+        defer { try? handle.close() }
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            return
+        }
+    }
+}
+
+private func localTrace(_ message: @autoclosure () -> String) {
+    LocalTerminalTraceLog.write(message())
+}
+#else
+private func localTrace(_: @autoclosure () -> String) {}
+#endif
+
 private final class LocalTerminalSession {
     private static let runtimeMetadataRefreshInterval: TimeInterval = 1.0
     private static let runtimeMetadataFailureBackoff: TimeInterval = 0.25
@@ -14597,6 +14858,10 @@ private final class LocalTerminalSession {
     let retainedLogFileURL: URL
     let retainedByteLimit: Int
     let coldAttachTailByteLimit: Int
+    let checkpointVTFileURL: URL
+    let checkpointMetadataFileURL: URL
+    let manifestFileURL: URL
+    let checkpointDebounceInterval: TimeInterval
 
     var attachments: [String: LocalTerminalAttachment]
     var retainedLogHandle: FileHandle
@@ -14616,6 +14881,11 @@ private final class LocalTerminalSession {
     private var lastRuntimeMetadataRefreshAt: Date?
     private var lastRuntimeMetadataAttemptAt: Date?
     private var runtimeMetadataRefreshInFlight: Bool
+    private let checkpointBuilder: LocalTerminalCheckpointBuilder
+    private var checkpointMetadata: LocalTerminalCheckpointMetadata?
+    private var checkpointCapturedAt: Date?
+    private var lastCheckpointAt: Date?
+    private(set) var lastStateChangeAt: Date
 
     init(
         sessionID: String,
@@ -14630,6 +14900,7 @@ private final class LocalTerminalSession {
         retainedLogFileURL: URL,
         retainedByteLimit: Int,
         coldAttachTailByteLimit: Int,
+        checkpointDebounceInterval: TimeInterval,
         initialCols: Int,
         initialRows: Int
     ) throws {
@@ -14638,13 +14909,29 @@ private final class LocalTerminalSession {
             at: retainedLogFileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        let checkpointVTFileURL = retainedLogFileURL.deletingPathExtension().appendingPathExtension("checkpoint.vt")
+        let checkpointMetadataFileURL = retainedLogFileURL.deletingPathExtension().appendingPathExtension("checkpoint.json")
+        let manifestFileURL = retainedLogFileURL.deletingPathExtension().appendingPathExtension("manifest.json")
         if fileManager.fileExists(atPath: retainedLogFileURL.path) {
             try fileManager.removeItem(at: retainedLogFileURL)
+        }
+        if fileManager.fileExists(atPath: checkpointVTFileURL.path) {
+            try fileManager.removeItem(at: checkpointVTFileURL)
+        }
+        if fileManager.fileExists(atPath: checkpointMetadataFileURL.path) {
+            try fileManager.removeItem(at: checkpointMetadataFileURL)
+        }
+        if fileManager.fileExists(atPath: manifestFileURL.path) {
+            try fileManager.removeItem(at: manifestFileURL)
         }
         guard fileManager.createFile(atPath: retainedLogFileURL.path, contents: Data()) else {
             throw CLIError(message: "Failed to create retained VT log at \(retainedLogFileURL.path)")
         }
         let retainedLogHandle = try FileHandle(forUpdating: retainedLogFileURL)
+        let checkpointBuilder = try LocalTerminalCheckpointBuilder(
+            cols: initialCols,
+            rows: initialRows
+        )
 
         self.sessionID = sessionID
         self.processID = processID
@@ -14659,6 +14946,10 @@ private final class LocalTerminalSession {
         self.retainedLogFileURL = retainedLogFileURL
         self.retainedByteLimit = max(retainedByteLimit, 65_536)
         self.coldAttachTailByteLimit = max(min(coldAttachTailByteLimit, max(retainedByteLimit, 65_536)), 1)
+        self.checkpointVTFileURL = checkpointVTFileURL
+        self.checkpointMetadataFileURL = checkpointMetadataFileURL
+        self.manifestFileURL = manifestFileURL
+        self.checkpointDebounceInterval = max(0, checkpointDebounceInterval)
         self.attachments = [:]
         self.retainedLogHandle = retainedLogHandle
         self.retainedStartSeq = 0
@@ -14676,6 +14967,17 @@ private final class LocalTerminalSession {
         self.lastRuntimeMetadataRefreshAt = nil
         self.lastRuntimeMetadataAttemptAt = nil
         self.runtimeMetadataRefreshInFlight = false
+        self.checkpointBuilder = checkpointBuilder
+        self.checkpointMetadata = nil
+        self.checkpointCapturedAt = nil
+        self.lastCheckpointAt = nil
+        self.lastStateChangeAt = self.createdAt
+        try persistManifest()
+        localTrace(
+            "session.init id=\(sessionID) pid=\(processID) tty=\(ttyName ?? "nil") " +
+            "cwd=\(requestedWorkingDirectory ?? "nil") cmd=\(requestedCommand ?? "nil") " +
+            "cols=\(initialCols) rows=\(initialRows)"
+        )
     }
 
     deinit {
@@ -14685,15 +14987,94 @@ private final class LocalTerminalSession {
 
     func appendOutput(_ data: Data) {
         guard !data.isEmpty else { return }
+        checkpointBuilder.ingest(data)
         nextSeq += UInt64(data.count)
         do {
             try retainedLogHandle.seekToEnd()
             try retainedLogHandle.write(contentsOf: data)
             retainedByteCount += data.count
             try trimRetainedLogIfNeeded()
+            try persistCheckpointIfNeeded()
+            try persistManifest()
+            localTrace(
+                "session.output id=\(sessionID) bytes=\(data.count) nextSeq=\(nextSeq) " +
+                "retainedStart=\(retainedStartSeq) buffered=\(retainedByteCount)"
+            )
         } catch {
             // Keep the daemon alive even if persistence fails; callers can still hot-attach.
+            localTrace("session.output.error id=\(sessionID) error=\(error)")
         }
+    }
+
+    private func persistCheckpointIfNeeded(force: Bool = false) throws {
+        let now = Date()
+        if !force,
+           let lastCheckpointAt,
+           now.timeIntervalSince(lastCheckpointAt) < checkpointDebounceInterval {
+            return
+        }
+
+        let snapshot = try checkpointBuilder.capture(sequence: nextSeq)
+        let capturedAt = now
+        try snapshot.vtData.write(to: checkpointVTFileURL, options: .atomic)
+        let metadataPayload: [String: Any] = [
+            "sequence": snapshot.metadata.sequence,
+            "active_screen": snapshot.metadata.activeScreen,
+            "cols": snapshot.metadata.cols,
+            "rows": snapshot.metadata.rows,
+            "total_rows": snapshot.metadata.totalRows,
+            "scrollback_rows": snapshot.metadata.scrollbackRows,
+            "cursor_visible": snapshot.metadata.cursorVisible,
+            "captured_at": ISO8601DateFormatter().string(from: capturedAt),
+        ]
+        let metadataData = try JSONSerialization.data(withJSONObject: metadataPayload, options: [.sortedKeys])
+        try metadataData.write(to: checkpointMetadataFileURL, options: .atomic)
+        checkpointMetadata = snapshot.metadata
+        checkpointCapturedAt = capturedAt
+        lastCheckpointAt = capturedAt
+        try compactRetainedLog(beforeSequence: snapshot.metadata.sequence)
+        localTrace(
+            "checkpoint.persist id=\(sessionID) seq=\(snapshot.metadata.sequence) " +
+            "screen=\(snapshot.metadata.activeScreen) cols=\(snapshot.metadata.cols) rows=\(snapshot.metadata.rows)"
+        )
+    }
+
+    private func compactRetainedLog(beforeSequence checkpointSequence: UInt64) throws {
+        guard checkpointSequence > retainedStartSeq else { return }
+        let keepOffset = Int(checkpointSequence - retainedStartSeq)
+        let clampedKeepOffset = max(0, min(keepOffset, retainedByteCount))
+        let remaining = max(0, retainedByteCount - clampedKeepOffset)
+        let tail = readRetainedData(offset: clampedKeepOffset, count: remaining)
+        try tail.write(to: retainedLogFileURL, options: .atomic)
+        try? retainedLogHandle.close()
+        retainedLogHandle = try FileHandle(forUpdating: retainedLogFileURL)
+        try retainedLogHandle.seekToEnd()
+        retainedStartSeq = checkpointSequence
+        retainedByteCount = tail.count
+        localTrace(
+            "checkpoint.compact id=\(sessionID) checkpointSeq=\(checkpointSequence) " +
+            "retainedStart=\(retainedStartSeq) buffered=\(retainedByteCount)"
+        )
+    }
+
+    private func persistManifest() throws {
+        let manifest = LocalTerminalSessionManifest(
+            sessionID: sessionID,
+            processID: processID,
+            ttyName: ttyName,
+            requestedCommand: requestedCommand,
+            requestedWorkingDirectory: requestedWorkingDirectory,
+            createdAt: ISO8601DateFormatter().string(from: createdAt),
+            checkpointSeq: checkpointMetadata?.sequence ?? retainedStartSeq,
+            retainedStartSeq: retainedStartSeq,
+            nextSeq: nextSeq
+        )
+        let data = try JSONEncoder().encode(manifest)
+        try data.write(to: manifestFileURL, options: .atomic)
+        localTrace(
+            "manifest.persist id=\(sessionID) checkpointSeq=\(manifest.checkpointSeq) " +
+            "retainedStart=\(manifest.retainedStartSeq) nextSeq=\(manifest.nextSeq)"
+        )
     }
 
     private func trimRetainedLogIfNeeded() throws {
@@ -14755,6 +15136,8 @@ private final class LocalTerminalSession {
     }
 
     func recomputeEffectiveSize() {
+        let previousCols = effectiveCols
+        let previousRows = effectiveRows
         if attachments.isEmpty {
             effectiveCols = lastKnownCols
             effectiveRows = lastKnownRows
@@ -14767,6 +15150,9 @@ private final class LocalTerminalSession {
             lastKnownRows = rows
         }
         Self.applyTerminalSize(fileDescriptor: masterFD, cols: effectiveCols, rows: effectiveRows)
+        if effectiveCols != previousCols || effectiveRows != previousRows {
+            try? checkpointBuilder.resize(cols: effectiveCols, rows: effectiveRows)
+        }
     }
 
     func read(afterSeq: UInt64, limitBytes: Int) -> (data: Data, startSeq: UInt64?, endSeq: UInt64, truncated: Bool) {
@@ -14797,10 +15183,57 @@ private final class LocalTerminalSession {
     }
 
     func coldAttachReplayStartSeq() -> UInt64 {
+        if checkpointMetadata != nil,
+           FileManager.default.fileExists(atPath: checkpointVTFileURL.path) {
+            return 0
+        }
         guard nextSeq > UInt64(coldAttachTailByteLimit) else {
             return retainedStartSeq
         }
         return max(retainedStartSeq, nextSeq - UInt64(coldAttachTailByteLimit))
+    }
+
+    func readForAttach(afterSeq: UInt64, limitBytes: Int) -> (data: Data, startSeq: UInt64?, endSeq: UInt64, truncated: Bool) {
+        if afterSeq == 0,
+           let checkpointMetadata,
+           let checkpointData = try? Data(contentsOf: checkpointVTFileURL) {
+            let deltaLimit = max(0, limitBytes - checkpointData.count)
+            let delta = read(afterSeq: checkpointMetadata.sequence, limitBytes: deltaLimit)
+            var combined = checkpointData
+            combined.append(delta.data)
+            localTrace(
+                "attach.replay id=\(sessionID) mode=checkpoint afterSeq=\(afterSeq) " +
+                "checkpointSeq=\(checkpointMetadata.sequence) checkpointBytes=\(checkpointData.count) " +
+                "deltaBytes=\(delta.data.count) endSeq=\(delta.endSeq) eof=\(eofObserved ? 1 : 0)"
+            )
+            return (
+                combined,
+                delta.startSeq ?? checkpointMetadata.sequence,
+                delta.endSeq,
+                delta.truncated
+            )
+        }
+        let delta = read(afterSeq: afterSeq, limitBytes: limitBytes)
+        if !delta.data.isEmpty || delta.truncated || (eofObserved && delta.endSeq >= nextSeq) {
+            localTrace(
+                "attach.replay id=\(sessionID) mode=delta afterSeq=\(afterSeq) limit=\(limitBytes) " +
+                "bytes=\(delta.data.count) endSeq=\(delta.endSeq) retainedStart=\(retainedStartSeq) nextSeq=\(nextSeq)"
+            )
+        }
+        return delta
+    }
+
+    func markExited(_ terminationStatus: Int32?) {
+        state = "exited"
+        self.terminationStatus = terminationStatus
+        eofObserved = true
+        lastStateChangeAt = Date()
+        try? persistCheckpointIfNeeded(force: true)
+        try? persistManifest()
+        localTrace(
+            "session.exit id=\(sessionID) status=\(terminationStatus.map(String.init) ?? "nil") " +
+            "nextSeq=\(nextSeq) retainedStart=\(retainedStartSeq)"
+        )
     }
 
     private func bootstrapRuntimeMetadataPayload() -> [String: Any] {
@@ -14925,6 +15358,9 @@ private final class LocalTerminalSession {
             "buffered_bytes": retainedByteCount,
             "retained_start_seq": retainedStartSeq,
             "cold_attach_replay_start_seq": coldAttachReplayStartSeq(),
+            "checkpoint_seq": checkpointMetadata.map { NSNumber(value: $0.sequence) } ?? NSNull(),
+            "checkpoint_active_screen": checkpointMetadata?.activeScreen ?? NSNull(),
+            "checkpoint_created_at": checkpointCapturedAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
             "attachments": attachmentsPayload,
             "created_at": ISO8601DateFormatter().string(from: createdAt),
             "termination_status": terminationStatus.map { NSNumber(value: $0) } ?? NSNull(),
@@ -14939,8 +15375,10 @@ private final class LocalTerminalSession {
         }
         masterHandle.closeFile()
         try? retainedLogHandle.close()
+        try? FileManager.default.removeItem(at: manifestFileURL)
         state = "closed"
         eofObserved = true
+        localTrace("session.close id=\(sessionID)")
     }
 
     static func normalizedTTYName(_ raw: String?) -> String? {
@@ -15243,6 +15681,8 @@ private struct LocalTerminalDaemonServerConfiguration {
     let retainedByteLimit: Int
     let coldAttachTailByteLimit: Int
     let sessionLogDirectoryURL: URL
+    let checkpointDebounceInterval: TimeInterval
+    let exitedSessionGraceInterval: TimeInterval
 }
 
 private final class LocalTerminalDaemonServer {
@@ -15253,6 +15693,7 @@ private final class LocalTerminalDaemonServer {
     private var listenerFD: Int32 = -1
     private var connections: [ObjectIdentifier: LocalTerminalDaemonConnection] = [:]
     private var sessions: [String: LocalTerminalSession] = [:]
+    private var recoveredSessions: [String: LocalTerminalRecoveredSession] = [:]
     private var nextSessionID: UInt64 = 1
 
     init(configuration: LocalTerminalDaemonServerConfiguration) {
@@ -15261,6 +15702,13 @@ private final class LocalTerminalDaemonServer {
 
     func run() throws {
         try prepareListener()
+        stateQueue.sync {
+            loadRecoveredSessionsIfNeeded()
+        }
+        localTrace(
+            "daemon.run socket=\(configuration.socketPath) sessionDir=\(configuration.sessionLogDirectoryURL.path) " +
+            "retainedLimit=\(configuration.retainedByteLimit) coldTail=\(configuration.coldAttachTailByteLimit)"
+        )
         while true {
             let clientFD = Darwin.accept(listenerFD, nil, nil)
             if clientFD >= 0 {
@@ -15275,6 +15723,30 @@ private final class LocalTerminalDaemonServer {
                 continue
             }
             throw CLIError(message: "Local daemon accept failed: \(String(cString: strerror(errno)))")
+        }
+    }
+
+    private func loadRecoveredSessionsIfNeeded() {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: configuration.sessionLogDirectoryURL,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+
+        for url in urls where url.lastPathComponent.hasSuffix(".manifest.json") {
+            guard let data = try? Data(contentsOf: url),
+                  let manifest = try? JSONDecoder().decode(LocalTerminalSessionManifest.self, from: data) else {
+                continue
+            }
+            recoveredSessions[manifest.sessionID] = LocalTerminalRecoveredSession(
+                manifest: manifest,
+                manifestFileURL: url
+            )
+            localTrace(
+                "daemon.recover id=\(manifest.sessionID) checkpointSeq=\(manifest.checkpointSeq) " +
+                "retainedStart=\(manifest.retainedStartSeq) nextSeq=\(manifest.nextSeq)"
+            )
         }
     }
 
@@ -15374,6 +15846,17 @@ private final class LocalTerminalDaemonServer {
     }
 
     private func handleRequestLocked(method: String, params: [String: Any]) throws -> [String: Any] {
+        let now = Date()
+        sweepExpiredSessions(now: now)
+        let sessionToken = ((params["session_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap {
+            $0.isEmpty ? nil : $0
+        } ?? "nil"
+        let attachmentToken = ((params["attachment_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap {
+            $0.isEmpty ? nil : $0
+        } ?? "nil"
+        if method != "session.read" {
+            localTrace("daemon.rpc method=\(method) session=\(sessionToken) attachment=\(attachmentToken)")
+        }
         switch method {
         case "hello":
             return [
@@ -15387,25 +15870,33 @@ private final class LocalTerminalDaemonServer {
                 ]
             ]
         case "session.list":
-            let now = Date()
             return [
-                "sessions": sessions.keys.sorted().map { sessionID in
-                    let session = sessions[sessionID]!
-                    session.pruneStaleAttachments(now: now, staleAfter: Self.staleAttachmentInterval)
-                    session.recomputeEffectiveSize()
-                    return session.statusPayload(now: now)
-                }
+                "sessions":
+                    sessions.keys.sorted().map { sessionID in
+                        let session = sessions[sessionID]!
+                        session.pruneStaleAttachments(now: now, staleAfter: Self.staleAttachmentInterval)
+                        session.recomputeEffectiveSize()
+                        return session.statusPayload(now: now)
+                    } + recoveredSessions.keys.sorted().compactMap { recoveredSessions[$0]?.statusPayload() }
             ]
         case "session.open":
             return try openSession(params: params)
         case "session.status":
-            return try withSession(params: params) { session in
-                let now = Date()
+            let sessionID = try Self.requireString(params, key: "session_id")
+            if let session = sessions[sessionID] {
                 session.pruneStaleAttachments(now: now, staleAfter: Self.staleAttachmentInterval)
                 session.recomputeEffectiveSize()
                 return session.statusPayload(now: now)
             }
+            if let recovered = recoveredSessions[sessionID] {
+                return recovered.statusPayload()
+            }
+            throw CLIError(message: "Unknown session \(sessionID)")
         case "session.attach":
+            let sessionID = try Self.requireString(params, key: "session_id")
+            if recoveredSessions[sessionID] != nil {
+                throw CLIError(message: "Session \(sessionID) is orphaned after daemon restart")
+            }
             return try withSession(params: params) { session in
                 let attachmentID = try Self.requireString(params, key: "attachment_id")
                 let cols = Self.requireInt(params, key: "cols")
@@ -15415,6 +15906,10 @@ private final class LocalTerminalDaemonServer {
                 return session.statusPayload(now: now)
             }
         case "session.detach":
+            let sessionID = try Self.requireString(params, key: "session_id")
+            if recoveredSessions[sessionID] != nil {
+                throw CLIError(message: "Session \(sessionID) is orphaned after daemon restart")
+            }
             return try withSession(params: params) { session in
                 let attachmentID = try Self.requireString(params, key: "attachment_id")
                 let now = Date()
@@ -15422,6 +15917,10 @@ private final class LocalTerminalDaemonServer {
                 return session.statusPayload(now: now)
             }
         case "session.resize":
+            let sessionID = try Self.requireString(params, key: "session_id")
+            if recoveredSessions[sessionID] != nil {
+                throw CLIError(message: "Session \(sessionID) is orphaned after daemon restart")
+            }
             return try withSession(params: params) { session in
                 let attachmentID = try Self.requireString(params, key: "attachment_id")
                 let cols = Self.requireInt(params, key: "cols")
@@ -15431,6 +15930,10 @@ private final class LocalTerminalDaemonServer {
                 return session.statusPayload(now: now)
             }
         case "session.write":
+            let sessionID = try Self.requireString(params, key: "session_id")
+            if recoveredSessions[sessionID] != nil {
+                throw CLIError(message: "Session \(sessionID) is orphaned after daemon restart")
+            }
             return try withSession(params: params) { session in
                 let attachmentID = (params["attachment_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
                 if let attachmentID, !attachmentID.isEmpty {
@@ -15447,6 +15950,10 @@ private final class LocalTerminalDaemonServer {
                 ]
             }
         case "session.read":
+            let sessionID = try Self.requireString(params, key: "session_id")
+            if recoveredSessions[sessionID] != nil {
+                throw CLIError(message: "Session \(sessionID) is orphaned after daemon restart")
+            }
             return try withSession(params: params) { session in
                 let afterSeq = Self.optionalUInt64(params, key: "after_seq") ?? 0
                 let limitBytes = Self.optionalInt(params, key: "limit_bytes") ?? 65_536
@@ -15454,7 +15961,7 @@ private final class LocalTerminalDaemonServer {
                    !attachmentID.isEmpty {
                     session.refreshAttachment(attachmentID, now: Date(), staleAfter: Self.staleAttachmentInterval)
                 }
-                let readResult = session.read(afterSeq: afterSeq, limitBytes: limitBytes)
+                let readResult = session.readForAttach(afterSeq: afterSeq, limitBytes: limitBytes)
                 return [
                     "session_id": session.sessionID,
                     "data_base64": readResult.data.base64EncodedString(),
@@ -15468,10 +15975,13 @@ private final class LocalTerminalDaemonServer {
             }
         case "session.close":
             let sessionID = try Self.requireString(params, key: "session_id")
-            guard let session = sessions.removeValue(forKey: sessionID) else {
+            if let session = sessions.removeValue(forKey: sessionID) {
+                session.close()
+            } else if let recovered = recoveredSessions.removeValue(forKey: sessionID) {
+                try? FileManager.default.removeItem(at: recovered.manifestFileURL)
+            } else {
                 throw CLIError(message: "Unknown session \(sessionID)")
             }
-            session.close()
             return [
                 "session_id": sessionID,
                 "closed": true
@@ -15492,6 +16002,7 @@ private final class LocalTerminalDaemonServer {
         }
 
         if let existing = sessions[sessionID] {
+            localTrace("session.open.reuse id=\(sessionID) state=\(existing.state)")
             return existing.statusPayload(now: Date())
         }
 
@@ -15573,6 +16084,7 @@ private final class LocalTerminalDaemonServer {
             retainedLogFileURL: retainedLogFileURL,
             retainedByteLimit: configuration.retainedByteLimit,
             coldAttachTailByteLimit: configuration.coldAttachTailByteLimit,
+            checkpointDebounceInterval: configuration.checkpointDebounceInterval,
             initialCols: cols,
             initialRows: rows
         )
@@ -15582,19 +16094,18 @@ private final class LocalTerminalDaemonServer {
             let waitedPID = waitpid(childPID, &status, 0)
             self?.stateQueue.async {
                 guard let session else { return }
-                session.state = "exited"
                 guard waitedPID > 0 else {
-                    session.terminationStatus = nil
+                    session.markExited(nil)
                     return
                 }
                 let waitStatus = Int32(status)
                 let signalBits = waitStatus & 0x7f
                 if signalBits == 0 {
-                    session.terminationStatus = (waitStatus >> 8) & 0xff
+                    session.markExited((waitStatus >> 8) & 0xff)
                 } else if signalBits != 0x7f {
-                    session.terminationStatus = 128 + signalBits
+                    session.markExited(128 + signalBits)
                 } else {
-                    session.terminationStatus = waitStatus
+                    session.markExited(waitStatus)
                 }
             }
         }
@@ -15611,7 +16122,30 @@ private final class LocalTerminalDaemonServer {
         }
 
         sessions[sessionID] = session
+        localTrace(
+            "session.open id=\(sessionID) pid=\(childPID) tty=\(ttyName ?? "nil") " +
+            "cwd=\(workingDirectory ?? "nil") cmd=\(command ?? "nil")"
+        )
         return session.statusPayload(now: Date())
+    }
+
+    private func sweepExpiredSessions(now: Date) {
+        sessions = sessions.filter { _, session in
+            let shouldKeep =
+                session.state == "running"
+                || !session.attachments.isEmpty
+                || now.timeIntervalSince(session.lastStateChangeAt) < configuration.exitedSessionGraceInterval
+
+            if !shouldKeep {
+                localTrace("session.gc id=\(session.sessionID) state=\(session.state)")
+                try? FileManager.default.removeItem(at: session.retainedLogFileURL)
+                try? FileManager.default.removeItem(at: session.checkpointVTFileURL)
+                try? FileManager.default.removeItem(at: session.checkpointMetadataFileURL)
+                try? FileManager.default.removeItem(at: session.manifestFileURL)
+            }
+
+            return shouldKeep
+        }
     }
 
     private func withSession(
@@ -15702,6 +16236,9 @@ private final class LocalTerminalDaemonClient {
         }
         var frame = data
         frame.append(0x0A)
+        if method != "session.read" {
+            localTrace("client.rpc.send method=\(method) socket=\(socketPath)")
+        }
         try writeAll(frame)
 
         while true {
@@ -15713,10 +16250,14 @@ private final class LocalTerminalDaemonClient {
                 continue
             }
             if let ok = response["ok"] as? Bool, ok {
+                if method != "session.read" {
+                    localTrace("client.rpc.recv method=\(method) ok=1")
+                }
                 return (response["result"] as? [String: Any]) ?? [:]
             }
             let errorObject = response["error"] as? [String: Any]
             let message = (errorObject?["message"] as? String) ?? "local daemon request failed"
+            localTrace("client.rpc.recv method=\(method) ok=0 error=\(message)")
             throw CLIError(message: message)
         }
     }
@@ -15816,6 +16357,7 @@ private struct LocalTerminalDaemonTool {
 
     func run() throws {
         let command = commandArgs.first?.lowercased() ?? "help"
+        localTrace("tool.local-daemon command=\(command) args=\(commandArgs)")
         switch command {
         case "serve":
             try LocalTerminalDaemonServer(configuration: try serveConfiguration(args: Array(commandArgs.dropFirst()))).run()
@@ -15868,12 +16410,22 @@ private struct LocalTerminalDaemonTool {
         }
 
         let resolvedAuthTokenFilePath = authTokenFilePath ?? Self.defaultAuthTokenFilePath(forSocketPath: socketPath)
+        let checkpointDebounceMilliseconds = Double(
+            ProcessInfo.processInfo.environment["CMUX_LOCAL_DAEMON_CHECKPOINT_DEBOUNCE_MS"] ?? ""
+        )
+        let checkpointDebounceInterval = max(0, (checkpointDebounceMilliseconds ?? 250) / 1000.0)
+        let exitedSessionGraceInterval = max(
+            0,
+            TimeInterval(Double(ProcessInfo.processInfo.environment["CMUX_LOCAL_DAEMON_EXITED_SESSION_GRACE_SECONDS"] ?? "") ?? 3600)
+        )
         return LocalTerminalDaemonServerConfiguration(
             socketPath: socketPath,
             authToken: try Self.readAuthToken(filePath: resolvedAuthTokenFilePath),
             retainedByteLimit: max(retainedByteLimit, 65_536),
             coldAttachTailByteLimit: max(min(coldAttachTailByteLimit, max(retainedByteLimit, 65_536)), 1),
-            sessionLogDirectoryURL: Self.defaultSessionLogDirectory(forSocketPath: socketPath)
+            sessionLogDirectoryURL: Self.defaultSessionLogDirectory(forSocketPath: socketPath),
+            checkpointDebounceInterval: checkpointDebounceInterval,
+            exitedSessionGraceInterval: exitedSessionGraceInterval
         )
     }
 
@@ -15922,6 +16474,7 @@ private struct LocalTerminalDaemonTool {
             authTokenFilePath: authTokenFilePath ?? Self.defaultAuthTokenFilePath(forSocketPath: socketPath)
         )
         defer { client.close() }
+        localTrace("tool.local-daemon.rpc method=\(method) socket=\(socketPath)")
         let result = try client.sendRequest(method: method, params: params)
         let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
         FileHandle.standardOutput.write(data)
@@ -16065,6 +16618,10 @@ private struct LocalTerminalAttachTool {
             throw CLIError(message: "local-attach requires --session <id>")
         }
 
+        localTrace(
+            "tool.local-attach.start session=\(sessionID) attachment=\(attachmentID) " +
+            "socket=\(socketPath) lastAcked=\(lastAckedSeq)"
+        )
         try LocalTerminalDaemonTool.waitForSafeSocketPath(path: socketPath, timeout: 10)
         let probeClient = try SocketClient.waitForConnectableSocket(path: socketPath, timeout: 10)
         probeClient.close()
@@ -16098,6 +16655,12 @@ private struct LocalTerminalAttachTool {
                 "cols": initialSize.cols,
                 "rows": initialSize.rows
             ]
+        )
+        localTrace(
+            "tool.local-attach.attached session=\(sessionID) attachment=\(attachmentID) " +
+            "replayStart=\(String(describing: attachResponse["cold_attach_replay_start_seq"])) " +
+            "checkpointSeq=\(String(describing: attachResponse["checkpoint_seq"])) " +
+            "checkpointScreen=\(String(describing: attachResponse["checkpoint_active_screen"]))"
         )
         if lastAckedSeq == 0 {
             if let replayStart = attachResponse["cold_attach_replay_start_seq"] as? NSNumber {
@@ -16167,11 +16730,19 @@ private struct LocalTerminalAttachTool {
             if let dataBase64 = response["data_base64"] as? String,
                let data = Data(base64Encoded: dataBase64),
                !data.isEmpty {
+                let startSeq = (response["start_seq"] as? NSNumber)?.uint64Value
+                    ?? (response["start_seq"] as? UInt64)
+                    ?? 0
+                localTrace(
+                    "tool.local-attach.read session=\(sessionID) bytes=\(data.count) startSeq=\(startSeq) " +
+                    "endSeq=\(lastAckedSeq) eof=\((response["eof"] as? Bool) == true ? 1 : 0)"
+                )
                 FileHandle.standardOutput.write(data)
                 continue
             }
 
             if (response["eof"] as? Bool) == true {
+                localTrace("tool.local-attach.eof session=\(sessionID) endSeq=\(lastAckedSeq)")
                 break
             }
             Thread.sleep(forTimeInterval: 0.03)
@@ -16184,6 +16755,7 @@ private struct LocalTerminalAttachTool {
                 "attachment_id": attachmentID
             ]
         )
+        localTrace("tool.local-attach.detach session=\(sessionID) attachment=\(attachmentID)")
     }
 
     private static func currentTerminalSize() -> (cols: Int, rows: Int) {

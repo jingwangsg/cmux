@@ -3,7 +3,8 @@ import Foundation
 import Bonsplit
 
 enum SessionSnapshotSchema {
-    static let currentVersion = 1
+    static let currentVersion = 2
+    static let legacyVersion = 1
 }
 
 enum SessionPersistencePolicy {
@@ -221,10 +222,45 @@ struct SessionGitBranchSnapshot: Codable, Sendable {
     var isDirty: Bool
 }
 
+enum SessionTerminalRestoreStrategy: String, Codable, Sendable, Equatable {
+    case scrollbackReplay
+    case daemonAttach
+}
+
 struct SessionTerminalPanelSnapshot: Codable, Sendable {
     var workingDirectory: String?
     var scrollback: String?
     var localSessionID: String?
+    var restoreStrategy: SessionTerminalRestoreStrategy
+
+    init(
+        workingDirectory: String?,
+        scrollback: String?,
+        localSessionID: String?,
+        restoreStrategy: SessionTerminalRestoreStrategy? = nil
+    ) {
+        self.workingDirectory = workingDirectory
+        self.scrollback = scrollback
+        self.localSessionID = localSessionID
+        self.restoreStrategy = restoreStrategy ?? (localSessionID == nil ? .scrollbackReplay : .daemonAttach)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case workingDirectory
+        case scrollback
+        case localSessionID
+        case restoreStrategy
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workingDirectory = try container.decodeIfPresent(String.self, forKey: .workingDirectory)
+        scrollback = try container.decodeIfPresent(String.self, forKey: .scrollback)
+        localSessionID = try container.decodeIfPresent(String.self, forKey: .localSessionID)
+        restoreStrategy =
+            try container.decodeIfPresent(SessionTerminalRestoreStrategy.self, forKey: .restoreStrategy)
+            ?? (localSessionID == nil ? .scrollbackReplay : .daemonAttach)
+    }
 }
 
 struct SessionBrowserPanelSnapshot: Codable, Sendable {
@@ -361,6 +397,31 @@ struct AppSessionSnapshot: Codable, Sendable {
     var version: Int
     var createdAt: TimeInterval
     var windows: [SessionWindowSnapshot]
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case createdAt
+        case windows
+    }
+
+    init(version: Int, createdAt: TimeInterval, windows: [SessionWindowSnapshot]) {
+        self.version = version
+        self.createdAt = createdAt
+        self.windows = windows
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedVersion = try container.decode(Int.self, forKey: .version)
+        createdAt = try container.decode(TimeInterval.self, forKey: .createdAt)
+        windows = try container.decode([SessionWindowSnapshot].self, forKey: .windows)
+        if decodedVersion == SessionSnapshotSchema.legacyVersion
+            || decodedVersion == SessionSnapshotSchema.currentVersion {
+            version = SessionSnapshotSchema.currentVersion
+        } else {
+            version = decodedVersion
+        }
+    }
 }
 
 enum SessionPersistenceStore {

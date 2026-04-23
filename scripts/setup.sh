@@ -17,6 +17,7 @@ if ! command -v zig &> /dev/null; then
 fi
 
 "$SCRIPT_DIR/ensure-ghosttykit.sh"
+"$SCRIPT_DIR/ensure-ghosttyvt.sh"
 
 echo "==> Setup complete!"
 echo ""

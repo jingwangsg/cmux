@@ -99,6 +99,82 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertEqual(decoded.terminal?.localSessionID, "local-session-1")
     }
 
+    func testLoadMigratesV1TerminalSnapshotToExplicitRestoreStrategy() throws {
+        let payload = """
+        {
+          "version": 1,
+          "createdAt": 0,
+          "windows": [
+            {
+              "tabManager": {
+                "selectedWorkspaceIndex": 0,
+                "workspaces": [
+                  {
+                    "processTitle": "Terminal",
+                    "isPinned": false,
+                    "currentDirectory": "/tmp/demo",
+                    "layout": { "type": "pane", "pane": { "panelIds": ["11111111-1111-1111-1111-111111111111"], "selectedPanelId": "11111111-1111-1111-1111-111111111111" } },
+                    "panels": [
+                      {
+                        "id": "11111111-1111-1111-1111-111111111111",
+                        "type": "terminal",
+                        "title": "Terminal",
+                        "isPinned": false,
+                        "isManuallyUnread": false,
+                        "listeningPorts": [],
+                        "terminal": {
+                          "workingDirectory": "/tmp/demo",
+                          "scrollback": "hello from v1",
+                          "localSessionID": "legacy-local-session"
+                        }
+                      }
+                    ],
+                    "statusEntries": [],
+                    "logEntries": []
+                  }
+                ]
+              },
+              "sidebar": { "isVisible": true, "selection": "tabs", "width": 220 }
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let snapshot = try XCTUnwrap(try? JSONDecoder().decode(AppSessionSnapshot.self, from: payload))
+        let terminal = try XCTUnwrap(snapshot.windows.first?.tabManager.workspaces.first?.panels.first?.terminal)
+
+        XCTAssertEqual(snapshot.version, SessionSnapshotSchema.currentVersion)
+        XCTAssertEqual(terminal.restoreStrategy, .daemonAttach)
+    }
+
+    @MainActor
+    func testWorkspaceSessionSnapshotPersistsDaemonAttachRestoreStrategy() throws {
+        let previousOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            switch request.mode {
+            case .create:
+                return LocalTerminalLaunchConfiguration(
+                    sessionID: "persisted-daemon-session",
+                    initialCommand: "'/tmp/cmux' 'local-attach' '--socket' '/tmp/persisted.sock' '--auth-token-file' '/tmp/persisted.auth' '--session' 'persisted-daemon-session'",
+                    daemonSocketPath: "/tmp/persisted.sock",
+                    daemonAuthTokenFilePath: "/tmp/persisted.auth"
+                )
+            case .attachExisting:
+                return nil
+            }
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousOverride
+        }
+
+        let workspace = Workspace()
+        let snapshot = workspace.sessionSnapshot(includeScrollback: false)
+        let terminal = try XCTUnwrap(snapshot.panels.first?.terminal)
+
+        XCTAssertEqual(terminal.localSessionID, "persisted-daemon-session")
+        XCTAssertEqual(terminal.restoreStrategy, .daemonAttach)
+    }
+
     @MainActor
     func testWorkspaceRestoreReattachesLiveLocalTerminalSession() throws {
         let restoredPanelID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!

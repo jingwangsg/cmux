@@ -282,6 +282,7 @@ if [[ -z "$TAG" ]]; then
 fi
 
 "$PWD/scripts/ensure-ghosttykit.sh"
+"$PWD/scripts/ensure-ghosttyvt.sh"
 
 if should_skip_ghostty_cli_helper_zig_build; then
   if [[ "${CMUX_SKIP_ZIG_BUILD:-}" != "1" ]]; then

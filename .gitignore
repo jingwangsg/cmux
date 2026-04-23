@@ -18,6 +18,10 @@ xcuserdata/
 # GhosttyKit binary (built from ghostty submodule via scripts/setup.sh)
 GhosttyKit.xcframework
 GhosttyKit.xcframework.bak-*/
+GhosttyVt.xcframework
+libghostty-vt.a
+GhosttyVtHeaders
+GhosttyVtIncludes
 
 # Release artifacts
 GhosttyTabs-*.zip
