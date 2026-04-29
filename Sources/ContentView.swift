@@ -986,6 +986,7 @@ final class FileDropOverlayView: NSView {
 }
 
 var fileDropOverlayKey: UInt8 = 0
+private var fileDropOverlayInstallScheduledKey: UInt8 = 0
 private var commandPaletteWindowOverlayKey: UInt8 = 0
 private var tmuxWorkspacePaneWindowOverlayKey: UInt8 = 0
 let commandPaletteOverlayContainerIdentifier = NSUserInterfaceItemIdentifier("cmux.commandPalette.overlay.container")
@@ -1117,7 +1118,6 @@ private final class WindowCommandPaletteOverlayController: NSObject {
             hostingView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
             hostingView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
         ])
-        _ = ensureInstalled()
         installWindowKeyObservers()
     }
 
@@ -1493,12 +1493,12 @@ private final class WindowCommandPaletteOverlayController: NSObject {
     }
 
     func update(rootView: AnyView, isVisible: Bool) {
-        guard ensureInstalled() else { return }
         // Called from a .background(WindowAccessor { ... }) closure that re-runs
         // on every parent-view body eval (display-sync cadence). The palette is
         // hidden in the vast majority of frames; skip the full cleanup path when
         // we'd just be rewriting the same invisible state.
         if !isVisible && !isPaletteVisible { return }
+        guard ensureInstalled() else { return }
         let shouldPromote = CommandPaletteOverlayPromotionPolicy.shouldPromote(
             previouslyVisible: isPaletteVisible,
             isVisible: isVisible
@@ -1571,6 +1571,8 @@ private final class WindowTmuxWorkspacePaneOverlayController: NSObject {
     private let model = TmuxWorkspacePaneOverlayModel()
     private let hostingView: NSHostingView<TmuxWorkspacePaneOverlayView>
     private var installConstraints: [NSLayoutConstraint] = []
+    private var installScheduled = false
+    private var renderedState: TmuxWorkspacePaneOverlayRenderState?
 
     init(window: NSWindow) {
         self.window = window
@@ -1599,7 +1601,26 @@ private final class WindowTmuxWorkspacePaneOverlayController: NSObject {
             hostingView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
             hostingView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
         ])
-        _ = ensureInstalled()
+    }
+
+    private func isInstalled() -> Bool {
+        guard let window,
+              let contentView = window.contentView,
+              let themeFrame = contentView.superview else { return false }
+        return containerView.superview === themeFrame
+    }
+
+    private func scheduleInstall(remainingAttempts: Int = 16) {
+        guard remainingAttempts > 0 else { return }
+        guard !isInstalled() else { return }
+        guard !installScheduled else { return }
+        installScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.installScheduled = false
+            guard !self.ensureInstalled() else { return }
+            self.scheduleInstall(remainingAttempts: remainingAttempts - 1)
+        }
     }
 
     @discardableResult
@@ -1626,7 +1647,14 @@ private final class WindowTmuxWorkspacePaneOverlayController: NSObject {
     }
 
     func update(state: TmuxWorkspacePaneOverlayRenderState?) {
-        guard ensureInstalled() else { return }
+        if state == renderedState {
+            if state != nil {
+                scheduleInstall()
+            }
+            return
+        }
+        renderedState = state
+
         if let state {
             model.apply(state)
             hostingView.rootView = TmuxWorkspacePaneOverlayView(
@@ -1637,6 +1665,7 @@ private final class WindowTmuxWorkspacePaneOverlayController: NSObject {
             )
             containerView.alphaValue = 1
             containerView.isHidden = false
+            scheduleInstall()
         } else {
             model.clear()
             hostingView.rootView = TmuxWorkspacePaneOverlayView(
@@ -1647,6 +1676,9 @@ private final class WindowTmuxWorkspacePaneOverlayController: NSObject {
             )
             containerView.alphaValue = 0
             containerView.isHidden = true
+            if containerView.superview != nil {
+                scheduleInstall()
+            }
         }
     }
 }
@@ -1802,7 +1834,7 @@ enum MountedWorkspacePresentationPolicy {
     }
 }
 
-/// Installs a FileDropOverlayView on the window's theme frame for Finder file drag support.
+/// Installs a FileDropOverlayView over the window content for Finder file drag support.
 private func findFileDropOverlayView(in root: NSView?) -> FileDropOverlayView? {
     guard let root else { return nil }
     if let overlay = root as? FileDropOverlayView {
@@ -1825,9 +1857,9 @@ private func configureFileDropOverlay(_ overlay: FileDropOverlayView, tabManager
     }
 }
 
-private func attachFileDropOverlay(_ overlay: FileDropOverlayView, to contentView: NSView, in themeFrame: NSView) {
+private func attachFileDropOverlay(_ overlay: FileDropOverlayView, to contentView: NSView) {
     overlay.translatesAutoresizingMaskIntoConstraints = false
-    themeFrame.addSubview(overlay, positioned: .above, relativeTo: contentView)
+    contentView.addSubview(overlay, positioned: .above, relativeTo: nil)
     NSLayoutConstraint.activate([
         overlay.topAnchor.constraint(equalTo: contentView.topAnchor),
         overlay.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
@@ -1848,9 +1880,9 @@ func installFileDropOverlay(on window: NSWindow, tabManager: TabManager) -> Bool
     if let existingOverlay {
         configureFileDropOverlay(existingOverlay, tabManager: tabManager)
         objc_setAssociatedObject(window, &fileDropOverlayKey, existingOverlay, .OBJC_ASSOCIATION_RETAIN)
-        guard existingOverlay.superview !== themeFrame else { return true }
+        guard existingOverlay.superview !== contentView else { return true }
         existingOverlay.removeFromSuperview()
-        attachFileDropOverlay(existingOverlay, to: contentView, in: themeFrame)
+        attachFileDropOverlay(existingOverlay, to: contentView)
         return true
     }
 
@@ -1859,7 +1891,7 @@ func installFileDropOverlay(on window: NSWindow, tabManager: TabManager) -> Bool
     // Publish the overlay before mutating the view tree so any re-entrant lookup resolves
     // the in-flight view instead of installing a second overlay during layout.
     objc_setAssociatedObject(window, &fileDropOverlayKey, overlay, .OBJC_ASSOCIATION_RETAIN)
-    attachFileDropOverlay(overlay, to: contentView, in: themeFrame)
+    attachFileDropOverlay(overlay, to: contentView)
     return true
 }
 
@@ -1868,13 +1900,31 @@ private func installFileDropOverlayWhenReady(
     tabManager: TabManager,
     remainingAttempts: Int = 16
 ) {
-    guard !installFileDropOverlay(on: window, tabManager: tabManager),
-          remainingAttempts > 0 else { return }
+    guard remainingAttempts > 0 else { return }
+    if let existingOverlay = objc_getAssociatedObject(window, &fileDropOverlayKey) as? FileDropOverlayView,
+       existingOverlay.superview === window.contentView {
+        configureFileDropOverlay(existingOverlay, tabManager: tabManager)
+        return
+    }
+
+    if let scheduled = objc_getAssociatedObject(window, &fileDropOverlayInstallScheduledKey) as? NSNumber,
+       scheduled.boolValue {
+        return
+    }
+
+    objc_setAssociatedObject(
+        window,
+        &fileDropOverlayInstallScheduledKey,
+        NSNumber(value: true),
+        .OBJC_ASSOCIATION_RETAIN
+    )
 
     // Defer retrying until the next main-loop turn so we don't mutate the
     // NSThemeFrame hierarchy while SwiftUI/AppKit is still attaching views.
     DispatchQueue.main.async { [weak window, weak tabManager] in
         guard let window, let tabManager else { return }
+        objc_setAssociatedObject(window, &fileDropOverlayInstallScheduledKey, nil, .OBJC_ASSOCIATION_RETAIN)
+        guard !installFileDropOverlay(on: window, tabManager: tabManager) else { return }
         installFileDropOverlayWhenReady(
             on: window,
             tabManager: tabManager,
@@ -3079,21 +3129,21 @@ struct ContentView: View {
               let tab = tabManager.tabs.first(where: { $0.id == selectedId }) else {
             // No selection means we have no local cwd to scope by; clear so the
             // sessions panel doesn't keep filtering by a stale previous tab.
-            sessionIndexStore.currentDirectory = nil
+            setSessionIndexCurrentDirectory(nil)
             return
         }
 
         let dir = tab.currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !dir.isEmpty else {
-            sessionIndexStore.currentDirectory = nil
+            setSessionIndexCurrentDirectory(nil)
             return
         }
 
         fileExplorerStore.showHiddenFiles = true
         if !tab.isRemoteWorkspace {
-            sessionIndexStore.currentDirectory = dir
+            setSessionIndexCurrentDirectory(dir)
         } else {
-            sessionIndexStore.currentDirectory = nil
+            setSessionIndexCurrentDirectory(nil)
         }
 
         if tab.isRemoteWorkspace {
@@ -3144,6 +3194,11 @@ struct ContentView: View {
             }
             fileExplorerStore.setRootPath(dir)
         }
+    }
+
+    private func setSessionIndexCurrentDirectory(_ directory: String?) {
+        guard sessionIndexStore.currentDirectory != directory else { return }
+        sessionIndexStore.currentDirectory = directory
     }
 
     private var focusedDirectory: String? {
@@ -12341,9 +12396,9 @@ private struct ArrowlessPopoverAnchor<PopoverContent: View>: NSViewRepresentable
 
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.anchorView = nsView
-        context.coordinator.updateRootView(AnyView(content()))
 
         if isPresented {
+            context.coordinator.updateRootView(AnyView(content()))
             context.coordinator.present(
                 preferredEdge: preferredEdge,
                 detachedGap: detachedGap
@@ -12371,7 +12426,6 @@ private struct ArrowlessPopoverAnchor<PopoverContent: View>: NSViewRepresentable
         func updateRootView(_ rootView: AnyView) {
             hostingController.rootView = AnyView(rootView.fixedSize())
             hostingController.view.invalidateIntrinsicContentSize()
-            hostingController.view.layoutSubtreeIfNeeded()
         }
 
         func present(preferredEdge: NSRectEdge, detachedGap: CGFloat) {
@@ -12749,6 +12803,7 @@ enum SidebarTrailingAccessoryWidthPolicy {
 private final class SidebarTabItemContextMenuState: ObservableObject {
     var isVisible = false
     var hasDeferredWorkspaceObservationInvalidation = false
+    var hasScheduledWorkspaceObservationInvalidation = false
 }
 
 private struct TabItemView: View, Equatable {
@@ -12808,7 +12863,7 @@ private struct TabItemView: View, Equatable {
     let livePresentation: SidebarTabItemPresentationSnapshot
     @Binding var frozenPresentation: SidebarTabItemPresentationSnapshot?
     @State private var workspaceObservationGeneration: UInt64 = 0
-    @StateObject private var contextMenuState = SidebarTabItemContextMenuState()
+    @State private var contextMenuState = SidebarTabItemContextMenuState()
     @State private var isHovering = false
     @State private var rowHeight: CGFloat = 1
 
@@ -13356,10 +13411,10 @@ private struct TabItemView: View, Equatable {
             GeometryReader { proxy in
                 Color.clear
                     .onAppear {
-                        rowHeight = max(proxy.size.height, 1)
+                        scheduleRowHeightUpdate(proxy.size.height)
                     }
                     .onChange(of: proxy.size.height) { newHeight in
-                        rowHeight = max(newHeight, 1)
+                        scheduleRowHeightUpdate(newHeight)
                     }
             }
         }
@@ -13483,13 +13538,27 @@ private struct TabItemView: View, Equatable {
             contextMenuState.hasDeferredWorkspaceObservationInvalidation = true
             return
         }
-        workspaceObservationGeneration &+= 1
+        guard !contextMenuState.hasScheduledWorkspaceObservationInvalidation else { return }
+        contextMenuState.hasScheduledWorkspaceObservationInvalidation = true
+        DispatchQueue.main.async {
+            contextMenuState.hasScheduledWorkspaceObservationInvalidation = false
+            workspaceObservationGeneration &+= 1
+        }
     }
 
     private func flushDeferredWorkspaceObservationInvalidation() {
         guard contextMenuState.hasDeferredWorkspaceObservationInvalidation else { return }
         contextMenuState.hasDeferredWorkspaceObservationInvalidation = false
-        workspaceObservationGeneration &+= 1
+        scheduleWorkspaceObservationInvalidation()
+    }
+
+    private func scheduleRowHeightUpdate(_ height: CGFloat) {
+        let nextHeight = max(height, 1)
+        guard abs(rowHeight - nextHeight) > 0.5 else { return }
+        DispatchQueue.main.async {
+            guard abs(rowHeight - nextHeight) > 0.5 else { return }
+            rowHeight = nextHeight
+        }
     }
 
     private func contextMenuLabel(multi: String, single: String, isMulti: Bool) -> String {

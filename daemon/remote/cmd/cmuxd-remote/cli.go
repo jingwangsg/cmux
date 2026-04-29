@@ -147,6 +147,15 @@ doneFlags:
 		return runBrowserRelay(socketPath, cmdArgs, jsonOutput, refreshAddr)
 	}
 
+	// Agent hook commands are installed into agent config files and must work
+	// from SSH sessions where this lightweight relay shadows the full local CLI.
+	if cmdName == "codex-hook" {
+		return runCodexHookRelay(socketPath, cmdArgs, refreshAddr)
+	}
+	if cmdName == "claude-hook" {
+		return runClaudeHookRelay(socketPath, cmdArgs, refreshAddr)
+	}
+
 	// Agent launch commands
 	if cmdName == "claude-teams" {
 		return runClaudeTeamsRelay(socketPath, cmdArgs, refreshAddr)

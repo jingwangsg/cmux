@@ -1506,24 +1506,26 @@ class GhosttyApp {
         return true
     }
 
-    let backgroundLogEnabled = {
-        if ProcessInfo.processInfo.environment["CMUX_DEBUG_BG"] == "1" {
+    static func shouldEnableBackgroundLog(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        userDefaults: UserDefaults = .standard
+    ) -> Bool {
+        if environment["CMUX_DEBUG_BG"] == "1" {
             return true
         }
-        if ProcessInfo.processInfo.environment["CMUX_DEBUG_LOG"] != nil {
+        if environment["GHOSTTYTABS_DEBUG_BG"] == "1" {
             return true
         }
-        if ProcessInfo.processInfo.environment["GHOSTTYTABS_DEBUG_BG"] == "1" {
+        if userDefaults.bool(forKey: "cmuxDebugBG") {
             return true
         }
-        if UserDefaults.standard.bool(forKey: "cmuxDebugBG") {
-            return true
-        }
-        return UserDefaults.standard.bool(forKey: "GhosttyTabsDebugBG")
-    }()
+        return userDefaults.bool(forKey: "GhosttyTabsDebugBG")
+    }
+
+    let backgroundLogEnabled = GhosttyApp.shouldEnableBackgroundLog()
     private let backgroundLogURL = GhosttyApp.resolveBackgroundLogURL()
     private let backgroundLogStartUptime = ProcessInfo.processInfo.systemUptime
-    private let backgroundLogLock = NSLock()
+    private let backgroundLogQueue = DispatchQueue(label: "com.cmux.background-log", qos: .utility)
     private var backgroundLogSequence: UInt64 = 0
     private var appObservers: [NSObjectProtocol] = []
     private var bellAudioSound: NSSound?
@@ -1649,6 +1651,24 @@ class GhosttyApp {
     }
     #endif
 
+    private static func diagnosticMessages(_ config: ghostty_config_t) -> [String] {
+        let count = Int(ghostty_config_diagnostics_count(config))
+        guard count > 0 else { return [] }
+        return (0..<count).map { index in
+            let diag = ghostty_config_get_diagnostic(config, UInt32(index))
+            return diag.message.flatMap { String(cString: $0) } ?? "(null)"
+        }
+    }
+
+    static func shouldUseFallbackGhosttyConfig(diagnosticMessages: [String]) -> Bool {
+        !diagnosticMessages.isEmpty
+    }
+
+    static let embeddedSurfaceGhosttyConfigOverrides = """
+    window-vsync = false
+    shell-integration = none
+    """
+
     private func initializeGhostty() {
         // Ensure TUI apps can use colors even if NO_COLOR is set in the launcher env.
         if getenv("NO_COLOR") != nil {
@@ -1671,7 +1691,6 @@ class GhosttyApp {
         // Load default config (includes user config). If this fails hard (e.g. due to
         // invalid user config), ghostty_app_new may return nil; we fall back below.
         loadDefaultConfigFilesWithLegacyFallback(primaryConfig)
-        updateDefaultBackground(from: primaryConfig, source: "initialize.primaryConfig")
 
         // Create runtime config with callbacks
         var runtimeConfig = ghostty_runtime_config_s()
@@ -1768,44 +1787,47 @@ class GhosttyApp {
         }
 
         // Create app
-        if let created = ghostty_app_new(&runtimeConfig, primaryConfig) {
-            self.app = created
-            self.config = primaryConfig
-        } else {
+        var appConfig = primaryConfig
+        var usingFallbackConfig = false
+        let primaryDiagnostics = Self.diagnosticMessages(primaryConfig)
+        if Self.shouldUseFallbackGhosttyConfig(diagnosticMessages: primaryDiagnostics) {
             #if DEBUG
-            Self.initLog("ghostty_app_new(primary) failed; attempting fallback config")
+            Self.initLog("ghostty primary config has diagnostics; attempting fallback config")
             Self.dumpConfigDiagnostics(primaryConfig, label: "primary")
             #endif
-
-            // If the user config is invalid, prefer a minimal fallback configuration so
-            // cmux still launches with working terminals.
             ghostty_config_free(primaryConfig)
+            guard let fallbackConfig = makeFallbackGhosttyConfig(logLabel: "initialize.diagnosticsFallback") else {
+                return
+            }
+            appConfig = fallbackConfig
+            usingFallbackConfig = true
+        }
+        updateDefaultBackground(from: appConfig, source: usingFallbackConfig ? "initialize.diagnosticsFallback" : "initialize.primaryConfig")
 
-            guard let fallbackConfig = ghostty_config_new() else {
-                print("Failed to create ghostty fallback config")
+        if let created = ghostty_app_new(&runtimeConfig, appConfig) {
+            self.app = created
+            self.config = appConfig
+        } else {
+            #if DEBUG
+            Self.initLog("ghostty_app_new(\(usingFallbackConfig ? "fallback" : "primary")) failed")
+            Self.dumpConfigDiagnostics(appConfig, label: usingFallbackConfig ? "fallback" : "primary")
+            #endif
+
+            ghostty_config_free(appConfig)
+            guard !usingFallbackConfig else {
+                print("Failed to create ghostty app")
                 return
             }
 
-            loadInlineGhosttyConfig(
-                "macos-background-from-layer = true",
-                into: fallbackConfig,
-                prefix: "cmux-layer-bg",
-                logLabel: "layer background (fallback)"
-            )
-            loadInlineGhosttyConfig(
-                "shell-integration = none",
-                into: fallbackConfig,
-                prefix: "cmux-shell-integration-override",
-                logLabel: "shell integration override (fallback)"
-            )
-            usesHostLayerBackground = true
-            ghostty_config_finalize(fallbackConfig)
-            updateDefaultBackground(from: fallbackConfig, source: "initialize.fallbackConfig")
+            guard let fallbackConfig = makeFallbackGhosttyConfig(logLabel: "initialize.appNewFallback") else {
+                return
+            }
+            updateDefaultBackground(from: fallbackConfig, source: "initialize.appNewFallback")
 
             guard let created = ghostty_app_new(&runtimeConfig, fallbackConfig) else {
                 #if DEBUG
-                Self.initLog("ghostty_app_new(fallback) failed")
-                Self.dumpConfigDiagnostics(fallbackConfig, label: "fallback")
+                Self.initLog("ghostty_app_new(appNewFallback) failed")
+                Self.dumpConfigDiagnostics(fallbackConfig, label: "appNewFallback")
                 #endif
                 print("Failed to create ghostty app")
                 ghostty_config_free(fallbackConfig)
@@ -1844,6 +1866,35 @@ class GhosttyApp {
         })
 
         #endif
+    }
+
+    private func makeFallbackGhosttyConfig(logLabel: String) -> ghostty_config_t? {
+        guard let fallbackConfig = ghostty_config_new() else {
+            print("Failed to create ghostty fallback config")
+            return nil
+        }
+
+        loadInlineGhosttyConfig(
+            Self.embeddedSurfaceGhosttyConfigOverrides,
+            into: fallbackConfig,
+            prefix: "cmux-embedded-overrides",
+            logLabel: "embedded surface overrides (\(logLabel))"
+        )
+        usesHostLayerBackground = true
+        ghostty_config_finalize(fallbackConfig)
+
+        let fallbackDiagnostics = Self.diagnosticMessages(fallbackConfig)
+        guard !Self.shouldUseFallbackGhosttyConfig(diagnosticMessages: fallbackDiagnostics) else {
+            #if DEBUG
+            Self.initLog("ghostty fallback config has diagnostics label=\(logLabel)")
+            Self.dumpConfigDiagnostics(fallbackConfig, label: "\(logLabel).fallback")
+            #endif
+            print("Failed to create usable ghostty fallback config")
+            ghostty_config_free(fallbackConfig)
+            return nil
+        }
+
+        return fallbackConfig
     }
 
     private func loadInlineGhosttyConfig(
@@ -1889,31 +1940,7 @@ class GhosttyApp {
         loadCJKFontFallbackIfNeeded(config)
         let useHostLayerBackground = !hasConfiguredBackgroundImage(config)
         usesHostLayerBackground = useHostLayerBackground
-        if !useHostLayerBackground {
-            // Background images need Ghostty's fullscreen background pass. Force
-            // the layer-backed solid-color shortcut back off even if the user
-            // config enabled it manually.
-            loadInlineGhosttyConfig(
-                "macos-background-from-layer = false",
-                into: config,
-                prefix: "cmux-layer-bg-image-override",
-                logLabel: "layer background image override"
-            )
-        } else {
-            // cmux provides the terminal background via backgroundView (CALayer)
-            // instead of the GPU full-screen bg pass, so the layer can provide
-            // instant coverage during sidebar toggle and other layout transitions.
-            //
-            // Keep Ghostty's native background rendering when a background image
-            // is configured: the separate CALayer background only matches the
-            // solid-color path, not Ghostty's combined image compositing.
-            loadInlineGhosttyConfig(
-                "macos-background-from-layer = true",
-                into: config,
-                prefix: "cmux-layer-bg",
-                logLabel: "layer background"
-            )
-        }
+
         // Save the user's preference before we force it to none.
         userGhosttyShellIntegrationMode = "detect"
         do {
@@ -1925,13 +1952,21 @@ class GhosttyApp {
             }
         }
 
-        // Prevent Ghostty from overriding ZDOTDIR — cmux handles shell
+        // cmux embeds Ghostty surfaces inside SwiftUI/AppKit views. The embedded
+        // C API only exposes display id updates after surface creation, while
+        // Ghostty's macOS vsync display link is created during surface creation.
+        // In remote/virtualized desktop sessions, active display enumeration can
+        // transiently return zero displays and make ghostty_surface_new fail
+        // before cmux can provide the actual window display id. Disable Ghostty's
+        // window-level vsync for embedded surfaces and keep cmux-driven refreshes.
+        //
+        // Also prevent Ghostty from overriding ZDOTDIR — cmux handles shell
         // integration itself via the .zshenv bootstrap (#2594).
         loadInlineGhosttyConfig(
-            "shell-integration = none",
+            Self.embeddedSurfaceGhosttyConfigOverrides,
             into: config,
-            prefix: "cmux-shell-integration-override",
-            logLabel: "shell integration override"
+            prefix: "cmux-embedded-overrides",
+            logLabel: "embedded surface overrides"
         )
 
         ghostty_config_finalize(config)
@@ -2540,9 +2575,26 @@ class GhosttyApp {
             return
         }
         loadDefaultConfigFilesWithLegacyFallback(newConfig)
-        ghostty_app_update_config(app, newConfig)
+        let configToApply: ghostty_config_t
+        let diagnostics = Self.diagnosticMessages(newConfig)
+        if Self.shouldUseFallbackGhosttyConfig(diagnosticMessages: diagnostics) {
+            logThemeAction("reload fallback source=\(source) soft=\(soft) diagnostics=\(diagnostics.count)")
+            #if DEBUG
+            Self.initLog("ghostty reload config has diagnostics source=\(source); attempting fallback config")
+            Self.dumpConfigDiagnostics(newConfig, label: "reload.\(source)")
+            #endif
+            ghostty_config_free(newConfig)
+            guard let fallbackConfig = makeFallbackGhosttyConfig(logLabel: "reload.\(source)") else {
+                logThemeAction("reload skipped source=\(source) soft=\(soft) reason=fallback_config_failed")
+                return
+            }
+            configToApply = fallbackConfig
+        } else {
+            configToApply = newConfig
+        }
+        ghostty_app_update_config(app, configToApply)
         updateDefaultBackground(
-            from: newConfig,
+            from: configToApply,
             source: "reloadConfiguration(source=\(source))",
             scope: .unscoped
         )
@@ -2552,7 +2604,7 @@ class GhosttyApp {
         if let oldConfig = config {
             ghostty_config_free(oldConfig)
         }
-        config = newConfig
+        config = configToApply
         lastAppearanceColorScheme = GhosttyConfig.currentColorSchemePreference()
         NotificationCenter.default.post(name: .ghosttyConfigDidReload, object: nil)
         scheduleSurfaceRefreshAfterConfigurationReload(source: source)
@@ -3447,25 +3499,29 @@ class GhosttyApp {
     }
 
     func logBackground(_ message: String) {
-        let timestamp = Self.backgroundLogTimestampFormatter.string(from: Date())
+        let eventDate = Date()
         let uptimeMs = (ProcessInfo.processInfo.systemUptime - backgroundLogStartUptime) * 1000
         let frame60 = Int((CACurrentMediaTime() * 60.0).rounded(.down))
         let frame120 = Int((CACurrentMediaTime() * 120.0).rounded(.down))
         let threadLabel = Thread.isMainThread ? "main" : "background"
-        backgroundLogLock.lock()
-        defer { backgroundLogLock.unlock() }
-        backgroundLogSequence &+= 1
-        let sequence = backgroundLogSequence
-        let line =
-            "\(timestamp) seq=\(sequence) t+\(String(format: "%.3f", uptimeMs))ms thread=\(threadLabel) frame60=\(frame60) frame120=\(frame120) cmux bg: \(message)\n"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: backgroundLogURL.path) == false {
-                FileManager.default.createFile(atPath: backgroundLogURL.path, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: backgroundLogURL) {
+
+        backgroundLogQueue.async { [self] in
+            let timestamp = Self.backgroundLogTimestampFormatter.string(from: eventDate)
+            backgroundLogSequence &+= 1
+            let sequence = backgroundLogSequence
+            let line =
+                "\(timestamp) seq=\(sequence) t+\(String(format: "%.3f", uptimeMs))ms thread=\(threadLabel) frame60=\(frame60) frame120=\(frame120) cmux bg: \(message)\n"
+            guard let data = line.data(using: .utf8) else { return }
+            do {
+                if FileManager.default.fileExists(atPath: backgroundLogURL.path) == false {
+                    FileManager.default.createFile(atPath: backgroundLogURL.path, contents: nil)
+                }
+                let handle = try FileHandle(forWritingTo: backgroundLogURL)
                 defer { try? handle.close() }
-                try? handle.seekToEnd()
-                try? handle.write(contentsOf: data)
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } catch {
+                return
             }
         }
     }
@@ -4347,6 +4403,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
         if let bundleId = Bundle.main.bundleIdentifier, !bundleId.isEmpty {
             setManagedEnvironmentValue("CMUX_BUNDLE_ID", bundleId)
         }
+        if SSHAutoRemoteSettings.passiveEnhancementEnabled() {
+            setManagedEnvironmentValue("CMUX_SSH_PASSIVE_ENHANCEMENT", "1")
+        }
+        if SSHAutoRemoteSettings.upgradeInteractiveCommandsEnabled() {
+            setManagedEnvironmentValue("CMUX_SSH_UPGRADE_INTERACTIVE", "1")
+        }
 
         // Port range for this workspace (base/range snapshotted once per app session)
         do {
@@ -4387,6 +4449,14 @@ final class TerminalSurface: Identifiable, ObservableObject {
            let integrationDir = Bundle.main.resourceURL?.appendingPathComponent("shell-integration").path {
             setManagedEnvironmentValue("CMUX_SHELL_INTEGRATION", "1")
             setManagedEnvironmentValue("CMUX_SHELL_INTEGRATION_DIR", integrationDir)
+
+            let currentDataDirs = (env["XDG_DATA_DIRS"]?.isEmpty == false ? env["XDG_DATA_DIRS"] : nil)
+                ?? getenv("XDG_DATA_DIRS").map { String(cString: $0) }
+                ?? (ProcessInfo.processInfo.environment["XDG_DATA_DIRS"]?.isEmpty == false ? ProcessInfo.processInfo.environment["XDG_DATA_DIRS"] : nil)
+                ?? "/usr/local/share:/usr/share"
+            if !currentDataDirs.split(separator: ":").contains(Substring(integrationDir)) {
+                setManagedEnvironmentValue("XDG_DATA_DIRS", "\(integrationDir):\(currentDataDirs)")
+            }
 
             let shell = (env["SHELL"]?.isEmpty == false ? env["SHELL"] : nil)
                 ?? getenv("SHELL").map { String(cString: $0) }
@@ -9713,11 +9783,12 @@ final class GhosttySurfaceScrollView: NSView {
         }
     }
 
-    func attachSurface(_ terminalSurface: TerminalSurface) {
+    func attachSurface(_ terminalSurface: TerminalSurface, synchronizeGeometry: Bool = true) {
         surfaceView.attachSurface(terminalSurface)
         let workspace = terminalSurface.owningWorkspace()
         cachedOwningWorkspace = workspace
         updateWorkspaceTerminalScrollBarObserver(workspace)
+        guard synchronizeGeometry else { return }
         // Preserve the bootstrap 800x600 surface until portal reattach churn
         // has produced a real host size instead of a transient 1x1 placeholder.
         guard bounds.width > 1, bounds.height > 1 else { return }
@@ -12320,6 +12391,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
     final class Coordinator {
         var attachGeneration: Int = 0
+        var portalBindRequestSerial: UInt64 = 0
         // Track the latest desired state so attach retries can re-apply focus after re-parenting.
         var desiredIsActive: Bool = true
         var desiredIsVisibleInUI: Bool = true
@@ -12437,7 +12509,9 @@ struct GhosttyTerminalView: NSViewRepresentable {
         } ?? true
 
         // Keep the surface lifecycle and handlers updated even if we defer re-parenting.
-        hostedView.attachSurface(terminalSurface)
+        // Geometry is reconciled by the portal bind below; doing it synchronously from
+        // updateNSView can re-enter AppKit layout while SwiftUI is still rendering.
+        hostedView.attachSurface(terminalSurface, synchronizeGeometry: false)
         hostedView.setFocusHandler { onFocus?(terminalSurface.id) }
         hostedView.setTriggerFlashHandler(onTriggerFlash)
         if hostOwnsPortalNow {
@@ -12484,10 +12558,48 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
         coordinator.attachGeneration += 1
         let generation = coordinator.attachGeneration
+        func schedulePortalBind(to host: HostContainerView, reason: String) {
+            coordinator.portalBindRequestSerial &+= 1
+            let requestSerial = coordinator.portalBindRequestSerial
+            let expectedSurfaceId = portalExpectedSurfaceId
+            let expectedGeneration = portalExpectedGeneration
+            DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    guard coordinator.portalBindRequestSerial == requestSerial,
+                          coordinator.hostedView === hostedView,
+                          host.window != nil,
+                          terminalSurface.claimPortalHost(
+                              hostId: ObjectIdentifier(host),
+                              paneId: paneId,
+                              instanceSerial: host.instanceSerial,
+                              inWindow: host.window != nil,
+                              bounds: host.bounds,
+                              reason: reason
+                          ),
+                          terminalSurface.canAcceptPortalBinding(
+                              expectedSurfaceId: expectedSurfaceId,
+                              expectedGeneration: expectedGeneration
+                          ) else { return }
+                    TerminalWindowPortalRegistry.bind(
+                        hostedView: hostedView,
+                        to: host,
+                        visibleInUI: coordinator.desiredIsVisibleInUI,
+                        zPriority: coordinator.desiredPortalZPriority,
+                        expectedSurfaceId: expectedSurfaceId,
+                        expectedGeneration: expectedGeneration
+                    )
+                    coordinator.lastBoundHostId = ObjectIdentifier(host)
+                    coordinator.lastSynchronizedHostGeometryRevision = host.geometryRevision
+                    hostedView.setVisibleInUI(coordinator.desiredIsVisibleInUI)
+                    hostedView.setActive(coordinator.desiredIsActive)
+                    hostedView.setNotificationRing(visible: coordinator.desiredShowsUnreadNotificationRing)
+                }
+            }
+        }
 
         if let host = hostContainer {
-            host.onDidMoveToWindow = { [weak host, weak hostedView, weak coordinator] in
-                guard let host, let hostedView, let coordinator else { return }
+            host.onDidMoveToWindow = { [weak host, weak coordinator] in
+                guard let host, let coordinator else { return }
                 guard coordinator.attachGeneration == generation else { return }
                 guard terminalSurface.claimPortalHost(
                     hostId: ObjectIdentifier(host),
@@ -12499,19 +12611,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
                 ) else { return }
                 guard host.window != nil else { return }
                 guard portalBindingStillLive() else { return }
-                TerminalWindowPortalRegistry.bind(
-                    hostedView: hostedView,
-                    to: host,
-                    visibleInUI: coordinator.desiredIsVisibleInUI,
-                    zPriority: coordinator.desiredPortalZPriority,
-                    expectedSurfaceId: portalExpectedSurfaceId,
-                    expectedGeneration: portalExpectedGeneration
-                )
-                coordinator.lastBoundHostId = ObjectIdentifier(host)
-                coordinator.lastSynchronizedHostGeometryRevision = host.geometryRevision
-                hostedView.setVisibleInUI(coordinator.desiredIsVisibleInUI)
-                hostedView.setActive(coordinator.desiredIsActive)
-                hostedView.setNotificationRing(visible: coordinator.desiredShowsUnreadNotificationRing)
+                schedulePortalBind(to: host, reason: "didMoveToWindow")
             }
             host.onGeometryChanged = { [weak host, weak hostedView, weak coordinator] in
                 guard let host, let hostedView, let coordinator else { return }
@@ -12536,18 +12636,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
                         "active=\(coordinator.desiredIsActive ? 1 : 0) z=\(coordinator.desiredPortalZPriority)"
                     )
 #endif
-                    TerminalWindowPortalRegistry.bind(
-                        hostedView: hostedView,
-                        to: host,
-                        visibleInUI: coordinator.desiredIsVisibleInUI,
-                        zPriority: coordinator.desiredPortalZPriority,
-                        expectedSurfaceId: portalExpectedSurfaceId,
-                        expectedGeneration: portalExpectedGeneration
-                    )
-                    coordinator.lastBoundHostId = hostId
-                    hostedView.setVisibleInUI(coordinator.desiredIsVisibleInUI)
-                    hostedView.setActive(coordinator.desiredIsActive)
-                    hostedView.setNotificationRing(visible: coordinator.desiredShowsUnreadNotificationRing)
+                    schedulePortalBind(to: host, reason: "geometryChanged")
                 }
                 Self.synchronizePortalGeometry(
                     for: host,
@@ -12577,16 +12666,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
                         )
                     }
 #endif
-                    TerminalWindowPortalRegistry.bind(
-                        hostedView: hostedView,
-                        to: host,
-                        visibleInUI: coordinator.desiredIsVisibleInUI,
-                        zPriority: coordinator.desiredPortalZPriority,
-                        expectedSurfaceId: portalExpectedSurfaceId,
-                        expectedGeneration: portalExpectedGeneration
-                    )
-                    coordinator.lastBoundHostId = hostId
-                    coordinator.lastSynchronizedHostGeometryRevision = geometryRevision
+                    schedulePortalBind(to: host, reason: "update")
                 } else if portalBindingLive && coordinator.lastSynchronizedHostGeometryRevision != geometryRevision {
                     Self.synchronizePortalGeometry(
                         for: host,
@@ -12645,6 +12725,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
         coordinator.attachGeneration += 1
+        coordinator.portalBindRequestSerial &+= 1
         coordinator.desiredIsActive = false
         coordinator.desiredIsVisibleInUI = false
         coordinator.desiredShowsUnreadNotificationRing = false

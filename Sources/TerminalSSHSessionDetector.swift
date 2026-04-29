@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-struct DetectedSSHSession: Equatable {
+struct DetectedSSHSession: Equatable, Sendable {
     let destination: String
     let port: Int?
     let identityFile: String?
@@ -391,7 +391,29 @@ struct DetectedSSHSession: Equatable {
 #endif
 }
 
+extension DetectedSSHSession {
+    init(parsedCommand: ParsedSSHCommand) {
+        self.init(
+            destination: parsedCommand.destination,
+            port: parsedCommand.port,
+            identityFile: parsedCommand.identityFile,
+            configFile: parsedCommand.configFile,
+            jumpHost: parsedCommand.jumpHost,
+            controlPath: parsedCommand.controlPath,
+            useIPv4: parsedCommand.useIPv4,
+            useIPv6: parsedCommand.useIPv6,
+            forwardAgent: parsedCommand.forwardAgent,
+            compressionEnabled: parsedCommand.compressionEnabled,
+            sshOptions: parsedCommand.sshOptions
+        )
+    }
+}
+
 enum TerminalSSHSessionDetector {
+#if DEBUG
+    static var detectOverrideForTesting: ((String) -> DetectedSSHSession?)?
+#endif
+
     struct ProcessSnapshot: Equatable {
         let pid: Int32
         let pgid: Int32
@@ -401,6 +423,11 @@ enum TerminalSSHSessionDetector {
     }
 
     static func detect(forTTY ttyName: String) -> DetectedSSHSession? {
+#if DEBUG
+        if let detectOverrideForTesting {
+            return detectOverrideForTesting(ttyName)
+        }
+#endif
         let normalizedTTY = normalizeTTYName(ttyName)
         guard !normalizedTTY.isEmpty else { return nil }
         let processes = processSnapshots(forTTY: normalizedTTY)
@@ -437,32 +464,16 @@ enum TerminalSSHSessionDetector {
 
         for candidate in candidates {
             guard let arguments = argumentsByPID[candidate.pid],
-                  let session = parseSSHCommandLine(arguments) else {
+                  let parsedCommand = SSHCommandParser.parse(arguments: arguments) else {
                 continue
             }
-            return session
+            return DetectedSSHSession(parsedCommand: parsedCommand)
         }
 
         return nil
     }
 
     private static let psPath = "/bin/ps"
-    private static let noArgumentFlags = Set("46AaCfGgKkMNnqsTtVvXxYy")
-    private static let valueArgumentFlags = Set("BbcDEeFIiJLlmOopQRSWw")
-    private static let filteredSSHOptionKeys: Set<String> = [
-        "batchmode",
-        "controlmaster",
-        "controlpersist",
-        "forkafterauthentication",
-        "localcommand",
-        "permitlocalcommand",
-        "remotecommand",
-        "requesttty",
-        "sendenv",
-        "sessiontype",
-        "setenv",
-        "stdioforward",
-    ]
 
     private static func normalizeTTYName(_ ttyName: String) -> String {
         let trimmed = ttyName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -579,229 +590,4 @@ enum TerminalSSHSessionDetector {
         return arguments.count == argc ? arguments : nil
     }
 
-    private static func parseSSHCommandLine(_ arguments: [String]) -> DetectedSSHSession? {
-        guard !arguments.isEmpty else { return nil }
-
-        var index = 0
-        if let executable = arguments.first?.split(separator: "/").last,
-           executable == "ssh" {
-            index = 1
-        }
-
-        var destination: String?
-        var port: Int?
-        var identityFile: String?
-        var configFile: String?
-        var jumpHost: String?
-        var controlPath: String?
-        var loginName: String?
-        var useIPv4 = false
-        var useIPv6 = false
-        var forwardAgent = false
-        var compressionEnabled = false
-        var sshOptions: [String] = []
-
-        func consumeValue(_ value: String, for option: Character) -> Bool {
-            let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedValue.isEmpty else { return false }
-
-            switch option {
-            case "p":
-                guard let parsedPort = Int(trimmedValue) else { return false }
-                port = parsedPort
-                return true
-            case "i":
-                identityFile = trimmedValue
-                return true
-            case "F":
-                configFile = trimmedValue
-                return true
-            case "J":
-                jumpHost = trimmedValue
-                return true
-            case "S":
-                controlPath = trimmedValue
-                return true
-            case "l":
-                loginName = trimmedValue
-                return true
-            case "o":
-                return consumeSSHOption(
-                    trimmedValue,
-                    port: &port,
-                    identityFile: &identityFile,
-                    controlPath: &controlPath,
-                    jumpHost: &jumpHost,
-                    loginName: &loginName,
-                    sshOptions: &sshOptions
-                )
-            default:
-                return valueArgumentFlags.contains(option)
-            }
-        }
-
-        while index < arguments.count {
-            let argument = arguments[index]
-            if argument == "--" {
-                index += 1
-                if index < arguments.count {
-                    destination = arguments[index]
-                }
-                break
-            }
-            if !argument.hasPrefix("-") || argument == "-" {
-                destination = argument
-                break
-            }
-
-            if argument.count > 2,
-               let option = argument.dropFirst().first,
-               valueArgumentFlags.contains(option) {
-                guard consumeValue(String(argument.dropFirst(2)), for: option) else { return nil }
-                index += 1
-                continue
-            }
-
-            if argument.count == 2,
-               let optionCharacter = argument.dropFirst().first,
-               valueArgumentFlags.contains(optionCharacter) {
-                let nextIndex = index + 1
-                guard nextIndex < arguments.count,
-                      consumeValue(arguments[nextIndex], for: optionCharacter) else {
-                    return nil
-                }
-                index += 2
-                continue
-            }
-
-            let flags = Array(argument.dropFirst())
-            guard !flags.isEmpty, flags.allSatisfy({ noArgumentFlags.contains($0) }) else {
-                return nil
-            }
-            for flag in flags {
-                switch flag {
-                case "4":
-                    useIPv4 = true
-                    useIPv6 = false
-                case "6":
-                    useIPv6 = true
-                    useIPv4 = false
-                case "A":
-                    forwardAgent = true
-                case "C":
-                    compressionEnabled = true
-                default:
-                    break
-                }
-            }
-            index += 1
-        }
-
-        guard let destination else { return nil }
-        let finalDestination = resolveDestination(destination, loginName: loginName)
-        guard !finalDestination.isEmpty else { return nil }
-
-        return DetectedSSHSession(
-            destination: finalDestination,
-            port: port,
-            identityFile: identityFile,
-            configFile: configFile,
-            jumpHost: jumpHost,
-            controlPath: controlPath,
-            useIPv4: useIPv4,
-            useIPv6: useIPv6,
-            forwardAgent: forwardAgent,
-            compressionEnabled: compressionEnabled,
-            sshOptions: sshOptions
-        )
-    }
-
-    private static func consumeSSHOption(
-        _ option: String,
-        port: inout Int?,
-        identityFile: inout String?,
-        controlPath: inout String?,
-        jumpHost: inout String?,
-        loginName: inout String?,
-        sshOptions: inout [String]
-    ) -> Bool {
-        let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        let key = sshOptionKey(trimmed)
-        let value = sshOptionValue(trimmed)
-
-        switch key {
-        case "port":
-            if let value, let parsedPort = Int(value) {
-                port = parsedPort
-                return true
-            }
-            return false
-        case "identityfile":
-            if let value, !value.isEmpty {
-                identityFile = value
-                return true
-            }
-            return false
-        case "controlpath":
-            if let value, !value.isEmpty {
-                controlPath = value
-                return true
-            }
-            return false
-        case "proxyjump":
-            if let value, !value.isEmpty {
-                jumpHost = value
-                return true
-            }
-            return false
-        case "user":
-            if let value, !value.isEmpty {
-                loginName = value
-                return true
-            }
-            return false
-        case let key? where filteredSSHOptionKeys.contains(key):
-            return true
-        case .some, .none:
-            sshOptions.append(trimmed)
-            return true
-        }
-    }
-
-    private static func resolveDestination(_ destination: String, loginName: String?) -> String {
-        let trimmedDestination = destination.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedDestination.isEmpty else { return "" }
-        guard let loginName = loginName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !loginName.isEmpty,
-              !trimmedDestination.contains("@") else {
-            return trimmedDestination
-        }
-        return "\(loginName)@\(trimmedDestination)"
-    }
-
-    private static func sshOptionKey(_ option: String) -> String? {
-        let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return trimmed
-            .split(whereSeparator: { $0 == "=" || $0.isWhitespace })
-            .first
-            .map(String.init)?
-            .lowercased()
-    }
-
-    private static func sshOptionValue(_ option: String) -> String? {
-        let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        if let equalIndex = trimmed.firstIndex(of: "=") {
-            let value = trimmed[trimmed.index(after: equalIndex)...].trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? nil : value
-        }
-
-        let parts = trimmed.split(maxSplits: 1, whereSeparator: \.isWhitespace)
-        guard parts.count == 2 else { return nil }
-        let value = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
-    }
 }

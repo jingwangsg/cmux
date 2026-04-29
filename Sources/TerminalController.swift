@@ -2156,6 +2156,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceSendKey(params: params))
         case "surface.report_tty":
             return v2Result(id: id, self.v2SurfaceReportTTY(params: params))
+        case "surface.ssh_upgrade":
+            return v2Result(id: id, self.v2SurfaceSSHUpgrade(params: params))
         case "surface.ports_kick":
             return v2Result(id: id, self.v2SurfacePortsKick(params: params))
         case "surface.clear_history":
@@ -3859,6 +3861,15 @@ class TerminalController {
             }
             relayPort = parsedRelayPort
         }
+        var localRelayPort: Int?
+        if v2HasNonNullParam(params, "local_relay_port") {
+            guard let parsedLocalRelayPort = v2StrictInt(params, "local_relay_port"),
+                  parsedLocalRelayPort > 0,
+                  parsedLocalRelayPort <= 65535 else {
+                return .err(code: "invalid_params", message: "local_relay_port must be 1-65535", data: nil)
+            }
+            localRelayPort = parsedLocalRelayPort
+        }
         let relayID = v2RawString(params, "relay_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let relayToken = v2RawString(params, "relay_token")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let foregroundAuthToken = v2RawString(params, "foreground_auth_token")?
@@ -3881,6 +3892,7 @@ class TerminalController {
             "workspace.remote.configure.request workspace=\(workspaceId.uuidString.prefix(8)) " +
             "target=\(destination) port=\(sshPort.map(String.init) ?? "nil") " +
             "autoConnect=\(autoConnect ? 1 : 0) relayPort=\(relayPort.map(String.init) ?? "nil") " +
+            "localRelayPort=\(localRelayPort.map(String.init) ?? "nil") " +
             "localSocket=\(localSocketPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? localSocketPath! : "nil") " +
             "sshOptions=\(sshOptions.joined(separator: "|"))"
         )
@@ -3904,6 +3916,7 @@ class TerminalController {
                 sshOptions: sshOptions,
                 localProxyPort: localProxyPort,
                 relayPort: relayPort,
+                localRelayPort: localRelayPort,
                 relayID: relayID?.isEmpty == true ? nil : relayID,
                 relayToken: relayToken?.isEmpty == true ? nil : relayToken,
                 localSocketPath: localSocketPath,
@@ -4188,6 +4201,7 @@ class TerminalController {
             }
 
             tab.surfaceTTYNames[surfaceId] = ttyName
+            tab.scheduleDetectedSSHAttachmentRefresh(panelId: surfaceId, reason: "v2_surface_tty")
             if tab.isRemoteWorkspace {
                 tab.syncRemotePortScanTTYs()
                 _ = tab.applyPendingRemoteSurfacePortKickIfNeeded(to: surfaceId)
@@ -4201,6 +4215,124 @@ class TerminalController {
                 "surface_id": surfaceId.uuidString,
                 "surface_ref": v2Ref(kind: .surface, uuid: surfaceId),
                 "tty_name": ttyName,
+            ])
+        }
+
+        return result
+    }
+
+    private func v2SurfaceSSHUpgrade(params: [String: Any]) -> V2CallResult {
+        guard let workspaceId = v2UUID(params, "workspace_id") else {
+            return .err(code: "invalid_params", message: "surface.ssh_upgrade requires workspace_id", data: nil)
+        }
+        guard let surfaceId = v2UUID(params, "surface_id") else {
+            return .err(code: "invalid_params", message: "surface.ssh_upgrade requires surface_id", data: nil)
+        }
+        guard let originalArgv = params["original_argv"] as? [String],
+              !originalArgv.isEmpty else {
+            return .err(code: "invalid_params", message: "surface.ssh_upgrade requires original_argv", data: nil)
+        }
+        let originalCommand = (params["original_command"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let parsed = SSHCommandParser.parse(arguments: originalArgv),
+              parsed.isEligibleForAutoUpgrade else {
+            return .err(
+                code: "invalid_params",
+                message: "surface.ssh_upgrade only accepts simple interactive ssh commands",
+                data: ["original_command": originalCommand]
+            )
+        }
+
+        var result: V2CallResult = .err(
+            code: "not_found",
+            message: "Surface not found",
+            data: [
+                "workspace_id": workspaceId.uuidString,
+                "workspace_ref": v2Ref(kind: .workspace, uuid: workspaceId),
+                "surface_id": surfaceId.uuidString,
+                "surface_ref": v2Ref(kind: .surface, uuid: surfaceId),
+            ]
+        )
+
+        let relayPort = v2Int(params, "relay_port")
+        let relayID = v2String(params, "relay_id")
+        let relayToken = v2String(params, "relay_token")
+        let localSocketPath = v2String(params, "local_socket_path")
+        let terminalStartupCommand = v2String(params, "terminal_startup_command")
+        let hasRelayBootstrap = relayPort.map { $0 > 0 } == true
+            && relayID != nil
+            && relayToken != nil
+            && localSocketPath != nil
+            && terminalStartupCommand != nil
+        let relayConfiguration: WorkspaceRemoteConfiguration?
+        if hasRelayBootstrap,
+           let relayPort,
+           let relayID,
+           let relayToken,
+           let localSocketPath,
+           let terminalStartupCommand {
+            relayConfiguration = WorkspaceRemoteConfiguration(
+                destination: v2String(params, "destination") ?? parsed.destination,
+                port: v2Int(params, "port") ?? parsed.port,
+                identityFile: v2String(params, "identity_file") ?? parsed.identityFile,
+                sshOptions: v2StringArray(params, "ssh_options") ?? parsed.sshOptions,
+                localProxyPort: nil,
+                relayPort: relayPort,
+                relayID: relayID,
+                relayToken: relayToken,
+                localSocketPath: localSocketPath,
+                terminalStartupCommand: terminalStartupCommand,
+                foregroundAuthToken: nil
+            )
+        } else {
+            relayConfiguration = nil
+        }
+
+        v2MainSync {
+            guard let workspace = self.tabForSidebarMutation(id: workspaceId),
+                  workspace.panels[surfaceId] is TerminalPanel else {
+                return
+            }
+
+            let session = DetectedSSHSession(parsedCommand: parsed)
+            let transportKey = relayConfiguration?.relayID
+                .map { "\(Workspace.sshExecUpgradeTransportKeyPrefix)\($0)" }
+                ?? Workspace.detectedSSHTransportKeyForUpgrade(session)
+            let displayTarget = relayConfiguration?.displayTarget
+                ?? parsed.port.map { "\(parsed.destination):\($0)" }
+                ?? parsed.destination
+            let attachmentDestination = relayConfiguration?.destination ?? parsed.destination
+            let attachmentPort = relayConfiguration?.port ?? parsed.port
+            let attachmentIdentityFile = relayConfiguration?.identityFile ?? parsed.identityFile
+            let attachmentSSHOptions = relayConfiguration?.sshOptions ?? parsed.sshOptions
+            workspace.setRemoteAttachment(
+                .detectedSSH(.init(
+                    destination: attachmentDestination,
+                    displayTarget: displayTarget,
+                    port: attachmentPort,
+                    identityFile: attachmentIdentityFile,
+                    sshOptions: attachmentSSHOptions,
+                    transportKey: transportKey,
+                    daemonState: .bootstrapping(detail: "Bootstrapping remote daemon on \(displayTarget)")
+                )),
+                for: surfaceId
+            )
+            workspace.startDetectedSSHRemoteSupportIfNeeded(
+                session: session,
+                panelId: surfaceId,
+                transportKey: transportKey,
+                relayConfiguration: relayConfiguration,
+                allowPreparedAdoption: relayConfiguration == nil
+            )
+
+            result = .ok([
+                "upgraded": relayConfiguration != nil,
+                "fallback_required": relayConfiguration == nil,
+                "workspace_id": workspace.id.uuidString,
+                "workspace_ref": v2Ref(kind: .workspace, uuid: workspace.id),
+                "surface_id": surfaceId.uuidString,
+                "surface_ref": v2Ref(kind: .surface, uuid: surfaceId),
+                "remote": v2OrNull(workspace.remoteAttachmentPayload(for: surfaceId)),
             ])
         }
 
@@ -4848,6 +4980,7 @@ class TerminalController {
                     "tty": v2OrNull(runtimeMetadata.ttyName),
                     "current_directory": v2OrNull(runtimeMetadata.currentDirectory),
                     "local_session_id": v2OrNull(runtimeMetadata.localSessionID),
+                    "remote_attachment": v2OrNull(ws.remoteAttachmentPayload(for: panel.id)),
                     "foreground_process_name": v2OrNull(runtimeMetadata.foregroundProcessName),
                     "foreground_process_command": v2OrNull(runtimeMetadata.foregroundProcessCommand),
                     "runtime_title": v2OrNull(runtimeMetadata.title)
@@ -5642,6 +5775,7 @@ class TerminalController {
                     "current_directory": v2OrNull(currentDirectory),
                     "local_session_id": v2OrNull(runtimeMetadata?.localSessionID),
                     "local_session_state": v2OrNull(runtimeMetadata?.state),
+                    "remote_attachment": v2OrNull(workspace?.remoteAttachmentPayload(for: panelId)),
                     "foreground_process_name": v2OrNull(runtimeMetadata?.foregroundProcessName),
                     "foreground_process_command": v2OrNull(runtimeMetadata?.foregroundProcessCommand),
                     "runtime_title": v2OrNull(runtimeMetadata?.title),
@@ -15482,6 +15616,7 @@ class TerminalController {
                 tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
                 guard validSurfaceIds.contains(scope.panelId) else { return }
                 tab.surfaceTTYNames[scope.panelId] = ttyName
+                tab.scheduleDetectedSSHAttachmentRefresh(panelId: scope.panelId, reason: "report_tty")
                 if tab.isRemoteWorkspace {
                     tab.syncRemotePortScanTTYs()
                     _ = tab.applyPendingRemoteSurfacePortKickIfNeeded(to: scope.panelId)
@@ -15526,6 +15661,7 @@ class TerminalController {
             }
 
             tab.surfaceTTYNames[surfaceId] = ttyName
+            tab.scheduleDetectedSSHAttachmentRefresh(panelId: surfaceId, reason: "report_tty")
             if tab.isRemoteWorkspace {
                 tab.syncRemotePortScanTTYs()
                 _ = tab.applyPendingRemoteSurfacePortKickIfNeeded(to: surfaceId)

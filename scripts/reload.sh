@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="cmux DEV"
 BUNDLE_ID="com.cmuxterm.app.debug"
 BASE_APP_NAME="cmux DEV"
+MAX_TAGGED_APP_NAME_LENGTH=30
 DERIVED_DATA=""
 NAME_SET=0
 BUNDLE_SET=0
@@ -159,6 +160,23 @@ sanitize_path() {
   echo "$cleaned"
 }
 
+tagged_app_name() {
+  local tag="$1"
+  local full_name="${BASE_APP_NAME} ${tag}"
+  if [[ "${#full_name}" -le "$MAX_TAGGED_APP_NAME_LENGTH" ]]; then
+    echo "$full_name"
+    return 0
+  fi
+
+  local prefix="${BASE_APP_NAME} "
+  local max_tag_length=$((MAX_TAGGED_APP_NAME_LENGTH - ${#prefix}))
+  if [[ "$max_tag_length" -lt 1 ]]; then
+    echo "${full_name:0:$MAX_TAGGED_APP_NAME_LENGTH}"
+    return 0
+  fi
+  echo "${prefix}${tag:0:$max_tag_length}"
+}
+
 tagged_derived_data_path() {
   local slug="$1"
   echo "$HOME/Library/Developer/Xcode/DerivedData/cmux-${slug}"
@@ -209,14 +227,14 @@ print_tag_cleanup_reminder() {
     done
     echo "Cleanup stale tags only:"
     for tag in "${stale_tags[@]}"; do
-      echo "  pkill -f \"cmux DEV ${tag}.app/Contents/MacOS/cmux DEV\""
+      echo "  pkill -f \"$(tagged_app_name "$tag").app/Contents/MacOS/cmux DEV\""
       echo "  rm -rf \"$(tagged_derived_data_path "$tag")\" \"/tmp/cmux-${tag}\" \"/tmp/cmux-debug-${tag}.sock\""
       echo "  rm -f \"/tmp/cmux-debug-${tag}.log\""
       echo "  rm -f \"$HOME/Library/Application Support/cmux/cmuxd-dev-${tag}.sock\""
     done
   fi
   echo "After you verify current tag, cleanup command:"
-  echo "  pkill -f \"cmux DEV ${current_slug}.app/Contents/MacOS/cmux DEV\""
+  echo "  pkill -f \"$(tagged_app_name "$current_slug").app/Contents/MacOS/cmux DEV\""
   echo "  rm -rf \"$(tagged_derived_data_path "$current_slug")\" \"/tmp/cmux-${current_slug}\" \"/tmp/cmux-debug-${current_slug}.sock\""
   echo "  rm -f \"/tmp/cmux-debug-${current_slug}.log\""
   echo "  rm -f \"$HOME/Library/Application Support/cmux/cmuxd-dev-${current_slug}.sock\""
@@ -295,7 +313,10 @@ if [[ -n "$TAG" ]]; then
   TAG_ID="$(sanitize_bundle "$TAG")"
   TAG_SLUG="$(sanitize_path "$TAG")"
   if [[ "$NAME_SET" -eq 0 ]]; then
-    APP_NAME="cmux DEV ${TAG}"
+    APP_NAME="$(tagged_app_name "$TAG")"
+    if [[ "$APP_NAME" != "${BASE_APP_NAME} ${TAG}" ]]; then
+      echo "Using shortened tagged app name for CGWindow compatibility: ${APP_NAME}"
+    fi
   fi
   if [[ "$BUNDLE_SET" -eq 0 ]]; then
     BUNDLE_ID="com.cmuxterm.app.debug.${TAG_ID}"

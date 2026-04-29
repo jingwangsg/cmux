@@ -113,6 +113,27 @@ enum TerminalScrollBarSettings {
     }
 }
 
+enum SSHAutoRemoteSettings {
+    static let passiveEnhancementKey = "sshAutoRemote.passiveEnhancement"
+    static let defaultPassiveEnhancement = true
+    static let upgradeInteractiveCommandsKey = "sshAutoRemote.upgradeInteractiveCommands"
+    static let defaultUpgradeInteractiveCommands = true
+
+    static func passiveEnhancementEnabled(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: passiveEnhancementKey) == nil {
+            return defaultPassiveEnhancement
+        }
+        return defaults.bool(forKey: passiveEnhancementKey)
+    }
+
+    static func upgradeInteractiveCommandsEnabled(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: upgradeInteractiveCommandsKey) == nil {
+            return defaultUpgradeInteractiveCommands
+        }
+        return defaults.bool(forKey: upgradeInteractiveCommandsKey)
+    }
+}
+
 enum UITestLaunchManifest {
     static let argumentName = "-cmuxUITestLaunchManifest"
 
@@ -364,6 +385,7 @@ struct cmuxApp: App {
                     appDelegate.fileExplorerState = fileExplorerState
                     cmuxConfigStore.wireDirectoryTracking(tabManager: tabManager)
                     cmuxConfigStore.loadAll()
+                    SSHHostPreparationStore.shared.prepareAutoRegisteredHostsOnAppLaunch()
                     applyAppearance()
                     if ProcessInfo.processInfo.environment["CMUX_UI_TEST_SHOW_SETTINGS"] == "1" {
                         DispatchQueue.main.async {
@@ -839,9 +861,10 @@ struct cmuxApp: App {
                         .keyboardShortcut(
                             KeyEquivalent(Character("\(number)")),
                             modifiers: selectWorkspaceByNumberShortcut.eventModifiers
-                        )
-                    }
-                }
+	                            )
+	                        }
+
+		                    }
 
                 Divider()
 
@@ -4449,6 +4472,10 @@ struct SettingsView: View {
     private var paneFirstClickFocusEnabled = PaneFirstClickFocusSettings.defaultEnabled
     @AppStorage(TerminalScrollBarSettings.showScrollBarKey)
     private var showTerminalScrollBar = TerminalScrollBarSettings.defaultShowScrollBar
+    @AppStorage(SSHAutoRemoteSettings.passiveEnhancementKey)
+    private var sshPassiveEnhancement = SSHAutoRemoteSettings.defaultPassiveEnhancement
+    @AppStorage(SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+    private var sshUpgradeInteractiveCommands = SSHAutoRemoteSettings.defaultUpgradeInteractiveCommands
     @AppStorage(WorkspaceAutoReorderSettings.key) private var workspaceAutoReorder = WorkspaceAutoReorderSettings.defaultValue
     @AppStorage(SidebarWorkspaceDetailSettings.hideAllDetailsKey)
     private var sidebarHideAllDetails = SidebarWorkspaceDetailSettings.defaultHideAllDetails
@@ -4482,6 +4509,7 @@ struct SettingsView: View {
 
     @ObservedObject private var notificationStore = TerminalNotificationStore.shared
     @StateObject private var keyboardShortcutSettingsObserver = KeyboardShortcutSettingsObserver.shared
+    @StateObject private var sshHostPreparationStore = SSHHostPreparationStore.shared
     @State private var shortcutResetToken = UUID()
     @State private var topBlurOpacity: Double = 0
     @State private var topBlurBaselineOffset: CGFloat?
@@ -4504,6 +4532,8 @@ struct SettingsView: View {
     @State private var isResettingSettings = false
     @State private var workspaceTabPaletteEntries = WorkspaceTabColorSettings.palette()
     @State private var trustedDirectoriesDraft: String = CmuxDirectoryTrust.shared.allTrustedPaths.joined(separator: "\n")
+    @State private var sshHostDraft = ""
+    @State private var sshConfigHostAliases: [String] = []
 
     @ViewBuilder
     private var localTerminalDaemonSettingsCard: some View {
@@ -4551,6 +4581,24 @@ struct SettingsView: View {
                 )
             )
         }
+    }
+
+    @ViewBuilder
+    private var sshRegisteredHostsSettings: some View {
+        SettingsSSHRegisteredHostsView(
+            store: sshHostPreparationStore,
+            hostDraft: $sshHostDraft,
+            configHostAliases: sshConfigHostAliases,
+            onReloadConfigHosts: reloadSSHConfigHostAliases
+        )
+        .onAppear {
+            sshHostPreparationStore.reloadRegisteredHostsFromDisk()
+            reloadSSHConfigHostAliases()
+        }
+    }
+
+    private func reloadSSHConfigHostAliases() {
+        sshConfigHostAliases = SSHConfigHostScanner.hostAliases()
     }
 
     private var selectedWorkspacePlacement: NewWorkspacePlacement {
@@ -5596,6 +5644,42 @@ struct SettingsView: View {
                                     String(localized: "settings.terminal.scrollBar", defaultValue: "Show Terminal Scroll Bar")
                                 )
                         }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            configurationReview: .json("terminal.passiveSSHEnhancement"),
+                            String(localized: "settings.terminal.sshPassiveEnhancement", defaultValue: "Detect SSH Sessions"),
+                            subtitle: String(localized: "settings.terminal.sshPassiveEnhancement.subtitle", defaultValue: "When a terminal runs ssh, cmux can attach remote browser and file-transfer support without changing the SSH shell.")
+                        ) {
+                            Toggle("", isOn: $sshPassiveEnhancement)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityIdentifier("SettingsSSHPassiveEnhancementToggle")
+                                .accessibilityLabel(
+                                    String(localized: "settings.terminal.sshPassiveEnhancement", defaultValue: "Detect SSH Sessions")
+                                )
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            configurationReview: .json("terminal.upgradeInteractiveSSHCommands"),
+                            String(localized: "settings.terminal.sshUpgradeInteractiveCommands", defaultValue: "Upgrade Interactive SSH Commands"),
+                            subtitle: String(localized: "settings.terminal.sshUpgradeInteractiveCommands.subtitle", defaultValue: "When enabled, simple interactive ssh commands can become recoverable remote sessions before OpenSSH starts.")
+                        ) {
+                            Toggle("", isOn: $sshUpgradeInteractiveCommands)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityIdentifier("SettingsSSHUpgradeInteractiveCommandsToggle")
+                                .accessibilityLabel(
+                                    String(localized: "settings.terminal.sshUpgradeInteractiveCommands", defaultValue: "Upgrade Interactive SSH Commands")
+                                )
+                        }
+
+                        SettingsCardDivider()
+
+                        sshRegisteredHostsSettings
                     }
 
                     SettingsSectionHeader(title: String(localized: "settings.section.workspaceColors", defaultValue: "Workspace Colors"))
@@ -6647,6 +6731,11 @@ struct SettingsView: View {
         if previousShowTerminalScrollBar != showTerminalScrollBar {
             TerminalScrollBarSettings.notifyDidChange()
         }
+        sshPassiveEnhancement = SSHAutoRemoteSettings.defaultPassiveEnhancement
+        sshUpgradeInteractiveCommands = SSHAutoRemoteSettings.defaultUpgradeInteractiveCommands
+        sshHostPreparationStore.clearRegisteredHosts()
+        sshHostDraft = ""
+        sshConfigHostAliases = []
         workspaceAutoReorder = WorkspaceAutoReorderSettings.defaultValue
         sidebarHideAllDetails = SidebarWorkspaceDetailSettings.defaultHideAllDetails
         sidebarShowNotificationMessage = SidebarWorkspaceDetailSettings.defaultShowNotificationMessage
@@ -6755,6 +6844,223 @@ private struct SettingsTitleLeadingInsetReader: NSViewRepresentable {
                 inset = nextInset
             }
         }
+    }
+}
+
+private struct SettingsSSHRegisteredHostsView: View {
+    @ObservedObject var store: SSHHostPreparationStore
+    @Binding var hostDraft: String
+    let configHostAliases: [String]
+    let onReloadConfigHosts: () -> Void
+
+    private var trimmedDraft: String {
+        SSHRegisteredHostSettings.normalizeHost(hostDraft)
+    }
+
+    private var filteredConfigHostAliases: [String] {
+        let registered = Set(store.registeredHosts.map { $0.host.lowercased() })
+        return configHostAliases.filter { !registered.contains($0.lowercased()) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(String(localized: "settings.terminal.sshRegisteredHosts", defaultValue: "Registered SSH Hosts"))
+                        .font(.system(size: 13, weight: .medium))
+                    Text(String(localized: "settings.terminal.sshRegisteredHosts.subtitle", defaultValue: "Prewarm remote daemons for hosts you use often. A host only becomes an SSH session after you run ssh yourself."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                Button(String(localized: "settings.terminal.sshRegisteredHosts.reloadConfig", defaultValue: "Reload Config")) {
+                    onReloadConfigHosts()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("SettingsSSHHostRefreshButton")
+            }
+
+            HStack(spacing: 8) {
+                TextField(
+                    String(localized: "settings.terminal.sshRegisteredHosts.hostPlaceholder", defaultValue: "SSH host"),
+                    text: $hostDraft
+                )
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(addDraftHost)
+                .accessibilityIdentifier("SettingsSSHHostField")
+
+                Button(String(localized: "settings.terminal.sshRegisteredHosts.add", defaultValue: "Add")) {
+                    addDraftHost()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(trimmedDraft.isEmpty)
+                .accessibilityIdentifier("SettingsSSHHostAddButton")
+
+                Menu(String(localized: "settings.terminal.sshRegisteredHosts.fromConfig", defaultValue: "From Config")) {
+                    if filteredConfigHostAliases.isEmpty {
+                        Text(String(localized: "settings.terminal.sshRegisteredHosts.noConfigHosts", defaultValue: "No explicit hosts found"))
+                    } else {
+                        ForEach(filteredConfigHostAliases, id: \.self) { alias in
+                            Button(alias) {
+                                store.addHost(alias)
+                            }
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .controlSize(.small)
+                .accessibilityIdentifier("SettingsSSHHostConfigMenu")
+            }
+
+            if store.registeredHosts.isEmpty {
+                Text(String(localized: "settings.terminal.sshRegisteredHosts.empty", defaultValue: "No hosts registered yet. Add one manually or choose an alias from ~/.ssh/config."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 2)
+                    .accessibilityIdentifier("SettingsSSHHostEmptyState")
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(store.registeredHosts) { host in
+                        SettingsSSHRegisteredHostRow(
+                            host: host,
+                            status: store.status(for: host.host),
+                            autoPrepare: Binding(
+                                get: { host.autoPrepare },
+                                set: { store.setAutoPrepare(host: host.host, enabled: $0) }
+                            ),
+                            prepare: { store.prepare(host: host.host) },
+                            remove: { store.removeHost(host.host) }
+                        )
+                        if host.id != store.registeredHosts.last?.id {
+                            Divider()
+                                .opacity(0.35)
+                        }
+                    }
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color(nsColor: NSColor.controlBackgroundColor).opacity(0.28))
+                )
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    private func addDraftHost() {
+        let host = trimmedDraft
+        guard !host.isEmpty else { return }
+        store.addHost(host)
+        hostDraft = ""
+    }
+}
+
+private struct SettingsSSHRegisteredHostRow: View {
+    let host: RegisteredSSHHost
+    let status: SSHHostPreparationStatus?
+    @Binding var autoPrepare: Bool
+    let prepare: () -> Void
+    let remove: () -> Void
+
+    private var accessibilitySuffix: String {
+        host.host.map { character in
+            character.isLetter || character.isNumber ? String(character) : "-"
+        }.joined()
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(host.host)
+                        .font(.system(size: 12.5, weight: .medium, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    SettingsSSHStatusPill(status: status)
+                        .accessibilityIdentifier("SettingsSSHHostStatus.\(accessibilitySuffix)")
+                }
+                if let detail = status?.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Toggle(String(localized: "settings.terminal.sshRegisteredHosts.autoPrepare", defaultValue: "Auto-prepare"), isOn: $autoPrepare)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .fixedSize()
+                .accessibilityIdentifier("SettingsSSHHostAutoPrepareToggle.\(accessibilitySuffix)")
+
+            Button(status?.state == .error ? String(localized: "settings.terminal.sshRegisteredHosts.retry", defaultValue: "Retry") : String(localized: "settings.terminal.sshRegisteredHosts.prepare", defaultValue: "Prepare")) {
+                prepare()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(status?.state == .bootstrapping)
+            .accessibilityIdentifier("SettingsSSHHostPrepareButton.\(accessibilitySuffix)")
+
+            Button(String(localized: "settings.terminal.sshRegisteredHosts.remove", defaultValue: "Remove")) {
+                remove()
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("SettingsSSHHostRemoveButton.\(accessibilitySuffix)")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct SettingsSSHStatusPill: View {
+    let status: SSHHostPreparationStatus?
+
+    private var title: String {
+        switch status?.state {
+        case .ready:
+            return String(localized: "settings.terminal.sshRegisteredHosts.status.ready", defaultValue: "Ready")
+        case .bootstrapping:
+            return String(localized: "settings.terminal.sshRegisteredHosts.status.preparing", defaultValue: "Preparing")
+        case .error:
+            return String(localized: "settings.terminal.sshRegisteredHosts.status.failed", defaultValue: "Failed")
+        case .unavailable, .none:
+            return String(localized: "settings.terminal.sshRegisteredHosts.status.idle", defaultValue: "Idle")
+        }
+    }
+
+    private var tint: Color {
+        switch status?.state {
+        case .ready:
+            return .green
+        case .bootstrapping:
+            return .blue
+        case .error:
+            return .red
+        case .unavailable, .none:
+            return .secondary
+        }
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 10.5, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(tint.opacity(0.12))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(tint.opacity(0.28), lineWidth: 1)
+            )
     }
 }
 

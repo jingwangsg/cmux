@@ -344,6 +344,17 @@ extension TerminalSurface {
     @MainActor
     func resolvedImageTransferTarget() -> TerminalImageTransferTarget {
         guard let workspace = owningWorkspace() else { return .local }
+        if let attachment = workspace.remoteAttachment(for: id) {
+            switch attachment {
+            case .managedRemote:
+                return .remote(.workspaceRemote)
+            case .detectedSSH:
+                if let ttyName = workspace.surfaceTTYNames[id],
+                   let session = TerminalSSHSessionDetector.detect(forTTY: ttyName) {
+                    return .remote(.detectedSSH(session))
+                }
+            }
+        }
         if workspace.isRemoteTerminalSurface(id) {
             return .remote(.workspaceRemote)
         }

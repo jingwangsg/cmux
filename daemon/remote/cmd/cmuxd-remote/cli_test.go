@@ -43,6 +43,28 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(output)
 }
 
+func withStdin(t *testing.T, input string, fn func()) {
+	t.Helper()
+	original := os.Stdin
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stdin: %v", err)
+	}
+	if _, err := writer.WriteString(input); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stdin writer: %v", err)
+	}
+	os.Stdin = reader
+	defer func() {
+		os.Stdin = original
+		_ = reader.Close()
+	}()
+
+	fn()
+}
+
 func makeShortUnixSocketPath(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "cmuxd-")
@@ -51,6 +73,37 @@ func makeShortUnixSocketPath(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "cmux.sock")
+}
+
+func startMockSocketWithCapture(t *testing.T, response string) (string, <-chan string) {
+	t.Helper()
+	sockPath := makeShortUnixSocketPath(t)
+	received := make(chan string, 16)
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				line, err := bufio.NewReader(conn).ReadString('\n')
+				if err == nil || line != "" {
+					received <- strings.TrimRight(line, "\r\n")
+				}
+				_, _ = conn.Write([]byte(response + "\n"))
+			}(conn)
+		}
+	}()
+
+	return sockPath, received
 }
 
 // startMockSocket creates a Unix socket that accepts one connection,
@@ -557,6 +610,89 @@ func TestCLINotifyDefaultOutputPrintsOKForEmptyResult(t *testing.T) {
 	})
 	if strings.TrimSpace(output) != "OK" {
 		t.Fatalf("expected empty-result command to print OK, got %q", output)
+	}
+}
+
+func TestCLICodexHookPromptSubmitRelaysStatus(t *testing.T) {
+	sockPath, received := startMockSocketWithCapture(t, "OK")
+	t.Setenv("CMUX_WORKSPACE_ID", "11111111-1111-1111-1111-111111111111")
+	t.Setenv("CMUX_SURFACE_ID", "22222222-2222-2222-2222-222222222222")
+
+	withStdin(t, `{"session_id":"codex-smoke","cwd":"/work/project"}`, func() {
+		output := captureStdout(t, func() {
+			code := runCLI([]string{"--socket", sockPath, "codex-hook", "prompt-submit"})
+			if code != 0 {
+				t.Fatalf("codex-hook prompt-submit should return 0, got %d", code)
+			}
+		})
+		if strings.TrimSpace(output) != "{}" {
+			t.Fatalf("expected codex hook to print {}, got %q", output)
+		}
+	})
+
+	first := <-received
+	second := <-received
+	if first != "clear_notifications --tab=11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("unexpected first hook relay command: %q", first)
+	}
+	wantStatus := "set_status codex Running --icon=bolt.fill --color=#4C8DFF --tab=11111111-1111-1111-1111-111111111111"
+	if second != wantStatus {
+		t.Fatalf("unexpected second hook relay command: %q", second)
+	}
+}
+
+func TestCLICodexHookStopRelaysTargetNotification(t *testing.T) {
+	sockPath, received := startMockSocketWithCapture(t, "OK")
+	t.Setenv("CMUX_WORKSPACE_ID", "11111111-1111-1111-1111-111111111111")
+	t.Setenv("CMUX_SURFACE_ID", "22222222-2222-2222-2222-222222222222")
+
+	input := `{"session_id":"codex-smoke","cwd":"/work/project","last_assistant_message":"codex hook smoke done"}`
+	withStdin(t, input, func() {
+		code := runCLI([]string{"--socket", sockPath, "codex-hook", "stop"})
+		if code != 0 {
+			t.Fatalf("codex-hook stop should return 0, got %d", code)
+		}
+	})
+
+	first := <-received
+	second := <-received
+	wantNotify := "notify_target 11111111-1111-1111-1111-111111111111 22222222-2222-2222-2222-222222222222 Codex|Completed in project|codex hook smoke done"
+	if first != wantNotify {
+		t.Fatalf("unexpected notification command: %q", first)
+	}
+	wantStatus := "set_status codex Idle --icon=pause.circle.fill --color=#8E8E93 --tab=11111111-1111-1111-1111-111111111111"
+	if second != wantStatus {
+		t.Fatalf("unexpected status command: %q", second)
+	}
+}
+
+func TestCLIClaudeHookNotificationRelaysTargetNotification(t *testing.T) {
+	sockPath, received := startMockSocketWithCapture(t, "OK")
+	t.Setenv("CMUX_WORKSPACE_ID", "11111111-1111-1111-1111-111111111111")
+	t.Setenv("CMUX_SURFACE_ID", "22222222-2222-2222-2222-222222222222")
+
+	input := `{"session_id":"claude-smoke","reason":"permission_prompt","message":"Approve shell command?"}`
+	withStdin(t, input, func() {
+		output := captureStdout(t, func() {
+			code := runCLI([]string{"--socket", sockPath, "claude-hook", "notification"})
+			if code != 0 {
+				t.Fatalf("claude-hook notification should return 0, got %d", code)
+			}
+		})
+		if strings.TrimSpace(output) != "OK" {
+			t.Fatalf("expected claude hook to print OK, got %q", output)
+		}
+	})
+
+	first := <-received
+	second := <-received
+	wantNotify := "notify_target 11111111-1111-1111-1111-111111111111 22222222-2222-2222-2222-222222222222 Claude Code|Permission|Approve shell command?"
+	if first != wantNotify {
+		t.Fatalf("unexpected notification command: %q", first)
+	}
+	wantStatus := "set_status claude_code Needs input --icon=bell.fill --color=#4C8DFF --tab=11111111-1111-1111-1111-111111111111"
+	if second != wantStatus {
+		t.Fatalf("unexpected status command: %q", second)
 	}
 }
 

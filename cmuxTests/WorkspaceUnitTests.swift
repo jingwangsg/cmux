@@ -830,6 +830,147 @@ final class KeyboardShortcutSettingsFileStoreTests: XCTestCase {
         XCTAssertTrue(contents.contains(#"//   "shortcuts" : {"#))
     }
 
+    func testSSHAutoRemoteSettingsDefaults() {
+        let suiteName = "SSHAutoRemoteSettings.Defaults.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.removeObject(forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+        defaults.removeObject(forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+
+        XCTAssertTrue(SSHAutoRemoteSettings.passiveEnhancementEnabled(defaults: defaults))
+        XCTAssertTrue(SSHAutoRemoteSettings.upgradeInteractiveCommandsEnabled(defaults: defaults))
+    }
+
+    func testRegisteredSSHHostsPersistAndFilterAutoPrepareHosts() throws {
+        let suiteName = "RegisteredSSHHosts.Persistence.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let hosts = [
+            RegisteredSSHHost(host: "osmo_9000", autoPrepare: true),
+            RegisteredSSHHost(host: "staging-box", autoPrepare: false),
+        ]
+        SSHRegisteredHostSettings.save(hosts, defaults: defaults)
+
+        XCTAssertEqual(SSHRegisteredHostSettings.load(defaults: defaults), hosts)
+        XCTAssertEqual(SSHRegisteredHostSettings.autoPrepareHosts(defaults: defaults).map(\.host), ["osmo_9000"])
+    }
+
+    func testSSHConfigHostScannerExtractsExplicitAliases() {
+        let config = """
+        Host *
+          ServerAliveInterval 20
+
+        Host osmo_9000 ray-cluster
+          HostName 192.168.0.101
+
+        Host *.internal ignored? literal-host
+          User deploy
+        """
+
+        XCTAssertEqual(
+            SSHConfigHostScanner.hostAliases(from: config),
+            ["literal-host", "osmo_9000", "ray-cluster"]
+        )
+    }
+
+    @MainActor
+    func testAutoPrepareRegisteredHostPublishesReadyStatusWithoutCreatingSSHSession() throws {
+        let suiteName = "RegisteredSSHHosts.AutoPrepare.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        SSHRegisteredHostSettings.save(
+            [RegisteredSSHHost(host: "osmo_9000", autoPrepare: true)],
+            defaults: defaults
+        )
+
+        let ready = expectation(description: "host becomes ready")
+        WorkspaceRemoteSessionController.startOverrideForTesting = { configuration, mode in
+            XCTAssertEqual(configuration.destination, "osmo_9000")
+            XCTAssertEqual(mode, .prewarm(host: "osmo_9000"))
+            return WorkspaceRemoteDaemonStatus(
+                state: .ready,
+                detail: "Remote daemon ready",
+                version: "test-version",
+                remotePath: ".cmux/bin/cmuxd-remote/test/linux-amd64/cmuxd-remote"
+            )
+        }
+        defer { WorkspaceRemoteSessionController.startOverrideForTesting = nil }
+
+        let store = SSHHostPreparationStore(defaults: defaults)
+        store.onStatusChangeForTesting = { host, status in
+            if host == "osmo_9000", status.state == .ready {
+                ready.fulfill()
+            }
+        }
+
+        store.prepareAutoRegisteredHostsOnAppLaunch()
+        wait(for: [ready], timeout: 1.0)
+
+        let status = try XCTUnwrap(store.status(for: "osmo_9000"))
+        XCTAssertEqual(status.state, .ready)
+        XCTAssertEqual(status.version, "test-version")
+        XCTAssertEqual(store.registeredHosts.map(\.host), ["osmo_9000"])
+    }
+
+    func testSettingsFileStoreAppliesSSHAutoRemoteTerminalSettings() throws {
+        let defaults = UserDefaults.standard
+        let previousPassive = defaults.object(forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+        let previousUpgrade = defaults.object(forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+        let previousBackups = defaults.data(forKey: settingsFileBackupsDefaultsKey)
+        defer {
+            if let previousPassive {
+                defaults.set(previousPassive, forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+            } else {
+                defaults.removeObject(forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+            }
+            if let previousUpgrade {
+                defaults.set(previousUpgrade, forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+            } else {
+                defaults.removeObject(forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+            }
+            if let previousBackups {
+                defaults.set(previousBackups, forKey: settingsFileBackupsDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: settingsFileBackupsDefaultsKey)
+            }
+        }
+
+        defaults.removeObject(forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+        defaults.removeObject(forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+        defaults.removeObject(forKey: settingsFileBackupsDefaultsKey)
+
+        let directoryURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let settingsFileURL = directoryURL.appendingPathComponent("settings.json", isDirectory: false)
+        try writeSettingsFile(
+            """
+            {
+              "terminal": {
+                "passiveSSHEnhancement": false,
+                "upgradeInteractiveSSHCommands": true
+              }
+            }
+            """,
+            to: settingsFileURL
+        )
+
+        _ = KeyboardShortcutSettingsFileStore(
+            primaryPath: settingsFileURL.path,
+            fallbackPath: nil,
+            startWatching: false
+        )
+
+        XCTAssertFalse(SSHAutoRemoteSettings.passiveEnhancementEnabled(defaults: defaults))
+        XCTAssertTrue(SSHAutoRemoteSettings.upgradeInteractiveCommandsEnabled(defaults: defaults))
+    }
+
     func testBootstrapDoesNotCreatePrimaryWhenFallbackAlreadyExists() throws {
         let directoryURL = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directoryURL) }
@@ -2672,6 +2813,11 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
         }
 
         let previousOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        let defaults = UserDefaults.standard
+        let previousPassive = defaults.object(forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+        let previousUpgrade = defaults.object(forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+        defaults.set(true, forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+        defaults.set(true, forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
         Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
             switch request.mode {
             case .create:
@@ -2685,6 +2831,16 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
                 XCTAssertEqual(env["CMUX_WORKSPACE_ID"], workspace.id.uuidString)
                 XCTAssertEqual(env["CMUX_SOCKET_PATH"], SocketControlSettings.socketPath())
                 XCTAssertEqual(env["CMUX_SOCKET"], SocketControlSettings.socketPath())
+                XCTAssertEqual(env["CMUX_SSH_PASSIVE_ENHANCEMENT"], "1")
+                XCTAssertEqual(env["CMUX_SSH_UPGRADE_INTERACTIVE"], "1")
+                guard let shellIntegrationDir = env["CMUX_SHELL_INTEGRATION_DIR"] else {
+                    XCTFail("Expected CMUX_SHELL_INTEGRATION_DIR in managed daemon environment")
+                    return nil
+                }
+                XCTAssertTrue(
+                    (env["XDG_DATA_DIRS"] ?? "").split(separator: ":").contains(Substring(shellIntegrationDir)),
+                    env["XDG_DATA_DIRS"] ?? ""
+                )
                 XCTAssertEqual(env["CUSTOM_ENV"], "custom-value")
                 XCTAssertEqual(
                     env["TERM"],
@@ -2703,6 +2859,16 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
         }
         defer {
             Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousOverride
+            if let previousPassive {
+                defaults.set(previousPassive, forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+            } else {
+                defaults.removeObject(forKey: SSHAutoRemoteSettings.passiveEnhancementKey)
+            }
+            if let previousUpgrade {
+                defaults.set(previousUpgrade, forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+            } else {
+                defaults.removeObject(forKey: SSHAutoRemoteSettings.upgradeInteractiveCommandsKey)
+            }
         }
 
         guard workspace.newTerminalSurface(
@@ -3220,6 +3386,215 @@ final class WorkspaceSplitWorkingDirectoryTests: XCTestCase {
                 ["print", "gui/\(getuid())/\(registration.launchAgentLabel)"],
                 ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
                 ["kickstart", "-k", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+            ]
+        )
+    }
+
+    func testRestartLocalTerminalDaemonFromAppRecoversWhenBootstrapFindsMissedLoadedAgent() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-restart-bootstrap-loaded-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        let env = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-restart-bootstrap-loaded-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+        let registration = Workspace.localTerminalDaemonRegistrationForTesting(environment: env)
+
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+
+        var commands: [[String]] = []
+        var printCount = 0
+        var connectable = false
+
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return connectable
+        }
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            commands.append(arguments)
+            switch arguments.first {
+            case "print":
+                printCount += 1
+                return (status: printCount == 1 ? 1 : 0, stdout: Data(), stderr: Data())
+            case "bootstrap":
+                if commands.filter({ $0.first == "bootstrap" }).count == 1 {
+                    return (
+                        status: 5,
+                        stdout: Data(),
+                        stderr: Data("Bootstrap failed: 5: Input/output error\n".utf8)
+                    )
+                }
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "bootout":
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "kickstart":
+                connectable = true
+                return (status: 0, stdout: Data(), stderr: Data())
+            default:
+                return (status: 0, stdout: Data(), stderr: Data())
+            }
+        }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        let resolvedSocketPath = try Workspace.restartLocalTerminalDaemonFromApp(environment: env)
+
+        XCTAssertEqual(resolvedSocketPath, socketPath)
+        XCTAssertEqual(
+            commands,
+            [
+                ["print", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+                ["print", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["bootout", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+                ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+                ["kickstart", "-k", "gui/\(getuid())/\(registration.launchAgentLabel)"],
+            ]
+        )
+    }
+
+    func testRestartLocalTerminalDaemonFromAppReportsBootstrapFailureDetail() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-restart-bootstrap-detail-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        let env = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-restart-bootstrap-detail-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return false
+        }
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            switch arguments.first {
+            case "print":
+                return (status: 1, stdout: Data(), stderr: Data("service not loaded\n".utf8))
+            case "bootstrap":
+                return (
+                    status: 5,
+                    stdout: Data(),
+                    stderr: Data("Bootstrap failed: 5: Input/output error\n".utf8)
+                )
+            default:
+                return (status: 0, stdout: Data(), stderr: Data())
+            }
+        }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        XCTAssertThrowsError(try Workspace.restartLocalTerminalDaemonFromApp(environment: env)) { error in
+            let description = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            XCTAssertTrue(
+                description.contains("launchctl bootstrap failed: Bootstrap failed: 5: Input/output error"),
+                "Expected launchctl stderr detail, got: \(description)"
+            )
+        }
+    }
+
+    func testRestartLocalTerminalDaemonFromAppTreatsPrintedLaunchAgentRecordAsLoaded() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-local-daemon-restart-print-output-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let socketPath = temporaryRoot.appendingPathComponent("locald.sock").path
+        let authTokenFilePath = temporaryRoot.appendingPathComponent("locald.auth").path
+        let plistPath = temporaryRoot.appendingPathComponent("locald.plist").path
+        let cliPath = try makeExecutableFile(named: "cmux", in: temporaryRoot)
+        let env = [
+            "CMUX_LOCAL_DAEMON_ALLOW_TESTING": "1",
+            "CMUX_LOCAL_DAEMON_INSTANCE": "phase1-restart-print-output-test",
+            "CMUX_LOCAL_DAEMON_SOCKET_PATH": socketPath,
+            "CMUX_LOCAL_DAEMON_AUTH_TOKEN_FILE": authTokenFilePath,
+            "CMUX_LOCAL_DAEMON_LAUNCH_AGENT_PATH": plistPath,
+        ]
+        let registration = Workspace.localTerminalDaemonRegistrationForTesting(environment: env)
+        let launchctlTarget = "gui/\(getuid())/\(registration.launchAgentLabel)"
+
+        let previousCLIOverride = Workspace.localTerminalBundledCLIPathOverrideForTesting
+        let previousConnectivityOverride = Workspace.localTerminalSocketConnectivityOverrideForTesting
+        let previousLaunchctlOverride = Workspace.localTerminalLaunchctlResultOverrideForTesting
+
+        var commands: [[String]] = []
+        var connectable = false
+
+        Workspace.localTerminalBundledCLIPathOverrideForTesting = { cliPath }
+        Workspace.localTerminalSocketConnectivityOverrideForTesting = { path in
+            XCTAssertEqual(path, socketPath)
+            return connectable
+        }
+        Workspace.localTerminalLaunchctlResultOverrideForTesting = { arguments in
+            commands.append(arguments)
+            switch arguments.first {
+            case "print":
+                let stdout = """
+                \(launchctlTarget) = {
+                \tactive count = 1
+                \ttype = LaunchAgent
+                \tstate = running
+                }
+                """
+                return (status: 15, stdout: Data(stdout.utf8), stderr: Data())
+            case "bootout":
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "bootstrap":
+                return (status: 0, stdout: Data(), stderr: Data())
+            case "kickstart":
+                connectable = true
+                return (status: 0, stdout: Data(), stderr: Data())
+            default:
+                return (status: 0, stdout: Data(), stderr: Data())
+            }
+        }
+        defer {
+            Workspace.localTerminalBundledCLIPathOverrideForTesting = previousCLIOverride
+            Workspace.localTerminalSocketConnectivityOverrideForTesting = previousConnectivityOverride
+            Workspace.localTerminalLaunchctlResultOverrideForTesting = previousLaunchctlOverride
+        }
+
+        let resolvedSocketPath = try Workspace.restartLocalTerminalDaemonFromApp(environment: env)
+
+        XCTAssertEqual(resolvedSocketPath, socketPath)
+        XCTAssertEqual(
+            commands,
+            [
+                ["print", launchctlTarget],
+                ["bootout", launchctlTarget],
+                ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+                ["kickstart", "-k", launchctlTarget],
             ]
         )
     }

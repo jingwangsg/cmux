@@ -39,6 +39,19 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
             )
         }
 
+        let stdoutDone = DispatchSemaphore(value: 0)
+        let stderrDone = DispatchSemaphore(value: 0)
+        var stdoutData = Data()
+        var stderrData = Data()
+        DispatchQueue.global(qos: .userInitiated).async {
+            stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            stdoutDone.signal()
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            stderrDone.signal()
+        }
+
         let exitSignal = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .userInitiated).async {
             process.waitUntilExit()
@@ -51,8 +64,10 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
             _ = exitSignal.wait(timeout: .now() + 1)
         }
 
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        _ = stdoutDone.wait(timeout: .now() + 1)
+        _ = stderrDone.wait(timeout: .now() + 1)
+        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderr = String(data: stderrData, encoding: .utf8) ?? ""
         return ProcessRunResult(
             status: process.terminationStatus,
             stdout: stdout,
@@ -1133,6 +1148,34 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
     }
 
     @MainActor
+    func testNewTerminalInManagedRemoteWorkspaceStaysLocalUntilUserRunsSSH() throws {
+        let workspace = Workspace()
+        let config = WorkspaceRemoteConfiguration(
+            destination: "cmux-macmini",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: 64008,
+            relayID: String(repeating: "a", count: 16),
+            relayToken: String(repeating: "b", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh cmux-macmini"
+        )
+
+        workspace.configureRemoteConnection(config, autoConnect: false)
+
+        let existingPanelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(existingPanelId))
+
+        let paneId = try XCTUnwrap(workspace.bonsplitController.focusedPaneId)
+        let newTerminal = try XCTUnwrap(workspace.newTerminalSurface(inPane: paneId, focus: true))
+        XCTAssertNil(newTerminal.surface.debugInitialCommand())
+        XCTAssertFalse(workspace.isRemoteTerminalSurface(newTerminal.id))
+        XCTAssertNil(workspace.remoteAttachmentPayload(for: newTerminal.id))
+    }
+
+    @MainActor
     func testForegroundSSHAuthReadyBeforeRemoteConfigureStartsDeferredConnect() {
         let workspace = Workspace()
         let config = WorkspaceRemoteConfiguration(
@@ -1865,6 +1908,584 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
         )
     }
 
+    func testSSHCommandParserClassifiesPlainInteractiveSSHForUpgrade() throws {
+        let parsed = try XCTUnwrap(SSHCommandParser.parse(arguments: [
+            "ssh",
+            "-p", "2222",
+            "-i", "~/.ssh/id_ed25519",
+            "devbox",
+        ]))
+
+        XCTAssertEqual(parsed.destination, "devbox")
+        XCTAssertEqual(parsed.port, 2222)
+        XCTAssertEqual(parsed.identityFile, "~/.ssh/id_ed25519")
+        XCTAssertTrue(parsed.isPlainInteractive)
+        XCTAssertTrue(parsed.isEligibleForAutoUpgrade)
+    }
+
+    func testSSHCommandParserRejectsRemoteCommandsForUpgrade() throws {
+        let parsed = try XCTUnwrap(SSHCommandParser.parse(arguments: [
+            "ssh",
+            "devbox",
+            "uname",
+            "-a",
+        ]))
+
+        XCTAssertEqual(parsed.destination, "devbox")
+        XCTAssertEqual(parsed.remoteCommandArguments, ["uname", "-a"])
+        XCTAssertFalse(parsed.isPlainInteractive)
+        XCTAssertFalse(parsed.isEligibleForAutoUpgrade)
+    }
+
+    func testSSHCommandParserRejectsForwardingAndStdioModesForUpgrade() throws {
+        for args in [
+            ["ssh", "-N", "devbox"],
+            ["ssh", "-T", "devbox"],
+            ["ssh", "-L", "8080:localhost:80", "devbox"],
+            ["ssh", "-R", "9000:localhost:9000", "devbox"],
+            ["ssh", "-D", "1080", "devbox"],
+            ["ssh", "-W", "localhost:22", "jumpbox"],
+            ["ssh", "-o", "RemoteCommand=uname -a", "devbox"],
+            ["ssh", "-o", "SessionType=none", "devbox"],
+        ] {
+            let parsed = try XCTUnwrap(SSHCommandParser.parse(arguments: args), "args=\(args)")
+            XCTAssertFalse(parsed.isEligibleForAutoUpgrade, "args=\(args)")
+        }
+    }
+
+    func testTerminalSSHSessionDetectorUsesSharedParser() {
+        let session = TerminalSSHSessionDetector.detectForTesting(
+            ttyName: "ttys010",
+            processes: [
+                .init(pid: 200, pgid: 200, tpgid: 200, tty: "ttys010", executableName: "ssh"),
+            ],
+            argumentsByPID: [
+                200: [
+                    "/usr/bin/ssh",
+                    "-J", "jump",
+                    "-o", "ControlPath=/tmp/cmux-%C",
+                    "devbox",
+                ],
+            ]
+        )
+
+        XCTAssertEqual(session?.destination, "devbox")
+        XCTAssertEqual(session?.jumpHost, "jump")
+        XCTAssertEqual(session?.controlPath, "/tmp/cmux-%C")
+    }
+
+    func testDetectedSSHAttachmentPayloadIsNotRecoverable() throws {
+        let attachment = TerminalRemoteAttachment.detectedSSH(.init(
+            destination: "devbox",
+            displayTarget: "devbox",
+            port: 2222,
+            identityFile: "/Users/me/.ssh/id",
+            sshOptions: ["ProxyJump=jump"],
+            transportKey: "ssh:devbox:2222",
+            daemonState: .unavailable
+        ))
+
+        let payload = attachment.payload()
+        XCTAssertEqual(payload["kind"] as? String, "detected_ssh")
+        XCTAssertEqual(payload["destination"] as? String, "devbox")
+        XCTAssertEqual(payload["display_target"] as? String, "devbox")
+        XCTAssertEqual(payload["port"] as? Int, 2222)
+        XCTAssertEqual(payload["recoverable"] as? Bool, false)
+    }
+
+    @MainActor
+    func testWorkspaceStoresSurfaceRemoteAttachment() throws {
+        let workspace = Workspace()
+        let panelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+
+        workspace.setRemoteAttachment(
+            .detectedSSH(.init(
+                destination: "devbox",
+                displayTarget: "devbox",
+                port: nil,
+                identityFile: nil,
+                sshOptions: [],
+                transportKey: "ssh:devbox",
+                daemonState: .unavailable
+            )),
+            for: panelId
+        )
+
+        let payload = try XCTUnwrap(workspace.remoteAttachmentPayload(for: panelId))
+        XCTAssertEqual(payload["kind"] as? String, "detected_ssh")
+        XCTAssertEqual(payload["recoverable"] as? Bool, false)
+    }
+
+    @MainActor
+    func testWorkspaceUpdatesDetectedSSHAttachmentFromSurfaceTTY() throws {
+        let workspace = Workspace()
+        let panelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        workspace.surfaceTTYNames[panelId] = "ttys123"
+
+        TerminalSSHSessionDetector.detectOverrideForTesting = { ttyName in
+            XCTAssertEqual(ttyName, "ttys123")
+            return DetectedSSHSession(
+                destination: "devbox",
+                port: 2222,
+                identityFile: nil,
+                configFile: nil,
+                jumpHost: nil,
+                controlPath: nil,
+                useIPv4: false,
+                useIPv6: false,
+                forwardAgent: false,
+                compressionEnabled: false,
+                sshOptions: []
+            )
+        }
+        defer { TerminalSSHSessionDetector.detectOverrideForTesting = nil }
+
+        workspace.refreshDetectedSSHAttachmentNow(panelId: panelId, reason: "test")
+
+        let payload = try XCTUnwrap(workspace.remoteAttachmentPayload(for: panelId))
+        XCTAssertEqual(payload["kind"] as? String, "detected_ssh")
+        XCTAssertEqual(payload["destination"] as? String, "devbox")
+        XCTAssertEqual(payload["port"] as? Int, 2222)
+        XCTAssertEqual(payload["recoverable"] as? Bool, false)
+    }
+
+    @MainActor
+    func testPassiveSSHDetectionPreservesExplicitSSHExecUpgradeAttachment() throws {
+        let workspace = Workspace()
+        let panelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        workspace.surfaceTTYNames[panelId] = "ttys123"
+        let upgradedTransportKey = "\(Workspace.sshExecUpgradeTransportKeyPrefix)relay-1"
+
+        workspace.setRemoteAttachment(
+            .detectedSSH(.init(
+                destination: "devbox",
+                displayTarget: "devbox",
+                port: 2222,
+                identityFile: nil,
+                sshOptions: [],
+                transportKey: upgradedTransportKey,
+                daemonState: .ready(version: "test", remotePath: ".cmux/bin/cmuxd-remote/test/linux-amd64/cmuxd-remote")
+            )),
+            for: panelId
+        )
+
+        TerminalSSHSessionDetector.detectOverrideForTesting = { ttyName in
+            XCTAssertEqual(ttyName, "ttys123")
+            return DetectedSSHSession(
+                destination: "devbox",
+                port: 2222,
+                identityFile: nil,
+                configFile: nil,
+                jumpHost: nil,
+                controlPath: "/tmp/cmux-ssh-%C",
+                useIPv4: false,
+                useIPv6: false,
+                forwardAgent: false,
+                compressionEnabled: false,
+                sshOptions: ["ControlMaster=auto", "ControlPersist=600"]
+            )
+        }
+        defer { TerminalSSHSessionDetector.detectOverrideForTesting = nil }
+
+        workspace.refreshDetectedSSHAttachmentNow(panelId: panelId, reason: "test")
+
+        let payload = try XCTUnwrap(workspace.remoteAttachmentPayload(for: panelId))
+        XCTAssertEqual(payload["kind"] as? String, "detected_ssh")
+        XCTAssertEqual(payload["transport_key"] as? String, upgradedTransportKey)
+        XCTAssertEqual(payload["destination"] as? String, "devbox")
+        XCTAssertEqual(payload["port"] as? Int, 2222)
+    }
+
+    @MainActor
+    func testPassiveSSHDetectionDoesNotClearExplicitSSHExecUpgradeAttachmentOnTransientMiss() throws {
+        let workspace = Workspace()
+        let panelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        workspace.surfaceTTYNames[panelId] = "ttys123"
+        let upgradedTransportKey = "\(Workspace.sshExecUpgradeTransportKeyPrefix)relay-1"
+
+        workspace.setRemoteAttachment(
+            .detectedSSH(.init(
+                destination: "devbox",
+                displayTarget: "devbox",
+                port: 2222,
+                identityFile: nil,
+                sshOptions: [],
+                transportKey: upgradedTransportKey,
+                daemonState: .ready(version: "test", remotePath: ".cmux/bin/cmuxd-remote/test/linux-amd64/cmuxd-remote")
+            )),
+            for: panelId
+        )
+
+        TerminalSSHSessionDetector.detectOverrideForTesting = { ttyName in
+            XCTAssertEqual(ttyName, "ttys123")
+            return nil
+        }
+        defer { TerminalSSHSessionDetector.detectOverrideForTesting = nil }
+
+        workspace.refreshDetectedSSHAttachmentNow(panelId: panelId, reason: "test")
+
+        let payload = try XCTUnwrap(workspace.remoteAttachmentPayload(for: panelId))
+        XCTAssertEqual(payload["kind"] as? String, "detected_ssh")
+        XCTAssertEqual(payload["transport_key"] as? String, upgradedTransportKey)
+        XCTAssertEqual(payload["destination"] as? String, "devbox")
+        XCTAssertEqual(payload["port"] as? Int, 2222)
+    }
+
+    @MainActor
+    func testSessionRestoreRestartsExplicitSSHExecRelayAttachment() throws {
+        let workspace = Workspace()
+        let panelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        let transportKey = "\(Workspace.sshExecUpgradeTransportKeyPrefix)relay-restore"
+        let relayConfiguration = WorkspaceRemoteConfiguration(
+            destination: "devbox",
+            port: 2222,
+            identityFile: "/Users/test/.ssh/id_ed25519",
+            sshOptions: ["ControlMaster=auto", "ControlPersist=600"],
+            localProxyPort: nil,
+            relayPort: 59372,
+            localRelayPort: 60705,
+            relayID: "relay-restore",
+            relayToken: String(repeating: "a", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh devbox"
+        )
+        let session = DetectedSSHSession(
+            destination: "devbox",
+            port: 2222,
+            identityFile: "/Users/test/.ssh/id_ed25519",
+            configFile: nil,
+            jumpHost: nil,
+            controlPath: nil,
+            useIPv4: false,
+            useIPv6: false,
+            forwardAgent: false,
+            compressionEnabled: false,
+            sshOptions: relayConfiguration.sshOptions
+        )
+
+        var starts: [(WorkspaceRemoteConfiguration, WorkspaceRemoteSessionControllerMode)] = []
+        WorkspaceRemoteSessionController.startOverrideForTesting = { configuration, mode in
+            starts.append((configuration, mode))
+            return WorkspaceRemoteDaemonStatus(
+                state: .ready,
+                detail: "Remote daemon ready",
+                version: "test",
+                remotePath: ".cmux/bin/cmuxd-remote/test/linux-amd64/cmuxd-remote"
+            )
+        }
+        defer { WorkspaceRemoteSessionController.startOverrideForTesting = nil }
+
+        workspace.setRemoteAttachment(
+            .detectedSSH(.init(
+                destination: "devbox",
+                displayTarget: "devbox:2222",
+                port: 2222,
+                identityFile: "/Users/test/.ssh/id_ed25519",
+                sshOptions: relayConfiguration.sshOptions,
+                transportKey: transportKey,
+                daemonState: .ready(version: "test", remotePath: ".cmux/bin/cmuxd-remote/test/linux-amd64/cmuxd-remote")
+            )),
+            for: panelId
+        )
+        workspace.startDetectedSSHRemoteSupportIfNeeded(
+            session: session,
+            panelId: panelId,
+            transportKey: transportKey,
+            relayConfiguration: relayConfiguration,
+            allowPreparedAdoption: false
+        )
+
+        let snapshot = workspace.sessionSnapshot(includeScrollback: false)
+        let panelSnapshot = try XCTUnwrap(snapshot.panels.first { $0.id == panelId })
+        XCTAssertEqual(panelSnapshot.remoteAttachment?.transportKey, transportKey)
+        XCTAssertEqual(panelSnapshot.remoteAttachment?.relayConfiguration?.relayPort, 59372)
+        XCTAssertEqual(panelSnapshot.remoteAttachment?.relayConfiguration?.localRelayPort, 60705)
+
+        starts.removeAll()
+        let restored = Workspace()
+        restored.restoreSessionSnapshot(snapshot)
+
+        let restoredPanelId = try XCTUnwrap(restored.focusedTerminalPanel?.id)
+        let restoredPayload = try XCTUnwrap(restored.remoteAttachmentPayload(for: restoredPanelId))
+        XCTAssertEqual(restoredPayload["transport_key"] as? String, transportKey)
+        XCTAssertEqual(starts.count, 1)
+        XCTAssertEqual(starts[0].0.destination, "devbox")
+        XCTAssertEqual(starts[0].0.relayPort, 59372)
+        XCTAssertEqual(starts[0].0.localRelayPort, 60705)
+        XCTAssertEqual(
+            starts[0].1,
+            .surfaceAttachment(transportKey: transportKey, sourcePanelId: restoredPanelId)
+        )
+    }
+
+    @MainActor
+    func testSessionAutosaveFingerprintChangesForExplicitSSHExecRelayAttachment() throws {
+        let manager = TabManager()
+        let workspace = try XCTUnwrap(manager.selectedWorkspace)
+        let panelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        let beforeFingerprint = manager.sessionAutosaveFingerprint()
+        let transportKey = "\(Workspace.sshExecUpgradeTransportKeyPrefix)relay-autosave"
+        let relayConfiguration = WorkspaceRemoteConfiguration(
+            destination: "devbox",
+            port: nil,
+            identityFile: nil,
+            sshOptions: ["ControlMaster=auto", "ControlPersist=600"],
+            localProxyPort: nil,
+            relayPort: 55935,
+            localRelayPort: 60707,
+            relayID: "relay-autosave",
+            relayToken: String(repeating: "b", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh devbox"
+        )
+        let session = DetectedSSHSession(
+            destination: "devbox",
+            port: nil,
+            identityFile: nil,
+            configFile: nil,
+            jumpHost: nil,
+            controlPath: nil,
+            useIPv4: false,
+            useIPv6: false,
+            forwardAgent: false,
+            compressionEnabled: false,
+            sshOptions: relayConfiguration.sshOptions
+        )
+
+        WorkspaceRemoteSessionController.startOverrideForTesting = { _, _ in
+            WorkspaceRemoteDaemonStatus(
+                state: .ready,
+                detail: "Remote daemon ready",
+                version: "test",
+                remotePath: ".cmux/bin/cmuxd-remote/test/linux-amd64/cmuxd-remote"
+            )
+        }
+        defer { WorkspaceRemoteSessionController.startOverrideForTesting = nil }
+
+        workspace.setRemoteAttachment(
+            .detectedSSH(.init(
+                destination: "devbox",
+                displayTarget: "devbox",
+                port: nil,
+                identityFile: nil,
+                sshOptions: relayConfiguration.sshOptions,
+                transportKey: transportKey,
+                daemonState: .bootstrapping(detail: "Bootstrapping remote daemon on devbox")
+            )),
+            for: panelId
+        )
+        workspace.startDetectedSSHRemoteSupportIfNeeded(
+            session: session,
+            panelId: panelId,
+            transportKey: transportKey,
+            relayConfiguration: relayConfiguration,
+            allowPreparedAdoption: false
+        )
+
+        XCTAssertNotEqual(manager.sessionAutosaveFingerprint(), beforeFingerprint)
+
+        let snapshot = manager.sessionSnapshot(includeScrollback: false)
+        let panelSnapshot = try XCTUnwrap(snapshot.workspaces.first?.panels.first { $0.id == panelId })
+        XCTAssertEqual(panelSnapshot.remoteAttachment?.transportKey, transportKey)
+        XCTAssertEqual(panelSnapshot.remoteAttachment?.relayConfiguration?.relayPort, 55935)
+        XCTAssertEqual(panelSnapshot.remoteAttachment?.relayConfiguration?.localRelayPort, 60707)
+    }
+
+    @MainActor
+    func testDetectedSSHAttachmentStartsRemoteSupportWithoutMarkingWorkspaceRemote() throws {
+        let workspace = Workspace()
+        let panelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+
+        var startedConfiguration: WorkspaceRemoteConfiguration?
+        var startedMode: WorkspaceRemoteSessionControllerMode?
+        WorkspaceRemoteSessionController.startOverrideForTesting = { configuration, mode in
+            startedConfiguration = configuration
+            startedMode = mode
+            return WorkspaceRemoteDaemonStatus(
+                state: .ready,
+                detail: "Remote daemon ready",
+                version: "test",
+                remotePath: ".cmux/bin/cmuxd-remote/test/linux-amd64/cmuxd-remote"
+            )
+        }
+        defer { WorkspaceRemoteSessionController.startOverrideForTesting = nil }
+
+        let session = DetectedSSHSession(
+            destination: "devbox",
+            port: 2222,
+            identityFile: nil,
+            configFile: nil,
+            jumpHost: nil,
+            controlPath: nil,
+            useIPv4: false,
+            useIPv6: false,
+            forwardAgent: false,
+            compressionEnabled: false,
+            sshOptions: []
+        )
+
+        workspace.setRemoteAttachment(
+            .detectedSSH(.init(
+                destination: "devbox",
+                displayTarget: "devbox:2222",
+                port: 2222,
+                identityFile: nil,
+                sshOptions: [],
+                transportKey: "ssh:devbox:2222",
+                daemonState: .unavailable
+            )),
+            for: panelId
+        )
+        workspace.startDetectedSSHRemoteSupportIfNeeded(
+            session: session,
+            panelId: panelId,
+            transportKey: "ssh:devbox:2222"
+        )
+
+        XCTAssertEqual(startedConfiguration?.destination, "devbox")
+        XCTAssertEqual(startedConfiguration?.port, 2222)
+        XCTAssertEqual(
+            startedMode,
+            .surfaceAttachment(transportKey: "ssh:devbox:2222", sourcePanelId: panelId)
+        )
+        XCTAssertNil(workspace.remoteConfiguration)
+        XCTAssertEqual(workspace.remoteAttachment(for: panelId)?.payload()["recoverable"] as? Bool, false)
+    }
+
+    @MainActor
+    func testBrowserSurfaceInheritsDetectedSSHAttachmentAndProxyFromSelectedTerminal() throws {
+        let workspace = Workspace()
+        let terminalId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        let paneId = try XCTUnwrap(workspace.bonsplitController.focusedPaneId)
+        let transportKey = "ssh:devbox"
+        let endpoint = BrowserProxyEndpoint(host: "127.0.0.1", port: 19080)
+
+        WorkspaceRemoteSessionController.startOverrideForTesting = { _, _ in nil }
+        defer { WorkspaceRemoteSessionController.startOverrideForTesting = nil }
+
+        workspace.setRemoteAttachment(
+            .detectedSSH(.init(
+                destination: "devbox",
+                displayTarget: "devbox",
+                port: nil,
+                identityFile: nil,
+                sshOptions: [],
+                transportKey: transportKey,
+                daemonState: .unavailable
+            )),
+            for: terminalId
+        )
+        workspace.startDetectedSSHRemoteSupportIfNeeded(
+            session: DetectedSSHSession(
+                destination: "devbox",
+                port: nil,
+                identityFile: nil,
+                configFile: nil,
+                jumpHost: nil,
+                controlPath: nil,
+                useIPv4: false,
+                useIPv6: false,
+                forwardAgent: false,
+                compressionEnabled: false,
+                sshOptions: []
+            ),
+            panelId: terminalId,
+            transportKey: transportKey
+        )
+        workspace.applyDetectedSSHRemoteStatus(
+            transportKey: transportKey,
+            sourcePanelId: terminalId,
+            daemonStatus: WorkspaceRemoteDaemonStatus(
+                state: .ready,
+                detail: "Remote daemon ready",
+                version: "test",
+                remotePath: ".cmux/bin/cmuxd-remote/test/linux-amd64/cmuxd-remote"
+            ),
+            proxyEndpoint: endpoint,
+            target: "devbox"
+        )
+
+        let browser = try XCTUnwrap(workspace.newBrowserSurface(inPane: paneId, focus: true))
+        let payload = try XCTUnwrap(workspace.remoteAttachmentPayload(for: browser.id))
+        XCTAssertEqual(payload["kind"] as? String, "detected_ssh")
+        XCTAssertEqual(payload["destination"] as? String, "devbox")
+        XCTAssertEqual((payload["daemon"] as? [String: Any])?["state"] as? String, "ready")
+        XCTAssertEqual(workspace.remoteProxyEndpoint(forSourcePanelId: browser.id), endpoint)
+
+        let nextEndpoint = BrowserProxyEndpoint(host: "127.0.0.1", port: 19081)
+        workspace.applyDetectedSSHRemoteProxyEndpoint(
+            transportKey: transportKey,
+            sourcePanelId: terminalId,
+            proxyEndpoint: nextEndpoint,
+            target: "devbox"
+        )
+        XCTAssertEqual(workspace.remoteProxyEndpoint(forSourcePanelId: browser.id), nextEndpoint)
+
+        let secondBrowser = try XCTUnwrap(workspace.newBrowserSurface(inPane: paneId, focus: true))
+        XCTAssertEqual(
+            workspace.remoteAttachmentPayload(for: secondBrowser.id)?["destination"] as? String,
+            "devbox"
+        )
+        XCTAssertEqual(workspace.remoteProxyEndpoint(forSourcePanelId: secondBrowser.id), nextEndpoint)
+    }
+
+    @MainActor
+    func testTerminalSurfaceFromDetectedSSHBrowserStaysLocal() throws {
+        let workspace = Workspace()
+        let terminalId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        let paneId = try XCTUnwrap(workspace.bonsplitController.focusedPaneId)
+        let transportKey = "ssh:devbox:2222"
+
+        WorkspaceRemoteSessionController.startOverrideForTesting = { _, _ in nil }
+        defer { WorkspaceRemoteSessionController.startOverrideForTesting = nil }
+
+        let session = DetectedSSHSession(
+            destination: "deploy@devbox",
+            port: 2222,
+            identityFile: "/tmp/key with 'quote",
+            configFile: "/tmp/ssh config",
+            jumpHost: "jumpbox",
+            controlPath: "/tmp/cmux-%C",
+            useIPv4: true,
+            useIPv6: false,
+            forwardAgent: true,
+            compressionEnabled: true,
+            sshOptions: ["UserKnownHostsFile=/dev/null"]
+        )
+
+        workspace.setRemoteAttachment(
+            .detectedSSH(.init(
+                destination: session.destination,
+                displayTarget: "devbox:2222",
+                port: session.port,
+                identityFile: session.identityFile,
+                sshOptions: session.sshOptions,
+                transportKey: transportKey,
+                daemonState: .unavailable
+            )),
+            for: terminalId
+        )
+        workspace.startDetectedSSHRemoteSupportIfNeeded(
+            session: session,
+            panelId: terminalId,
+            transportKey: transportKey
+        )
+
+        let browser = try XCTUnwrap(workspace.newBrowserSurface(inPane: paneId, focus: true))
+        XCTAssertEqual(
+            workspace.remoteAttachmentPayload(for: browser.id)?["destination"] as? String,
+            session.destination
+        )
+
+        let newTerminal = try XCTUnwrap(workspace.newTerminalSurface(inPane: paneId, focus: true))
+        if let startupCommand = newTerminal.surface.debugInitialCommand() {
+            XCTAssertFalse(startupCommand.contains("'ssh'"), startupCommand)
+            XCTAssertFalse(startupCommand.contains("'deploy@devbox'"), startupCommand)
+        }
+        XCTAssertFalse(workspace.isRemoteTerminalSurface(newTerminal.id))
+        XCTAssertNil(workspace.remoteAttachmentPayload(for: newTerminal.id))
+    }
+
     func testDetectsForegroundSSHSessionWithShortControlPathFlag() {
         let session = TerminalSSHSessionDetector.detectForTesting(
             ttyName: "/dev/ttys004",
@@ -2230,6 +2851,19 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
             )
         }
 
+        let stdoutDone = DispatchSemaphore(value: 0)
+        let stderrDone = DispatchSemaphore(value: 0)
+        var stdoutData = Data()
+        var stderrData = Data()
+        DispatchQueue.global(qos: .userInitiated).async {
+            stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            stdoutDone.signal()
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            stderrDone.signal()
+        }
+
         let exitSignal = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .userInitiated).async {
             process.waitUntilExit()
@@ -2242,8 +2876,10 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
             _ = exitSignal.wait(timeout: .now() + 1)
         }
 
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        _ = stdoutDone.wait(timeout: .now() + 1)
+        _ = stderrDone.wait(timeout: .now() + 1)
+        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderr = String(data: stderrData, encoding: .utf8) ?? ""
         return ProcessRunResult(
             status: process.terminationStatus,
             stdout: stdout,
@@ -2334,6 +2970,7 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
     private func startMockServer(
         listenerFD: Int32,
         state: MockSocketServerState,
+        closeAfterResponses: Int? = nil,
         handler: @escaping @Sendable (String) -> String
     ) -> XCTestExpectation {
         let handled = expectation(description: "cli mock socket handled")
@@ -2356,6 +2993,7 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
 
             var pending = Data()
             var buffer = [UInt8](repeating: 0, count: 4096)
+            var responseCount = 0
 
             while true {
                 let count = Darwin.read(clientFD, &buffer, buffer.count)
@@ -2374,6 +3012,10 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
                     let response = handler(line) + "\n"
                     _ = response.withCString { ptr in
                         Darwin.write(clientFD, ptr, strlen(ptr))
+                    }
+                    responseCount += 1
+                    if let closeAfterResponses, responseCount >= closeAfterResponses {
+                        return
                     }
                 }
             }
@@ -2742,6 +3384,100 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
         let selectParams = try XCTUnwrap(requests[3]["params"] as? [String: Any])
         XCTAssertEqual(selectParams["workspace_id"] as? String, workspaceID)
         XCTAssertEqual(selectParams["window_id"] as? String, windowID)
+    }
+
+    @MainActor
+    func testSSHExecConfiguresCurrentSurfaceWithRelayBootstrap() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("ssh-exec")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        let state = MockSocketServerState()
+        let workspaceID = "11111111-1111-1111-1111-111111111111"
+        let surfaceID = "22222222-2222-2222-2222-222222222222"
+
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let serverHandled = startMockServer(listenerFD: listenerFD, state: state, closeAfterResponses: 1) { line in
+            guard let data = line.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                  let id = payload["id"] as? String,
+                  let method = payload["method"] as? String else {
+                return self.v2Response(
+                    id: "unknown",
+                    ok: false,
+                    error: ["code": "unexpected", "message": "Unexpected payload"]
+                )
+            }
+
+            switch method {
+            case "surface.ssh_upgrade":
+                return self.v2Response(
+                    id: id,
+                    ok: true,
+                    result: [
+                        "upgraded": true,
+                        "fallback_required": false,
+                        "workspace_id": workspaceID,
+                        "surface_id": surfaceID,
+                    ]
+                )
+            default:
+                return self.v2Response(
+                    id: id,
+                    ok: false,
+                    error: ["code": "unexpected", "message": "Unexpected method \(method)"]
+                )
+            }
+        }
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["CMUX_SOCKET_PATH"] = socketPath
+        environment["CMUX_WORKSPACE_ID"] = workspaceID
+        environment["CMUX_SURFACE_ID"] = surfaceID
+        environment["CMUX_CLI_SENTRY_DISABLED"] = "1"
+        environment["CMUX_CLAUDE_HOOK_SENTRY_DISABLED"] = "1"
+
+        let result = runProcess(
+            executablePath: cliPath,
+            arguments: ["ssh-exec", "--dry-run", "-p", "2222", "-i", "/Users/test/.ssh/id_ed25519", "cmux-macmini"],
+            environment: environment,
+            timeout: 5
+        )
+
+        wait(for: [serverHandled], timeout: 5)
+
+        XCTAssertFalse(result.timedOut, result.stderr)
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertTrue(result.stderr.isEmpty, result.stderr)
+        XCTAssertTrue(result.stdout.contains("ssh "), result.stdout)
+        XCTAssertTrue(result.stdout.contains("RemoteCommand="), result.stdout)
+
+        let requests = try state.commands.map { line -> [String: Any] in
+            let data = try XCTUnwrap(line.data(using: .utf8))
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data, options: []) as? [String: Any])
+        }
+        XCTAssertEqual(requests.compactMap { $0["method"] as? String }, ["surface.ssh_upgrade"])
+        guard let firstRequest = requests.first else {
+            XCTFail("Expected surface.ssh_upgrade request, got none. stdout=\(result.stdout) stderr=\(result.stderr)")
+            return
+        }
+        let params = try XCTUnwrap(firstRequest["params"] as? [String: Any])
+        XCTAssertEqual(params["workspace_id"] as? String, workspaceID)
+        XCTAssertEqual(params["surface_id"] as? String, surfaceID)
+        XCTAssertEqual(params["original_argv"] as? [String], ["ssh", "-p", "2222", "-i", "/Users/test/.ssh/id_ed25519", "cmux-macmini"])
+        XCTAssertEqual(params["destination"] as? String, "cmux-macmini")
+        XCTAssertEqual(params["port"] as? Int, 2222)
+        XCTAssertEqual(params["identity_file"] as? String, "/Users/test/.ssh/id_ed25519")
+        XCTAssertEqual(params["local_socket_path"] as? String, socketPath)
+        let relayPort = try XCTUnwrap(params["relay_port"] as? Int)
+        XCTAssertGreaterThan(relayPort, 0)
+        XCTAssertFalse((params["relay_id"] as? String ?? "").isEmpty)
+        XCTAssertEqual((params["relay_token"] as? String ?? "").count, 64)
+        let terminalStartupCommand = try XCTUnwrap(params["terminal_startup_command"] as? String)
+        XCTAssertFalse(terminalStartupCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     @MainActor

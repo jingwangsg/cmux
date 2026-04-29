@@ -47,7 +47,7 @@ final class TabManagerSessionSnapshotTests: XCTestCase {
         XCTAssertNotNil(manager.selectedTabId)
     }
 
-    func testSessionSnapshotExcludesRemoteWorkspacesFromRestore() throws {
+    func testSessionSnapshotIncludesRemoteWorkspacesForRestore() throws {
         let manager = TabManager()
         let remoteWorkspace = manager.addWorkspace(select: true)
         let configuration = WorkspaceRemoteConfiguration(
@@ -57,6 +57,7 @@ final class TabManagerSessionSnapshotTests: XCTestCase {
             sshOptions: [],
             localProxyPort: nil,
             relayPort: 64001,
+            localRelayPort: 54001,
             relayID: "relay-test",
             relayToken: String(repeating: "b", count: 64),
             localSocketPath: "/tmp/cmux-test.sock",
@@ -68,8 +69,14 @@ final class TabManagerSessionSnapshotTests: XCTestCase {
 
         let snapshot = manager.sessionSnapshot(includeScrollback: false)
 
-        XCTAssertEqual(snapshot.workspaces.count, 1)
-        XCTAssertNil(snapshot.selectedWorkspaceIndex)
-        XCTAssertFalse(snapshot.workspaces.contains { $0.processTitle == remoteWorkspace.title })
+        XCTAssertEqual(snapshot.workspaces.count, 2)
+        XCTAssertEqual(snapshot.selectedWorkspaceIndex, 1)
+        let remoteSnapshot = try XCTUnwrap(snapshot.workspaces.first { $0.processTitle == remoteWorkspace.title })
+        let remoteConfiguration = try XCTUnwrap(remoteSnapshot.remoteConfiguration)
+        XCTAssertEqual(remoteConfiguration.destination, "cmux-macmini")
+        XCTAssertEqual(remoteConfiguration.relayPort, 64001)
+        XCTAssertEqual(remoteConfiguration.localRelayPort, 54001)
+        XCTAssertEqual(remoteConfiguration.relayID, "relay-test")
+        XCTAssertEqual(remoteConfiguration.terminalStartupCommand, "ssh cmux-macmini")
     }
 }

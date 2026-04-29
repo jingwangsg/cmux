@@ -40,6 +40,8 @@ final class CmuxSettingsFileStore {
         "app.renameSelectsExistingName",
         "app.commandPaletteSearchesAllSurfaces",
         "terminal.showScrollBar",
+        "terminal.passiveSSHEnhancement",
+        "terminal.upgradeInteractiveSSHCommands",
         "notifications.dockBadge",
         "notifications.showInMenuBar",
         "notifications.unreadPaneRing",
@@ -493,6 +495,16 @@ final class CmuxSettingsFileStore {
             snapshot.managedUserDefaults[TerminalScrollBarSettings.showScrollBarKey] = .bool(value)
         } else if section.keys.contains("showScrollBar") {
             logInvalid("terminal.showScrollBar", sourcePath: sourcePath)
+        }
+        if let value = jsonBool(section["passiveSSHEnhancement"]) {
+            snapshot.managedUserDefaults[SSHAutoRemoteSettings.passiveEnhancementKey] = .bool(value)
+        } else if section.keys.contains("passiveSSHEnhancement") {
+            logInvalid("terminal.passiveSSHEnhancement", sourcePath: sourcePath)
+        }
+        if let value = jsonBool(section["upgradeInteractiveSSHCommands"]) {
+            snapshot.managedUserDefaults[SSHAutoRemoteSettings.upgradeInteractiveCommandsKey] = .bool(value)
+        } else if section.keys.contains("upgradeInteractiveSSHCommands") {
+            logInvalid("terminal.upgradeInteractiveSSHCommands", sourcePath: sourcePath)
         }
     }
 
@@ -1382,6 +1394,8 @@ final class CmuxSettingsFileStore {
             [
                 "terminal": [
                     "showScrollBar": TerminalScrollBarSettings.defaultShowScrollBar,
+                    "passiveSSHEnhancement": SSHAutoRemoteSettings.defaultPassiveEnhancement,
+                    "upgradeInteractiveSSHCommands": SSHAutoRemoteSettings.defaultUpgradeInteractiveCommands,
                 ],
             ],
             [

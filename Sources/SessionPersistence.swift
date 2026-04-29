@@ -277,6 +277,113 @@ struct SessionMarkdownPanelSnapshot: Codable, Sendable {
     var filePath: String
 }
 
+struct SessionWorkspaceRemoteConfigurationSnapshot: Codable, Sendable {
+    var destination: String
+    var port: Int?
+    var identityFile: String?
+    var sshOptions: [String]
+    var localProxyPort: Int?
+    var relayPort: Int?
+    var localRelayPort: Int?
+    var relayID: String?
+    var relayToken: String?
+    var localSocketPath: String?
+    var terminalStartupCommand: String?
+
+    init(configuration: WorkspaceRemoteConfiguration) {
+        self.destination = configuration.destination
+        self.port = configuration.port
+        self.identityFile = configuration.identityFile
+        self.sshOptions = configuration.sshOptions
+        self.localProxyPort = configuration.localProxyPort
+        self.relayPort = configuration.relayPort
+        self.localRelayPort = configuration.localRelayPort
+        self.relayID = configuration.relayID
+        self.relayToken = configuration.relayToken
+        self.localSocketPath = configuration.localSocketPath
+        self.terminalStartupCommand = configuration.terminalStartupCommand
+    }
+
+    func workspaceRemoteConfiguration() -> WorkspaceRemoteConfiguration {
+        WorkspaceRemoteConfiguration(
+            destination: destination,
+            port: port,
+            identityFile: identityFile,
+            sshOptions: sshOptions,
+            localProxyPort: localProxyPort,
+            relayPort: relayPort,
+            localRelayPort: localRelayPort,
+            relayID: relayID,
+            relayToken: relayToken,
+            localSocketPath: localSocketPath,
+            terminalStartupCommand: terminalStartupCommand
+        )
+    }
+}
+
+struct SessionTerminalRemoteAttachmentSnapshot: Codable, Sendable {
+    private static let sshExecTransportKeyPrefix = "ssh-exec:"
+
+    var kind: String
+    var destination: String
+    var displayTarget: String
+    var port: Int?
+    var identityFile: String?
+    var sshOptions: [String]
+    var transportKey: String
+    var relayConfiguration: SessionWorkspaceRemoteConfigurationSnapshot?
+
+    init?(
+        attachment: TerminalRemoteAttachment,
+        relayConfiguration: WorkspaceRemoteConfiguration?
+    ) {
+        guard case .detectedSSH(let detected) = attachment else {
+            return nil
+        }
+        guard detected.transportKey.hasPrefix(Self.sshExecTransportKeyPrefix),
+              let relayConfiguration else {
+            return nil
+        }
+        self.kind = "detected_ssh"
+        self.destination = detected.destination
+        self.displayTarget = detected.displayTarget
+        self.port = detected.port
+        self.identityFile = detected.identityFile
+        self.sshOptions = detected.sshOptions
+        self.transportKey = detected.transportKey
+        self.relayConfiguration = SessionWorkspaceRemoteConfigurationSnapshot(configuration: relayConfiguration)
+    }
+
+    func terminalRemoteAttachment() -> TerminalRemoteAttachment? {
+        guard kind == "detected_ssh" else { return nil }
+        return .detectedSSH(.init(
+            destination: destination,
+            displayTarget: displayTarget,
+            port: port,
+            identityFile: identityFile,
+            sshOptions: sshOptions,
+            transportKey: transportKey,
+            daemonState: .bootstrapping(detail: "Restoring remote daemon on \(displayTarget)")
+        ))
+    }
+
+    func detectedSSHSession() -> DetectedSSHSession {
+        DetectedSSHSession(
+            destination: destination,
+            port: port,
+            identityFile: identityFile,
+            configFile: nil,
+            jumpHost: nil,
+            controlPath: nil,
+            useIPv4: false,
+            useIPv6: false,
+            forwardAgent: false,
+            compressionEnabled: false,
+            sshOptions: sshOptions
+        )
+    }
+}
+
 struct SessionPanelSnapshot: Codable, Sendable {
     var id: UUID
     var type: PanelType
@@ -291,6 +398,7 @@ struct SessionPanelSnapshot: Codable, Sendable {
     var terminal: SessionTerminalPanelSnapshot?
     var browser: SessionBrowserPanelSnapshot?
     var markdown: SessionMarkdownPanelSnapshot?
+    var remoteAttachment: SessionTerminalRemoteAttachmentSnapshot? = nil
 }
 
 enum SessionSplitOrientation: String, Codable, Sendable {
@@ -379,6 +487,7 @@ struct SessionWorkspaceSnapshot: Codable, Sendable {
     var logEntries: [SessionLogEntrySnapshot]
     var progress: SessionProgressSnapshot?
     var gitBranch: SessionGitBranchSnapshot?
+    var remoteConfiguration: SessionWorkspaceRemoteConfigurationSnapshot? = nil
 }
 
 struct SessionTabManagerSnapshot: Codable, Sendable {

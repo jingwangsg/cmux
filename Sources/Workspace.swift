@@ -306,12 +306,17 @@ extension Workspace {
             statusEntries: statusSnapshots,
             logEntries: logSnapshots,
             progress: progressSnapshot,
-            gitBranch: gitBranchSnapshot
+            gitBranch: gitBranchSnapshot,
+            remoteConfiguration: remoteConfiguration.map(SessionWorkspaceRemoteConfigurationSnapshot.init(configuration:))
         )
     }
 
     func restoreSessionSnapshot(_ snapshot: SessionWorkspaceSnapshot) {
         restoredTerminalScrollbackByPanelId.removeAll(keepingCapacity: false)
+        let restoredRemoteConfiguration = snapshot.remoteConfiguration?.workspaceRemoteConfiguration()
+        if let restoredRemoteConfiguration {
+            remoteConfiguration = restoredRemoteConfiguration
+        }
 
         let normalizedCurrentDirectory = snapshot.currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         if !normalizedCurrentDirectory.isEmpty {
@@ -359,6 +364,9 @@ extension Workspace {
         gitBranch = snapshot.gitBranch.map { SidebarGitBranchState(branch: $0.branch, isDirty: $0.isDirty) }
 
         recomputeListeningPorts()
+        if let restoredRemoteConfiguration {
+            configureRemoteConnection(restoredRemoteConfiguration, autoConnect: true)
+        }
 
         if let focusedOldPanelId = snapshot.focusedPanelId,
            let focusedNewPanelId = oldToNewPanelIds[focusedOldPanelId],
@@ -515,7 +523,34 @@ extension Workspace {
             ttyName: ttyName,
             terminal: terminalSnapshot,
             browser: browserSnapshot,
-            markdown: markdownSnapshot
+            markdown: markdownSnapshot,
+            remoteAttachment: sessionRemoteAttachmentSnapshot(panelId: panelId)
+        )
+    }
+
+    private func sessionRemoteAttachmentSnapshot(panelId: UUID) -> SessionTerminalRemoteAttachmentSnapshot? {
+        guard let attachment = remoteAttachmentsByPanelId[panelId] else {
+            return nil
+        }
+        let relayConfiguration: WorkspaceRemoteConfiguration? = {
+            switch attachment {
+            case .detectedSSH(let detected):
+                return detectedSSHRelayConfigurationsByTransportKey[detected.transportKey]
+                    ?? detectedSSHRelayConfigurationsByPanelId[panelId]
+            case .managedRemote:
+                return nil
+            }
+        }()
+        #if DEBUG
+        if case .detectedSSH(let detected) = attachment,
+           detected.transportKey.hasPrefix(Self.sshExecUpgradeTransportKeyPrefix),
+           relayConfiguration == nil {
+            dlog("ssh.snapshot.missing_relay panel=\(panelId.uuidString) transportKey=\(detected.transportKey)")
+        }
+        #endif
+        return SessionTerminalRemoteAttachmentSnapshot(
+            attachment: attachment,
+            relayConfiguration: relayConfiguration
         )
     }
 
@@ -787,6 +822,8 @@ extension Workspace {
             surfaceTTYNames.removeValue(forKey: panelId)
         }
         syncRemotePortScanTTYs()
+        restoreSessionRemoteAttachment(snapshot.remoteAttachment, toPanelId: panelId)
+        scheduleDetectedSSHAttachmentRefresh(panelId: panelId, reason: "session_restore")
 
         if let browserSnapshot = snapshot.browser,
            let browserPanel = browserPanel(for: panelId) {
@@ -804,6 +841,28 @@ extension Workspace {
                 _ = browserPanel.hideDeveloperTools()
             }
         }
+    }
+
+    private func restoreSessionRemoteAttachment(
+        _ snapshot: SessionTerminalRemoteAttachmentSnapshot?,
+        toPanelId panelId: UUID
+    ) {
+        guard let snapshot,
+              let attachment = snapshot.terminalRemoteAttachment() else {
+            return
+        }
+        setRemoteAttachment(attachment, for: panelId)
+        guard case .detectedSSH(let detected) = attachment,
+              let relayConfiguration = snapshot.relayConfiguration?.workspaceRemoteConfiguration() else {
+            return
+        }
+        startDetectedSSHRemoteSupportIfNeeded(
+            session: snapshot.detectedSSHSession(),
+            panelId: panelId,
+            transportKey: detected.transportKey,
+            relayConfiguration: relayConfiguration,
+            allowPreparedAdoption: false
+        )
     }
 
     private func applySessionDividerPositions(
@@ -1262,6 +1321,11 @@ enum WorkspaceRemoteSSHBatchCommandBuilder {
 private final class WorkspaceRemoteDaemonRPCClient {
     private static let maxStdoutBufferBytes = 256 * 1024
     static let requiredProxyStreamCapability = "proxy.stream.push"
+    static let requiredAgentHooksCapability = "agent.hooks"
+    static let requiredCapabilities: Set<String> = [
+        requiredProxyStreamCapability,
+        requiredAgentHooksCapability,
+    ]
 
     enum StreamEvent {
         case data(Data)
@@ -1365,15 +1429,20 @@ private final class WorkspaceRemoteDaemonRPCClient {
         do {
             let hello = try call(method: "hello", params: [:], timeout: 8.0)
             let capabilities = (hello["capabilities"] as? [String]) ?? []
-            guard capabilities.contains(Self.requiredProxyStreamCapability) else {
+            if let missingCapability = Self.missingRequiredCapability(in: capabilities) {
                 throw NSError(domain: "cmux.remote.daemon.rpc", code: 2, userInfo: [
-                    NSLocalizedDescriptionKey: "remote daemon missing required capability \(Self.requiredProxyStreamCapability)",
+                    NSLocalizedDescriptionKey: "remote daemon missing required capability \(missingCapability)",
                 ])
             }
         } catch {
             stop(suppressTerminationCallback: true)
             throw error
         }
+    }
+
+    static func missingRequiredCapability(in capabilities: [String]) -> String? {
+        let advertised = Set(capabilities)
+        return requiredCapabilities.sorted().first { !advertised.contains($0) }
     }
 
     func stop() {
@@ -3200,16 +3269,24 @@ private final class WorkspaceRemoteCLIRelayServer {
     private var sessions: [UUID: Session] = [:]
     private var isStopped = false
     private(set) var localPort: Int?
+    private let requestedLocalPort: Int?
 
-    init(localSocketPath: String, relayID: String, relayTokenHex: String) throws {
+    init(localSocketPath: String, relayID: String, relayTokenHex: String, requestedLocalPort: Int? = nil) throws {
         guard let relayToken = Session.hexData(from: relayTokenHex), !relayToken.isEmpty else {
             throw NSError(domain: "cmux.remote.relay", code: 7, userInfo: [
                 NSLocalizedDescriptionKey: "invalid relay token",
             ])
         }
+        if let requestedLocalPort,
+           !(1 ... 65535).contains(requestedLocalPort) {
+            throw NSError(domain: "cmux.remote.relay", code: 9, userInfo: [
+                NSLocalizedDescriptionKey: "invalid requested local relay port",
+            ])
+        }
         self.localSocketPath = localSocketPath
         self.relayID = relayID
         self.relayToken = relayToken
+        self.requestedLocalPort = requestedLocalPort
     }
 
     func start() throws -> Int {
@@ -3217,7 +3294,7 @@ private final class WorkspaceRemoteCLIRelayServer {
             return existingPort
         }
 
-        let listener = try Self.makeLoopbackListener()
+        let listener = try Self.makeLoopbackListener(port: requestedLocalPort)
         let readySemaphore = DispatchSemaphore(value: 0)
         let stateLock = NSLock()
         var capturedError: Error?
@@ -3274,6 +3351,14 @@ private final class WorkspaceRemoteCLIRelayServer {
                 NSLocalizedDescriptionKey: "failed to bind local relay listener",
             ])
         }
+        if let requestedLocalPort, startupPort != requestedLocalPort {
+            listener.newConnectionHandler = nil
+            listener.stateUpdateHandler = nil
+            listener.cancel()
+            throw NSError(domain: "cmux.remote.relay", code: 10, userInfo: [
+                NSLocalizedDescriptionKey: "local relay listener bound unexpected port \(startupPort)",
+            ])
+        }
 
         return queue.sync {
             if let localPort {
@@ -3324,14 +3409,33 @@ private final class WorkspaceRemoteCLIRelayServer {
         session.start()
     }
 
-    private static func makeLoopbackListener() throws -> NWListener {
+    private static func makeLoopbackListener(port requestedLocalPort: Int? = nil) throws -> NWListener {
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
         let parameters = NWParameters(tls: nil, tcp: tcpOptions)
         parameters.allowLocalEndpointReuse = true
-        parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host("127.0.0.1"), port: .any)
+        let endpointPort: NWEndpoint.Port
+        if let requestedLocalPort,
+           let requestedPort = NWEndpoint.Port(rawValue: UInt16(requestedLocalPort)) {
+            endpointPort = requestedPort
+        } else {
+            endpointPort = .any
+        }
+        parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host("127.0.0.1"), port: endpointPort)
         return try NWListener(using: parameters)
     }
+}
+
+enum WorkspaceRemoteSessionControllerMode: Equatable {
+    case workspaceRemote
+    case surfaceAttachment(transportKey: String, sourcePanelId: UUID)
+    case prewarm(host: String)
+}
+
+enum WorkspaceRemoteSessionControllerEvent {
+    case connectionState(WorkspaceRemoteConnectionState, detail: String?)
+    case daemonStatus(WorkspaceRemoteDaemonStatus)
+    case proxyEndpoint(BrowserProxyEndpoint?)
 }
 
 final class WorkspaceRemoteSessionController {
@@ -3391,6 +3495,8 @@ final class WorkspaceRemoteSessionController {
     private weak var workspace: Workspace?
     private let configuration: WorkspaceRemoteConfiguration
     private let controllerID: UUID
+    private let mode: WorkspaceRemoteSessionControllerMode
+    private let eventSink: ((WorkspaceRemoteSessionControllerEvent) -> Void)?
 
     private enum RemotePortPollingMode {
         case hostWide
@@ -3455,14 +3561,37 @@ final class WorkspaceRemoteSessionController {
 
     private static let reverseRelayStartupGracePeriod: TimeInterval = 0.5
 
-    init(workspace: Workspace, configuration: WorkspaceRemoteConfiguration, controllerID: UUID) {
+    #if DEBUG
+    static var startOverrideForTesting: ((
+        WorkspaceRemoteConfiguration,
+        WorkspaceRemoteSessionControllerMode
+    ) -> WorkspaceRemoteDaemonStatus?)?
+    #endif
+
+    init(
+        workspace: Workspace?,
+        configuration: WorkspaceRemoteConfiguration,
+        controllerID: UUID,
+        mode: WorkspaceRemoteSessionControllerMode = .workspaceRemote,
+        eventSink: ((WorkspaceRemoteSessionControllerEvent) -> Void)? = nil
+    ) {
         self.workspace = workspace
         self.configuration = configuration
         self.controllerID = controllerID
+        self.mode = mode
+        self.eventSink = eventSink
         queue.setSpecific(key: queueKey, value: ())
     }
 
     func start() {
+#if DEBUG
+        if let startOverrideForTesting = Self.startOverrideForTesting {
+            if let status = startOverrideForTesting(configuration, mode) {
+                publishDaemonStatus(status)
+            }
+            return
+        }
+#endif
         debugLog("remote.session.start \(debugConfigSummary())")
         queue.async { [weak self] in
             guard let self else { return }
@@ -3600,9 +3729,9 @@ final class WorkspaceRemoteSessionController {
         publishDaemonStatus(.bootstrapping, detail: bootstrapDetail)
         do {
             let hello = try bootstrapDaemonLocked()
-            guard hello.capabilities.contains(WorkspaceRemoteDaemonRPCClient.requiredProxyStreamCapability) else {
+            if let missingCapability = WorkspaceRemoteDaemonRPCClient.missingRequiredCapability(in: hello.capabilities) {
                 throw NSError(domain: "cmux.remote.daemon", code: 43, userInfo: [
-                    NSLocalizedDescriptionKey: "remote daemon missing required capability \(WorkspaceRemoteDaemonRPCClient.requiredProxyStreamCapability)",
+                    NSLocalizedDescriptionKey: "remote daemon missing required capability \(missingCapability)",
                 ])
             }
             daemonReady = true
@@ -3684,6 +3813,7 @@ final class WorkspaceRemoteSessionController {
             )
             relayServer = server
             let localRelayPort = try server.start()
+            publishLocalRelayPortLocked(localRelayPort, relayPort: relayPort, relayID: relayID)
             Self.killOrphanedRemoteSSHProcesses(
                 destination: configuration.destination,
                 relayPort: relayPort
@@ -3713,6 +3843,16 @@ final class WorkspaceRemoteSessionController {
                 )
                 return
             }
+            if adoptExistingReverseRelayIfUsableLocked(
+                remotePath: remotePath,
+                relayPort: relayPort,
+                localRelayPort: localRelayPort,
+                relayID: relayID,
+                relayToken: relayToken,
+                relayServer: server
+            ) {
+                return
+            }
 
             let process = Process()
             let stderrPipe = Pipe()
@@ -3739,6 +3879,9 @@ final class WorkspaceRemoteSessionController {
                     "remote.relay.startFailed relayPort=\(relayPort) " +
                     "error=\(startupFailure)"
                 )
+                if cliRelayServer === relayServer {
+                    cliRelayServer = nil
+                }
                 relayServer?.stop()
                 publishDaemonStatus(
                     .error,
@@ -3757,8 +3900,32 @@ final class WorkspaceRemoteSessionController {
                     remotePath: remotePath,
                     relayPort: relayPort,
                     relayID: relayID,
-                    relayToken: relayToken
+                    relayToken: relayToken,
+                    setDefaultSocketAddress: false
                 )
+            } catch {
+                debugLog("remote.relay.metadata.error \(error.localizedDescription)")
+                stopReverseRelayLocked()
+                scheduleReverseRelayRestartLocked(remotePath: remotePath, delay: 2.0)
+                return
+            }
+            if let relayFailure = verifyRemoteRelayFailureDetailLocked(relayPort: relayPort) {
+                let retryDelay = 2.0
+                let retrySeconds = max(1, Int(retryDelay.rounded()))
+                debugLog(
+                    "remote.relay.verifyFailed relayPort=\(relayPort) " +
+                    "error=\(relayFailure)"
+                )
+                stopReverseRelayLocked()
+                publishDaemonStatus(
+                    .error,
+                    detail: "Remote SSH relay unavailable: \(relayFailure) (retry in \(retrySeconds)s)"
+                )
+                scheduleReverseRelayRestartLocked(remotePath: remotePath, delay: retryDelay)
+                return
+            }
+            do {
+                try setRemoteDefaultRelaySocketLocked(relayPort: relayPort)
             } catch {
                 debugLog("remote.relay.metadata.error \(error.localizedDescription)")
                 stopReverseRelayLocked()
@@ -3779,6 +3946,51 @@ final class WorkspaceRemoteSessionController {
             cliRelayServer = nil
             scheduleReverseRelayRestartLocked(remotePath: remotePath, delay: 2.0)
         }
+    }
+
+    private func adoptExistingReverseRelayIfUsableLocked(
+        remotePath: String,
+        relayPort: Int,
+        localRelayPort: Int,
+        relayID: String,
+        relayToken: String,
+        relayServer: WorkspaceRemoteCLIRelayServer
+    ) -> Bool {
+        guard configuration.localRelayPort == localRelayPort else {
+            return false
+        }
+
+        do {
+            try installRemoteRelayMetadataLocked(
+                remotePath: remotePath,
+                relayPort: relayPort,
+                relayID: relayID,
+                relayToken: relayToken,
+                setDefaultSocketAddress: false
+            )
+        } catch {
+            debugLog("remote.relay.adoptExisting.metadataFailed error=\(error.localizedDescription) \(debugConfigSummary())")
+            return false
+        }
+
+        if let relayFailure = verifyRemoteRelayFailureDetailLocked(relayPort: relayPort) {
+            debugLog("remote.relay.adoptExisting.failed detail=\(relayFailure) \(debugConfigSummary())")
+            return false
+        }
+        do {
+            try setRemoteDefaultRelaySocketLocked(relayPort: relayPort)
+        } catch {
+            debugLog("remote.relay.adoptExisting.metadataFailed error=\(error.localizedDescription) \(debugConfigSummary())")
+            return false
+        }
+        cliRelayServer = relayServer
+        reverseRelayStderrBuffer = ""
+        recordHeartbeatActivityLocked()
+        debugLog(
+            "remote.relay.adoptExisting relayPort=\(relayPort) localRelayPort=\(localRelayPort) " +
+            "target=\(configuration.displayTarget)"
+        )
+        return true
     }
 
     private func installReverseRelayStderrHandlerLocked(_ stderrPipe: Pipe) {
@@ -3927,15 +4139,43 @@ final class WorkspaceRemoteSessionController {
 
     private func publishState(_ state: WorkspaceRemoteConnectionState, detail: String?) {
         let controllerID = self.controllerID
+        let mode = self.mode
+        let target = configuration.displayTarget
+        let eventSink = self.eventSink
         DispatchQueue.main.async { [weak workspace] in
+            eventSink?(.connectionState(state, detail: detail))
             guard let workspace else { return }
-            guard workspace.activeRemoteSessionControllerID == controllerID else { return }
-            workspace.applyRemoteConnectionStateUpdate(
-                state,
-                detail: detail,
-                target: workspace.remoteDisplayTarget ?? "remote host"
-            )
+            switch mode {
+            case .workspaceRemote:
+                guard workspace.activeRemoteSessionControllerID == controllerID else { return }
+                workspace.applyRemoteConnectionStateUpdate(
+                    state,
+                    detail: detail,
+                    target: workspace.remoteDisplayTarget ?? "remote host"
+                )
+            case .surfaceAttachment(let transportKey, let sourcePanelId):
+                workspace.applyDetectedSSHRemoteConnectionState(
+                    transportKey: transportKey,
+                    sourcePanelId: sourcePanelId,
+                    state: state,
+                    detail: detail,
+                    target: target
+                )
+            case .prewarm:
+                break
+            }
         }
+    }
+
+    private func publishDaemonStatus(_ status: WorkspaceRemoteDaemonStatus) {
+        publishDaemonStatus(
+            status.state,
+            detail: status.detail,
+            version: status.version,
+            name: status.name,
+            capabilities: status.capabilities,
+            remotePath: status.remotePath
+        )
     }
 
     private func publishDaemonStatus(
@@ -3947,6 +4187,10 @@ final class WorkspaceRemoteSessionController {
         remotePath: String? = nil
     ) {
         let controllerID = self.controllerID
+        let mode = self.mode
+        let endpoint = proxyEndpoint
+        let target = configuration.displayTarget
+        let eventSink = self.eventSink
         let status = WorkspaceRemoteDaemonStatus(
             state: state,
             detail: detail,
@@ -3956,21 +4200,51 @@ final class WorkspaceRemoteSessionController {
             remotePath: remotePath
         )
         DispatchQueue.main.async { [weak workspace] in
+            eventSink?(.daemonStatus(status))
             guard let workspace else { return }
-            guard workspace.activeRemoteSessionControllerID == controllerID else { return }
-            workspace.applyRemoteDaemonStatusUpdate(
-                status,
-                target: workspace.remoteDisplayTarget ?? "remote host"
-            )
+            switch mode {
+            case .workspaceRemote:
+                guard workspace.activeRemoteSessionControllerID == controllerID else { return }
+                workspace.applyRemoteDaemonStatusUpdate(
+                    status,
+                    target: workspace.remoteDisplayTarget ?? "remote host"
+                )
+            case .surfaceAttachment(let transportKey, let sourcePanelId):
+                workspace.applyDetectedSSHRemoteStatus(
+                    transportKey: transportKey,
+                    sourcePanelId: sourcePanelId,
+                    daemonStatus: status,
+                    proxyEndpoint: endpoint,
+                    target: target
+                )
+            case .prewarm:
+                break
+            }
         }
     }
 
     private func publishProxyEndpoint(_ endpoint: BrowserProxyEndpoint?) {
         let controllerID = self.controllerID
+        let mode = self.mode
+        let target = configuration.displayTarget
+        let eventSink = self.eventSink
         DispatchQueue.main.async { [weak workspace] in
+            eventSink?(.proxyEndpoint(endpoint))
             guard let workspace else { return }
-            guard workspace.activeRemoteSessionControllerID == controllerID else { return }
-            workspace.applyRemoteProxyEndpointUpdate(endpoint)
+            switch mode {
+            case .workspaceRemote:
+                guard workspace.activeRemoteSessionControllerID == controllerID else { return }
+                workspace.applyRemoteProxyEndpointUpdate(endpoint)
+            case .surfaceAttachment(let transportKey, let sourcePanelId):
+                workspace.applyDetectedSSHRemoteProxyEndpoint(
+                    transportKey: transportKey,
+                    sourcePanelId: sourcePanelId,
+                    proxyEndpoint: endpoint,
+                    target: target
+                )
+            case .prewarm:
+                break
+            }
         }
     }
 
@@ -4397,8 +4671,9 @@ final class WorkspaceRemoteSessionController {
             try uploadRemoteDaemonBinaryLocked(localBinary: localBinary, remotePath: remotePath)
             hello = try helloRemoteDaemonLocked(remotePath: remotePath)
         }
-        if hadExistingBinary, !hello.capabilities.contains(WorkspaceRemoteDaemonRPCClient.requiredProxyStreamCapability) {
-            debugLog("remote.bootstrap.capabilityMissing remotePath=\(remotePath) capabilities=\(hello.capabilities.joined(separator: ","))")
+        if hadExistingBinary,
+           let missingCapability = WorkspaceRemoteDaemonRPCClient.missingRequiredCapability(in: hello.capabilities) {
+            debugLog("remote.bootstrap.capabilityMissing remotePath=\(remotePath) missing=\(missingCapability) capabilities=\(hello.capabilities.joined(separator: ","))")
             let localBinary = try buildLocalDaemonBinary(goOS: platform.goOS, goArch: platform.goArch, version: version)
             try uploadRemoteDaemonBinaryLocked(localBinary: localBinary, remotePath: remotePath)
             hello = try helloRemoteDaemonLocked(remotePath: remotePath)
@@ -4424,23 +4699,38 @@ final class WorkspaceRemoteSessionController {
         let relayServer = try WorkspaceRemoteCLIRelayServer(
             localSocketPath: localSocketPath,
             relayID: relayID,
-            relayTokenHex: relayToken
+            relayTokenHex: relayToken,
+            requestedLocalPort: configuration.localRelayPort
         )
         cliRelayServer = relayServer
         return relayServer
+    }
+
+    private func publishLocalRelayPortLocked(_ localRelayPort: Int, relayPort: Int, relayID: String) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.workspace?.rememberRemoteLocalRelayPort(
+                localRelayPort,
+                controllerID: self.controllerID,
+                relayPort: relayPort,
+                relayID: relayID
+            )
+        }
     }
 
     private func installRemoteRelayMetadataLocked(
         remotePath: String,
         relayPort: Int,
         relayID: String,
-        relayToken: String
+        relayToken: String,
+        setDefaultSocketAddress: Bool = true
     ) throws {
         let script = Self.remoteRelayMetadataInstallScript(
             daemonRemotePath: remotePath,
             relayPort: relayPort,
             relayID: relayID,
-            relayToken: relayToken
+            relayToken: relayToken,
+            setDefaultSocketAddress: setDefaultSocketAddress
         )
         let command = "sh -c \(Self.shellSingleQuoted(script))"
         let result = try sshExec(arguments: sshCommonArguments(batchMode: true) + [configuration.destination, command], timeout: 8)
@@ -4448,6 +4738,39 @@ final class WorkspaceRemoteSessionController {
             let detail = Self.bestErrorLine(stderr: result.stderr, stdout: result.stdout) ?? "ssh exited \(result.status)"
             throw NSError(domain: "cmux.remote.relay", code: 70, userInfo: [
                 NSLocalizedDescriptionKey: "failed to install remote relay metadata: \(detail)",
+            ])
+        }
+    }
+
+    private func verifyRemoteRelayFailureDetailLocked(relayPort: Int) -> String? {
+        let verifyScript = """
+        CMUX_SOCKET_PATH=127.0.0.1:\(relayPort) "$HOME/.cmux/bin/cmux" ping
+        """
+        let command = "sh -c \(Self.shellSingleQuoted(verifyScript))"
+        do {
+            let result = try sshExec(
+                arguments: sshCommonArguments(batchMode: true) + [configuration.destination, command],
+                timeout: 4
+            )
+            guard result.status == 0,
+                  result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "PONG" else {
+                return Self.bestErrorLine(stderr: result.stderr, stdout: result.stdout)
+                    ?? "ssh exited \(result.status)"
+            }
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private func setRemoteDefaultRelaySocketLocked(relayPort: Int) throws {
+        let script = Self.remoteRelayDefaultSocketInstallScript(relayPort: relayPort)
+        let command = "sh -c \(Self.shellSingleQuoted(script))"
+        let result = try sshExec(arguments: sshCommonArguments(batchMode: true) + [configuration.destination, command], timeout: 4)
+        guard result.status == 0 else {
+            let detail = Self.bestErrorLine(stderr: result.stderr, stdout: result.stdout) ?? "ssh exited \(result.status)"
+            throw NSError(domain: "cmux.remote.relay", code: 71, userInfo: [
+                NSLocalizedDescriptionKey: "failed to install remote default relay socket: \(detail)",
             ])
         }
     }
@@ -5045,7 +5368,8 @@ final class WorkspaceRemoteSessionController {
         daemonRemotePath: String,
         relayPort: Int,
         relayID: String,
-        relayToken: String
+        relayToken: String,
+        setDefaultSocketAddress: Bool = true
     ) -> String {
         let trimmedRemotePath = daemonRemotePath.trimmingCharacters(in: .whitespacesAndNewlines)
         let authPayload = """
@@ -5061,6 +5385,13 @@ final class WorkspaceRemoteSessionController {
         \(authPayload)
         CMUXRELAYAUTH
         chmod 600 "$HOME/.cmux/relay/\(relayPort).auth"
+        \(setDefaultSocketAddress ? remoteRelayDefaultSocketInstallScript(relayPort: relayPort) : "")
+        """
+    }
+
+    static func remoteRelayDefaultSocketInstallScript(relayPort: Int) -> String {
+        """
+        mkdir -p "$HOME/.cmux"
         printf '%s' '127.0.0.1:\(relayPort)' > "$HOME/.cmux/socket_addr"
         """
     }
@@ -5348,16 +5679,56 @@ final class WorkspaceRemoteSessionController {
         process.standardOutput = stdout
         process.standardError = stderr
 
+        let stdoutHandle = stdout.fileHandleForReading
+        let stderrHandle = stderr.fileHandleForReading
+        let captureQueue = DispatchQueue(label: "cmux.remote.path-helper.capture")
+        let captureGroup = DispatchGroup()
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        var stdoutData = Data()
+
+        process.terminationHandler = { _ in
+            exitSemaphore.signal()
+        }
+
+        captureGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = stdoutHandle.readDataToEndOfFile()
+            captureQueue.sync {
+                stdoutData = data
+            }
+            captureGroup.leave()
+        }
+
+        captureGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            _ = stderrHandle.readDataToEndOfFile()
+            captureGroup.leave()
+        }
+
         do {
             try process.run()
         } catch {
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForWriting.close()
             return ""
         }
+        try? stdout.fileHandleForWriting.close()
+        try? stderr.fileHandleForWriting.close()
 
-        process.waitUntilExit()
+        let didExit = exitSemaphore.wait(timeout: .now() + 2.0) == .success
+        if !didExit {
+            process.terminate()
+            if exitSemaphore.wait(timeout: .now() + 1.0) != .success, process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                process.waitUntilExit()
+            }
+        }
+        _ = captureGroup.wait(timeout: .now() + 1.0)
+        try? stdoutHandle.close()
+        try? stderrHandle.close()
+        guard didExit else { return "" }
         guard process.terminationStatus == 0 else { return "" }
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8) ?? ""
+        return String(data: stdoutData, encoding: .utf8) ?? ""
     }
 
     private static func which(_ executable: String) -> String? {
@@ -5775,6 +6146,9 @@ final class WorkspaceRemoteSessionController {
     }
 
     private func remotePortPollingModeLocked() -> RemotePortPollingMode? {
+        if case .surfaceAttachment = mode {
+            return nil
+        }
         if !remotePortScanTTYNames.isEmpty {
             return shouldUseTTYFallbackRemotePortPollingLocked() ? .ttyScoped : nil
         }
@@ -6036,6 +6410,7 @@ struct WorkspaceRemoteConfiguration: Equatable {
     let sshOptions: [String]
     let localProxyPort: Int?
     let relayPort: Int?
+    let localRelayPort: Int?
     let relayID: String?
     let relayToken: String?
     let localSocketPath: String?
@@ -6049,6 +6424,7 @@ struct WorkspaceRemoteConfiguration: Equatable {
         sshOptions: [String],
         localProxyPort: Int?,
         relayPort: Int?,
+        localRelayPort: Int? = nil,
         relayID: String?,
         relayToken: String?,
         localSocketPath: String?,
@@ -6061,11 +6437,29 @@ struct WorkspaceRemoteConfiguration: Equatable {
         self.sshOptions = sshOptions
         self.localProxyPort = localProxyPort
         self.relayPort = relayPort
+        self.localRelayPort = localRelayPort
         self.relayID = relayID
         self.relayToken = relayToken
         self.localSocketPath = localSocketPath
         self.terminalStartupCommand = terminalStartupCommand
         self.foregroundAuthToken = foregroundAuthToken
+    }
+
+    func withLocalRelayPort(_ localRelayPort: Int?) -> WorkspaceRemoteConfiguration {
+        WorkspaceRemoteConfiguration(
+            destination: destination,
+            port: port,
+            identityFile: identityFile,
+            sshOptions: sshOptions,
+            localProxyPort: localProxyPort,
+            relayPort: relayPort,
+            localRelayPort: localRelayPort,
+            relayID: relayID,
+            relayToken: relayToken,
+            localSocketPath: localSocketPath,
+            terminalStartupCommand: terminalStartupCommand,
+            foregroundAuthToken: foregroundAuthToken
+        )
     }
 
     var displayTarget: String {
@@ -6595,9 +6989,13 @@ struct LocalTerminalDaemonRegistration: Equatable {
 private struct LocalTerminalDaemonControlError: LocalizedError {
     let key: String
     let defaultValue: String
+    var usesRuntimeDetail = false
 
     var errorDescription: String? {
-        Bundle.main.localizedString(forKey: key, value: defaultValue, table: nil)
+        if usesRuntimeDetail {
+            return defaultValue
+        }
+        return Bundle.main.localizedString(forKey: key, value: defaultValue, table: nil)
     }
 }
 
@@ -6609,6 +7007,18 @@ struct TerminalRuntimeMetadata: Equatable {
     let foregroundProcessName: String?
     let foregroundProcessCommand: String?
     let title: String?
+}
+
+private struct LocalDaemonSSHDetectionCandidate: Sendable {
+    let panelId: UUID
+    let localSessionID: String
+    let fallbackTTYName: String?
+}
+
+private struct LocalDaemonSSHDetectionResult: Sendable {
+    let panelId: UUID
+    let ttyName: String?
+    let session: DetectedSSHSession?
 }
 
 @MainActor
@@ -6726,6 +7136,8 @@ final class Workspace: Identifiable, ObservableObject {
     @Published var listeningPorts: [Int] = []
     @Published private(set) var activeRemoteTerminalSessionCount: Int = 0
     var surfaceTTYNames: [UUID: String] = [:]
+    @Published private(set) var remoteAttachmentsByPanelId: [UUID: TerminalRemoteAttachment] = [:]
+    @Published private(set) var remoteAttachmentSnapshotRevision: Int = 0
     private var remoteSessionController: WorkspaceRemoteSessionController?
     private var pendingRemoteForegroundAuthToken: String?
     fileprivate var activeRemoteSessionControllerID: UUID?
@@ -6735,10 +7147,24 @@ final class Workspace: Identifiable, ObservableObject {
     private var remoteDetectedSurfaceIds: Set<UUID> = []
     private var activeRemoteTerminalSurfaceIds: Set<UUID> = []
     private var pendingRemoteTerminalChildExitSurfaceIds: Set<UUID> = []
+    private var pendingSSHDetectionWorkItems: [UUID: DispatchWorkItem] = [:]
+    private var detectedSSHControllersByTransportKey: [String: WorkspaceRemoteSessionController] = [:]
+    private var detectedSSHPanelIdsByTransportKey: [String: Set<UUID>] = [:]
+    private var detectedSSHSessionsByTransportKey: [String: DetectedSSHSession] = [:]
+    private var detectedSSHRelayConfigurationsByTransportKey: [String: WorkspaceRemoteConfiguration] = [:]
+    private var detectedSSHRelayConfigurationsByPanelId: [UUID: WorkspaceRemoteConfiguration] = [:]
+    private var detectedSSHTransportKeyByPanelId: [UUID: String] = [:]
+    private var detectedSSHDaemonStatusByTransportKey: [String: WorkspaceRemoteDaemonStatus] = [:]
+    private var remoteProxyEndpointsByDetectedTransportKey: [String: BrowserProxyEndpoint] = [:]
+    private var remoteProxyEndpointsBySourcePanelId: [UUID: BrowserProxyEndpoint] = [:]
+    private var localDaemonSSHDetectionPollWorkItem: DispatchWorkItem?
+    private var localDaemonSSHDetectionPollInFlight = false
+    private var localDaemonSSHDetectionGeneration: UInt64 = 0
 
     private static let remoteErrorStatusKey = "remote.error"
     private static let remotePortConflictStatusKey = "remote.port_conflicts"
     private static let localTerminalDaemonFallbackStatusKey = "local.terminal_daemon_starting"
+    private static let localDaemonSSHDetectionPollInterval: TimeInterval = 1.0
     private static let remoteNotificationCooldown: TimeInterval = 5 * 60
     private static let sshControlMasterCleanupQueue = DispatchQueue(
         label: "com.cmux.remote-ssh.control-master-cleanup",
@@ -7125,11 +7551,14 @@ final class Workspace: Identifiable, ObservableObject {
             bonsplitController.selectTab(initialTabId)
         }
         tmuxLayoutSnapshot = bonsplitController.layoutSnapshot()
+        scheduleLocalDaemonSSHDetectionPoll(delay: Self.localDaemonSSHDetectionPollInterval)
     }
 
     deinit {
         activeRemoteSessionControllerID = nil
         remoteSessionController?.stop()
+        localDaemonSSHDetectionGeneration &+= 1
+        localDaemonSSHDetectionPollWorkItem?.cancel()
         if let localTerminalDaemonWarmupObserver {
             NotificationCenter.default.removeObserver(localTerminalDaemonWarmupObserver)
         }
@@ -7495,11 +7924,64 @@ final class Workspace: Identifiable, ObservableObject {
         return runLocalTerminalCLI(cliPath: "/bin/launchctl", arguments: arguments, timeout: timeout)
     }
 
-    nonisolated private static func isLocalTerminalLaunchAgentLoaded(label: String) -> Bool {
-        guard let result = runLocalLaunchctl(arguments: ["print", localTerminalLaunchctlTarget(label: label)], timeout: 2.0) else {
+    nonisolated private static func localTerminalDaemonLogSnippet(_ value: String, limit: Int = 240) -> String {
+        let collapsed = value
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        guard collapsed.count > limit else {
+            return collapsed
+        }
+        return String(collapsed.prefix(limit)) + "..."
+    }
+
+    nonisolated private static func isLocalTerminalLaunchAgentLoaded(
+        label: String,
+        context: String = "check",
+        timeout: TimeInterval = 1.0
+    ) -> Bool {
+        let target = localTerminalLaunchctlTarget(label: label)
+        guard let result = runLocalLaunchctl(arguments: ["print", target], timeout: timeout) else {
+            #if DEBUG
+            dlog("daemon.restart.workspace launchctl_print context=\(context) target=\(target) result=nil")
+            #endif
             return false
         }
-        return result.status == 0
+        let stderr = String(data: result.stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stdout = String(data: result.stdout, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let outputLooksLoaded = stdout.hasPrefix("\(target) = {") && stdout.contains("state =")
+        #if DEBUG
+        dlog(
+            "daemon.restart.workspace launchctl_print context=\(context) target=\(target) " +
+            "status=\(result.status) outputLooksLoaded=\(outputLooksLoaded) stdoutBytes=\(result.stdout.count) " +
+            "stderr=\(localTerminalDaemonLogSnippet(stderr)) " +
+            "stdout=\(localTerminalDaemonLogSnippet(stdout))"
+        )
+        #endif
+        return result.status == 0 || outputLooksLoaded
+    }
+
+    nonisolated private static func waitForLocalTerminalLaunchAgentLoaded(
+        label: String,
+        timeout: TimeInterval,
+        context: String
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        var attempt = 0
+        repeat {
+            attempt += 1
+            let remaining = max(0.1, deadline.timeIntervalSinceNow)
+            if isLocalTerminalLaunchAgentLoaded(
+                label: label,
+                context: "\(context).attempt\(attempt)",
+                timeout: min(0.5, remaining)
+            ) {
+                return true
+            }
+            if Date() < deadline {
+                Thread.sleep(forTimeInterval: min(0.1, max(0.01, deadline.timeIntervalSinceNow)))
+            }
+        } while Date() < deadline
+        return false
     }
 
     nonisolated private static func localTerminalDaemonLaunchctlFailureMessage(
@@ -7656,7 +8138,10 @@ final class Workspace: Identifiable, ObservableObject {
         #endif
 
         let launchctlTarget = localTerminalLaunchctlTarget(label: registration.launchAgentLabel)
-        let alreadyLoaded = isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel)
+        let alreadyLoaded = isLocalTerminalLaunchAgentLoaded(
+            label: registration.launchAgentLabel,
+            context: "restart.initial"
+        )
         #if DEBUG
         dlog("daemon.restart.workspace target=\(launchctlTarget) alreadyLoaded=\(alreadyLoaded)")
         #endif
@@ -7670,13 +8155,17 @@ final class Workspace: Identifiable, ObservableObject {
             let bootoutStderr = bootoutResult.flatMap { String(data: $0.stderr, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             dlog("daemon.restart.workspace bootout status=\(bootoutStatus) stderr=\(bootoutStderr)")
             #endif
-            if bootoutResult?.status != 0 && isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
+            if bootoutResult?.status != 0 && isLocalTerminalLaunchAgentLoaded(
+                label: registration.launchAgentLabel,
+                context: "restart.bootout_failed"
+            ) {
                 #if DEBUG
                 dlog("daemon.restart.workspace guard=bootout_failed")
                 #endif
                 throw LocalTerminalDaemonControlError(
                     key: "debug.localTerminalDaemon.error.bootout",
-                    defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootout", result: bootoutResult)
+                    defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootout", result: bootoutResult),
+                    usesRuntimeDetail: true
                 )
             }
         }
@@ -7693,14 +8182,73 @@ final class Workspace: Identifiable, ObservableObject {
         let bootstrapStderr = bootstrapResult.flatMap { String(data: $0.stderr, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         dlog("daemon.restart.workspace bootstrap status=\(bootstrapStatus) stderr=\(bootstrapStderr)")
         #endif
-        if bootstrapResult?.status != 0 && !isLocalTerminalLaunchAgentLoaded(label: registration.launchAgentLabel) {
-            #if DEBUG
-            dlog("daemon.restart.workspace guard=bootstrap_failed")
-            #endif
-            throw LocalTerminalDaemonControlError(
-                key: "debug.localTerminalDaemon.error.bootstrap",
-                defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootstrap", result: bootstrapResult)
+        if bootstrapResult?.status != 0 {
+            let loadedAfterBootstrapFailure = waitForLocalTerminalLaunchAgentLoaded(
+                label: registration.launchAgentLabel,
+                timeout: 2.0,
+                context: "restart.bootstrap_failed"
             )
+            if loadedAfterBootstrapFailure {
+                #if DEBUG
+                dlog("daemon.restart.workspace bootstrap_nonzero_loaded recovery=bootout_bootstrap")
+                dlog("daemon.restart.workspace recovery_bootout begin")
+                #endif
+                let recoveryBootoutResult = runLocalLaunchctl(arguments: ["bootout", launchctlTarget], timeout: 3.0)
+                #if DEBUG
+                let recoveryBootoutStatus = recoveryBootoutResult.map { "\($0.status)" } ?? "nil"
+                let recoveryBootoutStderr = recoveryBootoutResult.flatMap { String(data: $0.stderr, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                dlog("daemon.restart.workspace recovery_bootout status=\(recoveryBootoutStatus) stderr=\(recoveryBootoutStderr)")
+                #endif
+                if recoveryBootoutResult?.status != 0 && isLocalTerminalLaunchAgentLoaded(
+                    label: registration.launchAgentLabel,
+                    context: "restart.recovery_bootout_failed"
+                ) {
+                    #if DEBUG
+                    dlog("daemon.restart.workspace guard=recovery_bootout_failed")
+                    #endif
+                    throw LocalTerminalDaemonControlError(
+                        key: "debug.localTerminalDaemon.error.bootout",
+                        defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootout", result: recoveryBootoutResult),
+                        usesRuntimeDetail: true
+                    )
+                }
+
+                #if DEBUG
+                dlog("daemon.restart.workspace recovery_bootstrap begin")
+                #endif
+                let recoveryBootstrapResult = runLocalLaunchctl(
+                    arguments: ["bootstrap", "gui/\(getuid())", registration.launchAgentPlistPath],
+                    timeout: 3.0
+                )
+                #if DEBUG
+                let recoveryBootstrapStatus = recoveryBootstrapResult.map { "\($0.status)" } ?? "nil"
+                let recoveryBootstrapStderr = recoveryBootstrapResult.flatMap { String(data: $0.stderr, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                dlog("daemon.restart.workspace recovery_bootstrap status=\(recoveryBootstrapStatus) stderr=\(recoveryBootstrapStderr)")
+                #endif
+                if recoveryBootstrapResult?.status != 0 && !waitForLocalTerminalLaunchAgentLoaded(
+                    label: registration.launchAgentLabel,
+                    timeout: 2.0,
+                    context: "restart.recovery_bootstrap_failed"
+                ) {
+                    #if DEBUG
+                    dlog("daemon.restart.workspace guard=recovery_bootstrap_failed")
+                    #endif
+                    throw LocalTerminalDaemonControlError(
+                        key: "debug.localTerminalDaemon.error.bootstrap",
+                        defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootstrap", result: recoveryBootstrapResult),
+                        usesRuntimeDetail: true
+                    )
+                }
+            } else {
+                #if DEBUG
+                dlog("daemon.restart.workspace guard=bootstrap_failed")
+                #endif
+                throw LocalTerminalDaemonControlError(
+                    key: "debug.localTerminalDaemon.error.bootstrap",
+                    defaultValue: localTerminalDaemonLaunchctlFailureMessage(action: "launchctl bootstrap", result: bootstrapResult),
+                    usesRuntimeDetail: true
+                )
+            }
         }
 
         #if DEBUG
@@ -7739,7 +8287,8 @@ final class Workspace: Identifiable, ObservableObject {
             }
             throw LocalTerminalDaemonControlError(
                 key: "debug.localTerminalDaemon.error.notReady",
-                defaultValue: detail
+                defaultValue: detail,
+                usesRuntimeDetail: true
             )
         }
         #if DEBUG
@@ -7844,9 +8393,35 @@ final class Workspace: Identifiable, ObservableObject {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
+        let outputLock = NSLock()
+        var stdout = Data()
+        var stderr = Data()
+        let outputGroup = DispatchGroup()
+        outputGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            outputLock.lock()
+            stdout = data
+            outputLock.unlock()
+            outputGroup.leave()
+        }
+        outputGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            outputLock.lock()
+            stderr = data
+            outputLock.unlock()
+            outputGroup.leave()
+        }
+
         do {
             try process.run()
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
         } catch {
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            _ = outputGroup.wait(timeout: .now() + 1.0)
             return nil
         }
 
@@ -7859,9 +8434,12 @@ final class Workspace: Identifiable, ObservableObject {
             process.waitUntilExit()
         }
 
-        let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        return (process.terminationStatus, stdout, stderr)
+        _ = outputGroup.wait(timeout: .now() + 1.0)
+        outputLock.lock()
+        let capturedStdout = stdout
+        let capturedStderr = stderr
+        outputLock.unlock()
+        return (process.terminationStatus, capturedStdout, capturedStderr)
     }
 
     nonisolated private static func runLocalTerminalDaemonRPCDirect(
@@ -8237,6 +8815,12 @@ final class Workspace: Identifiable, ObservableObject {
            !bundleId.isEmpty {
             setManagedEnvironmentValue("CMUX_BUNDLE_ID", bundleId)
         }
+        if SSHAutoRemoteSettings.passiveEnhancementEnabled() {
+            setManagedEnvironmentValue("CMUX_SSH_PASSIVE_ENHANCEMENT", "1")
+        }
+        if SSHAutoRemoteSettings.upgradeInteractiveCommandsEnabled() {
+            setManagedEnvironmentValue("CMUX_SSH_UPGRADE_INTERACTIVE", "1")
+        }
 
         let portBase = {
             let value = UserDefaults.standard.integer(forKey: "cmuxPortBase")
@@ -8280,6 +8864,14 @@ final class Workspace: Identifiable, ObservableObject {
            let integrationDir = Bundle.main.resourceURL?.appendingPathComponent("shell-integration").path {
             setManagedEnvironmentValue("CMUX_SHELL_INTEGRATION", "1")
             setManagedEnvironmentValue("CMUX_SHELL_INTEGRATION_DIR", integrationDir)
+
+            let currentDataDirs = (environment["XDG_DATA_DIRS"]?.isEmpty == false ? environment["XDG_DATA_DIRS"] : nil)
+                ?? getenv("XDG_DATA_DIRS").map { String(cString: $0) }
+                ?? (ProcessInfo.processInfo.environment["XDG_DATA_DIRS"]?.isEmpty == false ? ProcessInfo.processInfo.environment["XDG_DATA_DIRS"] : nil)
+                ?? "/usr/local/share:/usr/share"
+            if !currentDataDirs.split(separator: ":").contains(Substring(integrationDir)) {
+                setManagedEnvironmentValue("XDG_DATA_DIRS", "\(integrationDir):\(currentDataDirs)")
+            }
 
             let shell = (environment["SHELL"]?.isEmpty == false ? environment["SHELL"] : nil)
                 ?? getenv("SHELL").map { String(cString: $0) }
@@ -8377,6 +8969,103 @@ final class Workspace: Identifiable, ObservableObject {
             foregroundProcessCommand: Self.nonEmptyPayloadString(statusPayload["foreground_process_command"]),
             title: Self.nonEmptyPayloadString(statusPayload["title"])
         )
+    }
+
+    private func scheduleLocalDaemonSSHDetectionPoll(delay: TimeInterval) {
+        guard localDaemonSSHDetectionPollWorkItem == nil else { return }
+        let generation = localDaemonSSHDetectionGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self,
+                      self.localDaemonSSHDetectionGeneration == generation else {
+                    return
+                }
+                self.localDaemonSSHDetectionPollWorkItem = nil
+                self.runLocalDaemonSSHDetectionPoll(generation: generation)
+            }
+        }
+        localDaemonSSHDetectionPollWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func runLocalDaemonSSHDetectionPoll(generation: UInt64) {
+        guard localDaemonSSHDetectionGeneration == generation else { return }
+        guard !localDaemonSSHDetectionPollInFlight else {
+            scheduleLocalDaemonSSHDetectionPoll(delay: Self.localDaemonSSHDetectionPollInterval)
+            return
+        }
+        guard SSHAutoRemoteSettings.passiveEnhancementEnabled() else {
+            scheduleLocalDaemonSSHDetectionPoll(delay: Self.localDaemonSSHDetectionPollInterval)
+            return
+        }
+
+        let candidates = panels.compactMap { panelId, panel -> LocalDaemonSSHDetectionCandidate? in
+            guard panel is TerminalPanel,
+                  !isRemoteTerminalSurface(panelId),
+                  let localSessionID = Self.nonEmptyTrimmedString(terminalPanel(for: panelId)?.localSessionID) else {
+                return nil
+            }
+            return LocalDaemonSSHDetectionCandidate(
+                panelId: panelId,
+                localSessionID: localSessionID,
+                fallbackTTYName: Self.nonEmptyTrimmedString(surfaceTTYNames[panelId])
+            )
+        }
+
+        guard !candidates.isEmpty else {
+            scheduleLocalDaemonSSHDetectionPoll(delay: Self.localDaemonSSHDetectionPollInterval)
+            return
+        }
+
+        localDaemonSSHDetectionPollInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let results = candidates.map { candidate -> LocalDaemonSSHDetectionResult in
+                let statusPayload = Self.localTerminalStatusPayload(sessionID: candidate.localSessionID)
+                let ttyName = Self.nonEmptyPayloadString(statusPayload?["tty_name"]) ?? candidate.fallbackTTYName
+                let session = ttyName.flatMap { TerminalSSHSessionDetector.detect(forTTY: $0) }
+                return LocalDaemonSSHDetectionResult(
+                    panelId: candidate.panelId,
+                    ttyName: ttyName,
+                    session: session
+                )
+            }
+
+            DispatchQueue.main.async {
+                Task { @MainActor in
+                    self?.applyLocalDaemonSSHDetectionResults(results, generation: generation)
+                }
+            }
+        }
+    }
+
+    private func applyLocalDaemonSSHDetectionResults(
+        _ results: [LocalDaemonSSHDetectionResult],
+        generation: UInt64
+    ) {
+        guard localDaemonSSHDetectionGeneration == generation else { return }
+        localDaemonSSHDetectionPollInFlight = false
+
+        for result in results {
+            guard panels[result.panelId] is TerminalPanel,
+                  !isRemoteTerminalSurface(result.panelId) else {
+                continue
+            }
+
+            if let ttyName = Self.nonEmptyTrimmedString(result.ttyName) {
+                if surfaceTTYNames[result.panelId] != ttyName {
+                    surfaceTTYNames[result.panelId] = ttyName
+                    PortScanner.shared.registerTTY(workspaceId: id, panelId: result.panelId, ttyName: ttyName)
+                }
+            }
+
+            if let session = result.session {
+                applyDetectedSSHSession(session, panelId: result.panelId)
+            } else if result.ttyName != nil {
+                clearDetectedSSHAttachment(panelId: result.panelId)
+            }
+        }
+
+        scheduleLocalDaemonSSHDetectionPoll(delay: Self.localDaemonSSHDetectionPollInterval)
     }
 
     func currentDirectoryForCLI() -> String {
@@ -9313,6 +10002,13 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func pruneSurfaceMetadata(validSurfaceIds: Set<UUID>) {
+        let invalidDetectedPanelIds = detectedSSHTransportKeyByPanelId.keys.filter { !validSurfaceIds.contains($0) }
+        for panelId in invalidDetectedPanelIds {
+            if let transportKey = detectedSSHTransportKeyByPanelId[panelId] {
+                stopDetectedSSHRemoteSupport(panelId: panelId, transportKey: transportKey)
+            }
+        }
+        pendingSSHDetectionWorkItems = pendingSSHDetectionWorkItems.filter { validSurfaceIds.contains($0.key) }
         panelDirectories = panelDirectories.filter { validSurfaceIds.contains($0.key) }
         panelTitles = panelTitles.filter { validSurfaceIds.contains($0.key) }
         panelCustomTitles = panelCustomTitles.filter { validSurfaceIds.contains($0.key) }
@@ -9322,6 +10018,18 @@ final class Workspace: Identifiable, ObservableObject {
         manualUnreadMarkedAt = manualUnreadMarkedAt.filter { validSurfaceIds.contains($0.key) }
         surfaceListeningPorts = surfaceListeningPorts.filter { validSurfaceIds.contains($0.key) }
         surfaceTTYNames = surfaceTTYNames.filter { validSurfaceIds.contains($0.key) }
+        let filteredRemoteAttachmentsByPanelId = remoteAttachmentsByPanelId.filter { validSurfaceIds.contains($0.key) }
+        if filteredRemoteAttachmentsByPanelId != remoteAttachmentsByPanelId {
+            remoteAttachmentsByPanelId = filteredRemoteAttachmentsByPanelId
+            remoteAttachmentSnapshotRevision &+= 1
+        }
+        let filteredDetectedRelayConfigurationsByPanelId = detectedSSHRelayConfigurationsByPanelId.filter {
+            validSurfaceIds.contains($0.key)
+        }
+        if filteredDetectedRelayConfigurationsByPanelId.count != detectedSSHRelayConfigurationsByPanelId.count {
+            detectedSSHRelayConfigurationsByPanelId = filteredDetectedRelayConfigurationsByPanelId
+            remoteAttachmentSnapshotRevision &+= 1
+        }
         remoteDetectedSurfaceIds = remoteDetectedSurfaceIds.filter { validSurfaceIds.contains($0) }
         panelShellActivityStates = panelShellActivityStates.filter { validSurfaceIds.contains($0.key) }
         panelPullRequests = panelPullRequests.filter { validSurfaceIds.contains($0.key) }
@@ -9508,6 +10216,343 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     @MainActor
+    func remoteAttachment(for panelId: UUID) -> TerminalRemoteAttachment? {
+        remoteAttachmentsByPanelId[panelId]
+    }
+
+    @MainActor
+    func setRemoteAttachment(_ attachment: TerminalRemoteAttachment?, for panelId: UUID) {
+        if case .detectedSSH(let existing)? = remoteAttachmentsByPanelId[panelId] {
+            let nextTransportKey: String? = {
+                guard case .detectedSSH(let next)? = attachment else { return nil }
+                return next.transportKey
+            }()
+            if nextTransportKey != existing.transportKey {
+                stopDetectedSSHRemoteSupport(panelId: panelId, transportKey: existing.transportKey)
+            }
+        }
+
+        var next = remoteAttachmentsByPanelId
+        if let attachment {
+            next[panelId] = attachment
+        } else {
+            next.removeValue(forKey: panelId)
+        }
+        guard next != remoteAttachmentsByPanelId else { return }
+        remoteAttachmentsByPanelId = next
+        remoteAttachmentSnapshotRevision &+= 1
+    }
+
+    @MainActor
+    func remoteAttachmentPayload(for panelId: UUID) -> [String: Any]? {
+        remoteAttachmentsByPanelId[panelId]?.payload()
+    }
+
+    @MainActor
+    func scheduleDetectedSSHAttachmentRefresh(panelId: UUID, reason: String) {
+        pendingSSHDetectionWorkItems[panelId]?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.pendingSSHDetectionWorkItems.removeValue(forKey: panelId)
+                self.refreshDetectedSSHAttachmentNow(panelId: panelId, reason: reason)
+            }
+        }
+        pendingSSHDetectionWorkItems[panelId] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+    }
+
+    @MainActor
+    func refreshDetectedSSHAttachmentNow(panelId: UUID, reason: String) {
+        _ = reason
+        guard SSHAutoRemoteSettings.passiveEnhancementEnabled() else {
+            clearDetectedSSHAttachment(panelId: panelId)
+            return
+        }
+        guard panels[panelId] is TerminalPanel,
+              !isRemoteTerminalSurface(panelId),
+              let ttyName = surfaceTTYNames[panelId]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !ttyName.isEmpty,
+              let session = TerminalSSHSessionDetector.detect(forTTY: ttyName) else {
+            clearDetectedSSHAttachment(panelId: panelId)
+            return
+        }
+
+        applyDetectedSSHSession(session, panelId: panelId)
+    }
+
+    private func applyDetectedSSHSession(_ session: DetectedSSHSession, panelId: UUID) {
+        if case .detectedSSH(let existing)? = remoteAttachmentsByPanelId[panelId],
+           shouldPreserveExplicitSSHUpgradeAttachment(existing, for: session) {
+            #if DEBUG
+            dlog(
+                "ssh.passive.preserve_explicit_upgrade panel=\(panelId.uuidString) " +
+                "target=\(existing.displayTarget) transportKey=\(existing.transportKey)"
+            )
+            #endif
+            return
+        }
+
+        let transportKey = Self.detectedSSHTransportKey(session)
+        detectedSSHSessionsByTransportKey[transportKey] = session
+        let displayTarget = session.port.map { "\(session.destination):\($0)" } ?? session.destination
+        let existingDetectedAttachment: DetectedSSHAttachment? = {
+            guard case .detectedSSH(let existing)? = remoteAttachmentsByPanelId[panelId],
+                  existing.transportKey == transportKey else {
+                return nil
+            }
+            return existing
+        }()
+
+        if existingDetectedAttachment == nil {
+            setRemoteAttachment(
+                .detectedSSH(.init(
+                    destination: session.destination,
+                    displayTarget: displayTarget,
+                    port: session.port,
+                    identityFile: session.identityFile,
+                    sshOptions: session.sshOptions,
+                    transportKey: transportKey,
+                    daemonState: .unavailable
+                )),
+                for: panelId
+            )
+        }
+        startDetectedSSHRemoteSupportIfNeeded(
+            session: session,
+            panelId: panelId,
+            transportKey: transportKey
+        )
+    }
+
+    private func shouldPreserveExplicitSSHUpgradeAttachment(
+        _ existing: DetectedSSHAttachment,
+        for session: DetectedSSHSession
+    ) -> Bool {
+        guard existing.transportKey.hasPrefix(Self.sshExecUpgradeTransportKeyPrefix) else {
+            return false
+        }
+        return existing.destination == session.destination
+            && existing.port == session.port
+    }
+
+    private func clearDetectedSSHAttachment(panelId: UUID) {
+        guard case .detectedSSH(let existing) = remoteAttachmentsByPanelId[panelId] else { return }
+        if existing.transportKey.hasPrefix(Self.sshExecUpgradeTransportKeyPrefix) {
+            #if DEBUG
+            dlog(
+                "ssh.passive.preserve_explicit_upgrade_clear panel=\(panelId.uuidString) " +
+                "target=\(existing.displayTarget) transportKey=\(existing.transportKey)"
+            )
+            #endif
+            return
+        }
+        setRemoteAttachment(nil, for: panelId)
+    }
+
+    private static func detectedSSHTransportKey(_ session: DetectedSSHSession) -> String {
+        [
+            session.destination,
+            session.port.map(String.init) ?? "",
+            session.identityFile ?? "",
+            session.configFile ?? "",
+            session.jumpHost ?? "",
+            session.controlPath ?? "",
+            session.useIPv4 ? "4" : "",
+            session.useIPv6 ? "6" : "",
+            session.forwardAgent ? "A" : "",
+            session.compressionEnabled ? "C" : "",
+            session.sshOptions.joined(separator: "\u{1f}"),
+        ].joined(separator: "\u{1e}")
+    }
+
+    static func detectedSSHTransportKeyForUpgrade(_ session: DetectedSSHSession) -> String {
+        detectedSSHTransportKey(session)
+    }
+
+    static let sshExecUpgradeTransportKeyPrefix = "ssh-exec:"
+
+    @MainActor
+    func startDetectedSSHRemoteSupportIfNeeded(
+        session: DetectedSSHSession,
+        panelId: UUID,
+        transportKey: String,
+        relayConfiguration: WorkspaceRemoteConfiguration? = nil,
+        allowPreparedAdoption: Bool = true
+    ) {
+        detectedSSHSessionsByTransportKey[transportKey] = session
+
+        var panelIds = detectedSSHPanelIdsByTransportKey[transportKey] ?? []
+        panelIds.insert(panelId)
+        detectedSSHPanelIdsByTransportKey[transportKey] = panelIds
+        detectedSSHTransportKeyByPanelId[panelId] = transportKey
+        if let relayConfiguration {
+            var didChangeRelaySnapshot = false
+            if detectedSSHRelayConfigurationsByTransportKey[transportKey] != relayConfiguration {
+                detectedSSHRelayConfigurationsByTransportKey[transportKey] = relayConfiguration
+                didChangeRelaySnapshot = true
+            }
+            if detectedSSHRelayConfigurationsByPanelId[panelId] != relayConfiguration {
+                detectedSSHRelayConfigurationsByPanelId[panelId] = relayConfiguration
+                didChangeRelaySnapshot = true
+            }
+            if didChangeRelaySnapshot {
+                remoteAttachmentSnapshotRevision &+= 1
+            }
+        }
+
+        if let endpoint = remoteProxyEndpointsByDetectedTransportKey[transportKey] {
+            remoteProxyEndpointsBySourcePanelId[panelId] = endpoint
+        }
+
+        if allowPreparedAdoption,
+           let preparedRemote = SSHHostPreparationStore.shared.preparedRemote(for: session.destination) {
+            #if DEBUG
+            dlog("ssh.prewarm.adopt host=\(preparedRemote.host) transportKey=\(transportKey)")
+            #endif
+            applyDetectedSSHRemoteStatus(
+                transportKey: transportKey,
+                sourcePanelId: panelId,
+                daemonStatus: preparedRemote.status.daemonStatus,
+                proxyEndpoint: preparedRemote.proxyEndpoint,
+                target: preparedRemote.host
+            )
+            return
+        }
+
+        if let relayConfiguration {
+            detectedSSHControllersByTransportKey.removeValue(forKey: transportKey)?.stop()
+            if case .detectedSSH(var attachment)? = remoteAttachmentsByPanelId[panelId] {
+                attachment.daemonState = .bootstrapping(detail: "Bootstrapping remote daemon on \(attachment.displayTarget)")
+                setRemoteAttachment(.detectedSSH(attachment), for: panelId)
+            }
+            let controller = WorkspaceRemoteSessionController(
+                workspace: self,
+                configuration: relayConfiguration,
+                controllerID: UUID(),
+                mode: .surfaceAttachment(transportKey: transportKey, sourcePanelId: panelId)
+            )
+            detectedSSHControllersByTransportKey[transportKey] = controller
+            controller.start()
+            return
+        }
+
+        if detectedSSHControllersByTransportKey[transportKey] != nil {
+            if let status = detectedSSHDaemonStatusByTransportKey[transportKey],
+               case .detectedSSH(var attachment)? = remoteAttachmentsByPanelId[panelId] {
+                attachment.daemonState = TerminalRemoteDaemonState(status: status)
+                setRemoteAttachment(.detectedSSH(attachment), for: panelId)
+            }
+            return
+        }
+
+        if case .detectedSSH(var attachment)? = remoteAttachmentsByPanelId[panelId] {
+            attachment.daemonState = .bootstrapping(detail: "Bootstrapping remote daemon on \(attachment.displayTarget)")
+            setRemoteAttachment(.detectedSSH(attachment), for: panelId)
+        }
+
+        let configuration = WorkspaceRemoteConfiguration(
+            destination: session.destination,
+            port: session.port,
+            identityFile: session.identityFile,
+            sshOptions: session.sshOptions,
+            localProxyPort: nil,
+            relayPort: nil,
+            relayID: nil,
+            relayToken: nil,
+            localSocketPath: nil,
+            terminalStartupCommand: nil,
+            foregroundAuthToken: nil
+        )
+        let controller = WorkspaceRemoteSessionController(
+            workspace: self,
+            configuration: configuration,
+            controllerID: UUID(),
+            mode: .surfaceAttachment(transportKey: transportKey, sourcePanelId: panelId)
+        )
+        detectedSSHControllersByTransportKey[transportKey] = controller
+        controller.start()
+    }
+
+    private func stopDetectedSSHRemoteSupport(panelId: UUID, transportKey: String) {
+        detectedSSHTransportKeyByPanelId.removeValue(forKey: panelId)
+        if detectedSSHRelayConfigurationsByPanelId.removeValue(forKey: panelId) != nil {
+            remoteAttachmentSnapshotRevision &+= 1
+        }
+        remoteProxyEndpointsBySourcePanelId.removeValue(forKey: panelId)
+        if let browserPanel = panels[panelId] as? BrowserPanel {
+            browserPanel.setRemoteProxyEndpoint(nil)
+        }
+
+        var panelIds = detectedSSHPanelIdsByTransportKey[transportKey] ?? []
+        panelIds.remove(panelId)
+        if panelIds.isEmpty {
+            detectedSSHPanelIdsByTransportKey.removeValue(forKey: transportKey)
+            detectedSSHSessionsByTransportKey.removeValue(forKey: transportKey)
+            if detectedSSHRelayConfigurationsByTransportKey.removeValue(forKey: transportKey) != nil {
+                remoteAttachmentSnapshotRevision &+= 1
+            }
+            detectedSSHDaemonStatusByTransportKey.removeValue(forKey: transportKey)
+            remoteProxyEndpointsByDetectedTransportKey.removeValue(forKey: transportKey)
+            detectedSSHControllersByTransportKey.removeValue(forKey: transportKey)?.stop()
+        } else {
+            detectedSSHPanelIdsByTransportKey[transportKey] = panelIds
+        }
+    }
+
+    func remoteProxyEndpoint(forSourcePanelId panelId: UUID?) -> BrowserProxyEndpoint? {
+        guard let panelId else { return remoteProxyEndpoint }
+        if let endpoint = remoteProxyEndpointsBySourcePanelId[panelId] {
+            return endpoint
+        }
+        return remoteProxyEndpoint
+    }
+
+    private func inheritedRemoteAttachment(forSourcePanelId panelId: UUID?) -> TerminalRemoteAttachment? {
+        guard let panelId else { return nil }
+        return remoteAttachmentsByPanelId[panelId]
+    }
+
+    private func shouldUseRemoteBrowserProxy(forSourcePanelId panelId: UUID?) -> Bool {
+        isRemoteWorkspace || inheritedRemoteAttachment(forSourcePanelId: panelId) != nil
+    }
+
+    private func inheritRemoteAttachmentIfNeeded(from sourcePanelId: UUID?, to panelId: UUID) {
+        guard let inherited = inheritedRemoteAttachment(forSourcePanelId: sourcePanelId) else { return }
+
+        switch inherited {
+        case .managedRemote:
+            setRemoteAttachment(inherited, for: panelId)
+            if let browserPanel = panels[panelId] as? BrowserPanel {
+                browserPanel.setRemoteProxyEndpoint(remoteProxyEndpoint)
+            }
+
+        case .detectedSSH(var attachment):
+            guard panels[panelId] is BrowserPanel else { return }
+
+            if let status = detectedSSHDaemonStatusByTransportKey[attachment.transportKey] {
+                attachment.daemonState = TerminalRemoteDaemonState(status: status)
+            }
+            let inheritedAttachment = TerminalRemoteAttachment.detectedSSH(attachment)
+            setRemoteAttachment(inheritedAttachment, for: panelId)
+
+            var panelIds = detectedSSHPanelIdsByTransportKey[attachment.transportKey] ?? []
+            panelIds.insert(panelId)
+            detectedSSHPanelIdsByTransportKey[attachment.transportKey] = panelIds
+            detectedSSHTransportKeyByPanelId[panelId] = attachment.transportKey
+
+            let endpoint = remoteProxyEndpointsByDetectedTransportKey[attachment.transportKey]
+                ?? sourcePanelId.flatMap { remoteProxyEndpointsBySourcePanelId[$0] }
+            if let endpoint {
+                remoteProxyEndpointsBySourcePanelId[panelId] = endpoint
+            }
+            if let browserPanel = panels[panelId] as? BrowserPanel {
+                browserPanel.setRemoteProxyEndpoint(endpoint)
+            }
+        }
+    }
+
+    @MainActor
     func shouldDemoteWorkspaceAfterChildExit(surfaceId: UUID) -> Bool {
         isRemoteWorkspace || pendingRemoteTerminalChildExitSurfaceIds.contains(surfaceId)
     }
@@ -9618,12 +10663,14 @@ final class Workspace: Identifiable, ObservableObject {
             payload["has_identity_file"] = remoteConfiguration.identityFile != nil
             payload["has_ssh_options"] = !remoteConfiguration.sshOptions.isEmpty
             payload["local_proxy_port"] = remoteConfiguration.localProxyPort ?? NSNull()
+            payload["local_relay_port"] = remoteConfiguration.localRelayPort ?? NSNull()
         } else {
             payload["destination"] = NSNull()
             payload["port"] = NSNull()
             payload["has_identity_file"] = false
             payload["has_ssh_options"] = false
             payload["local_proxy_port"] = NSNull()
+            payload["local_relay_port"] = NSNull()
         }
         return payload
     }
@@ -9641,6 +10688,7 @@ final class Workspace: Identifiable, ObservableObject {
         remoteLastHeartbeatAt = nil
         remoteConnectionDetail = nil
         remoteDaemonStatus = WorkspaceRemoteDaemonStatus()
+        refreshManagedRemoteAttachments()
         statusEntries.removeValue(forKey: Self.remoteErrorStatusKey)
         statusEntries.removeValue(forKey: Self.remotePortConflictStatusKey)
         remoteLastErrorFingerprint = nil
@@ -9678,6 +10726,48 @@ final class Workspace: Identifiable, ObservableObject {
         remoteSessionController = controller
         syncRemotePortScanTTYs()
         controller.start()
+    }
+
+    @MainActor
+    fileprivate func rememberRemoteLocalRelayPort(
+        _ localRelayPort: Int,
+        controllerID: UUID?,
+        relayPort: Int,
+        relayID: String
+    ) {
+        if let controllerID,
+           activeRemoteSessionControllerID == controllerID,
+           let configuration = remoteConfiguration,
+           configuration.relayPort == relayPort,
+           configuration.relayID == relayID,
+           configuration.localRelayPort != localRelayPort {
+            remoteConfiguration = configuration.withLocalRelayPort(localRelayPort)
+            refreshManagedRemoteAttachments()
+            return
+        }
+
+        var updatedRelayConfigurations = detectedSSHRelayConfigurationsByTransportKey
+        var updatedRelayConfigurationsByPanelId = detectedSSHRelayConfigurationsByPanelId
+        var didUpdate = false
+        for (transportKey, configuration) in detectedSSHRelayConfigurationsByTransportKey
+            where configuration.relayPort == relayPort
+                && configuration.relayID == relayID
+                && configuration.localRelayPort != localRelayPort {
+            updatedRelayConfigurations[transportKey] = configuration.withLocalRelayPort(localRelayPort)
+            didUpdate = true
+        }
+        for (panelId, configuration) in detectedSSHRelayConfigurationsByPanelId
+            where configuration.relayPort == relayPort
+                && configuration.relayID == relayID
+                && configuration.localRelayPort != localRelayPort {
+            updatedRelayConfigurationsByPanelId[panelId] = configuration.withLocalRelayPort(localRelayPort)
+            didUpdate = true
+        }
+        if didUpdate {
+            detectedSSHRelayConfigurationsByTransportKey = updatedRelayConfigurations
+            detectedSSHRelayConfigurationsByPanelId = updatedRelayConfigurationsByPanelId
+            remoteAttachmentSnapshotRevision &+= 1
+        }
     }
 
     func reconnectRemoteConnection() {
@@ -9728,6 +10818,7 @@ final class Workspace: Identifiable, ObservableObject {
         pendingRemoteSurfaceTTYSurfaceId = nil
         pendingRemoteSurfacePortKickReason = nil
         pendingRemoteSurfacePortKickSurfaceId = nil
+        refreshManagedRemoteAttachments()
         clearRemoteDetectedSurfacePorts()
         remoteDetectedPorts = []
         remoteForwardedPorts = []
@@ -9738,6 +10829,7 @@ final class Workspace: Identifiable, ObservableObject {
         remoteConnectionState = .disconnected
         remoteConnectionDetail = nil
         remoteDaemonStatus = WorkspaceRemoteDaemonStatus()
+        refreshManagedRemoteAttachments()
         statusEntries.removeValue(forKey: Self.remoteErrorStatusKey)
         statusEntries.removeValue(forKey: Self.remotePortConflictStatusKey)
         remoteLastErrorFingerprint = nil
@@ -9772,12 +10864,71 @@ final class Workspace: Identifiable, ObservableObject {
         trackRemoteTerminalSurface(initialPanelId)
     }
 
+    private func managedRemoteAttachment(
+        for configuration: WorkspaceRemoteConfiguration,
+        daemonStatus: WorkspaceRemoteDaemonStatus
+    ) -> TerminalRemoteAttachment {
+        .managedRemote(.init(
+            destination: configuration.destination,
+            displayTarget: configuration.displayTarget,
+            transportKey: configuration.proxyBrokerTransportKey,
+            sessionID: configuration.relayID,
+            relayPort: configuration.relayPort,
+            daemonState: TerminalRemoteDaemonState(status: daemonStatus)
+        ))
+    }
+
+    private func refreshManagedRemoteAttachments() {
+        var next = remoteAttachmentsByPanelId
+        guard let remoteConfiguration else {
+            let managedPanelIds = next.compactMap { panelId, attachment -> UUID? in
+                if case .managedRemote = attachment { return panelId }
+                return nil
+            }
+            for panelId in managedPanelIds {
+                next.removeValue(forKey: panelId)
+            }
+            if next != remoteAttachmentsByPanelId {
+                remoteAttachmentsByPanelId = next
+            }
+            return
+        }
+
+        let attachment = managedRemoteAttachment(
+            for: remoteConfiguration,
+            daemonStatus: remoteDaemonStatus
+        )
+        let managedBrowserPanelIds = next.compactMap { panelId, existing -> UUID? in
+            guard panels[panelId] is BrowserPanel else { return nil }
+            if case .managedRemote = existing { return panelId }
+            return nil
+        }
+        let managedPanelIds = activeRemoteTerminalSurfaceIds.union(managedBrowserPanelIds)
+        for panelId in managedPanelIds {
+            next[panelId] = attachment
+        }
+        let staleManagedPanelIds = next.compactMap { panelId, existing -> UUID? in
+            if case .managedRemote = existing,
+               !managedPanelIds.contains(panelId) {
+                return panelId
+            }
+            return nil
+        }
+        for panelId in staleManagedPanelIds {
+            next.removeValue(forKey: panelId)
+        }
+        if next != remoteAttachmentsByPanelId {
+            remoteAttachmentsByPanelId = next
+        }
+    }
+
     private func trackRemoteTerminalSurface(_ panelId: UUID) {
         skipControlMasterCleanupAfterDetachedRemoteTransfer = false
         pendingRemoteTerminalChildExitSurfaceIds.remove(panelId)
         transferredRemoteCleanupConfigurationsByPanelId.removeValue(forKey: panelId)
         guard activeRemoteTerminalSurfaceIds.insert(panelId).inserted else { return }
         activeRemoteTerminalSessionCount = activeRemoteTerminalSurfaceIds.count
+        refreshManagedRemoteAttachments()
         applyPendingRemoteSurfaceTTYIfNeeded(to: panelId)
         _ = applyPendingRemoteSurfacePortKickIfNeeded(to: panelId)
     }
@@ -9785,6 +10936,8 @@ final class Workspace: Identifiable, ObservableObject {
     private func untrackRemoteTerminalSurface(_ panelId: UUID) {
         guard activeRemoteTerminalSurfaceIds.remove(panelId) != nil else { return }
         activeRemoteTerminalSessionCount = activeRemoteTerminalSurfaceIds.count
+        setRemoteAttachment(nil, for: panelId)
+        refreshManagedRemoteAttachments()
         guard !isDetachingCloseTransaction else { return }
         maybeDemoteRemoteWorkspaceAfterSSHSessionEnded()
     }
@@ -10049,6 +11202,7 @@ final class Workspace: Identifiable, ObservableObject {
 
     fileprivate func applyRemoteDaemonStatusUpdate(_ status: WorkspaceRemoteDaemonStatus, target: String) {
         remoteDaemonStatus = status
+        refreshManagedRemoteAttachments()
         applyBrowserRemoteWorkspaceStatusToPanels()
         guard status.state == .error else {
             remoteLastDaemonErrorFingerprint = nil
@@ -10063,6 +11217,91 @@ final class Workspace: Identifiable, ObservableObject {
             level: .error,
             source: "remote-daemon"
         )
+    }
+
+    func applyDetectedSSHRemoteConnectionState(
+        transportKey: String,
+        sourcePanelId: UUID,
+        state: WorkspaceRemoteConnectionState,
+        detail: String?,
+        target: String
+    ) {
+        guard detectedSSHPanelIdsByTransportKey[transportKey] != nil else { return }
+        guard state == .error else { return }
+        let fallbackDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let status = WorkspaceRemoteDaemonStatus(
+            state: .error,
+            detail: fallbackDetail?.isEmpty == false ? fallbackDetail : "Remote support for \(target) is unavailable"
+        )
+        applyDetectedSSHRemoteStatus(
+            transportKey: transportKey,
+            sourcePanelId: sourcePanelId,
+            daemonStatus: status,
+            proxyEndpoint: nil,
+            target: target
+        )
+    }
+
+    func applyDetectedSSHRemoteStatus(
+        transportKey: String,
+        sourcePanelId: UUID,
+        daemonStatus: WorkspaceRemoteDaemonStatus,
+        proxyEndpoint: BrowserProxyEndpoint?,
+        target: String
+    ) {
+        guard detectedSSHPanelIdsByTransportKey[transportKey] != nil else { return }
+        detectedSSHDaemonStatusByTransportKey[transportKey] = daemonStatus
+        let panelIds = detectedSSHPanelIdsByTransportKey[transportKey] ?? [sourcePanelId]
+        let daemonState = TerminalRemoteDaemonState(status: daemonStatus)
+        var nextAttachments = remoteAttachmentsByPanelId
+
+        for panelId in panelIds {
+            guard case .detectedSSH(var attachment)? = nextAttachments[panelId],
+                  attachment.transportKey == transportKey else {
+                continue
+            }
+            attachment.daemonState = daemonState
+            nextAttachments[panelId] = .detectedSSH(attachment)
+        }
+
+        if nextAttachments != remoteAttachmentsByPanelId {
+            remoteAttachmentsByPanelId = nextAttachments
+        }
+
+        applyDetectedSSHRemoteProxyEndpoint(
+            transportKey: transportKey,
+            sourcePanelId: sourcePanelId,
+            proxyEndpoint: proxyEndpoint,
+            target: target
+        )
+    }
+
+    func applyDetectedSSHRemoteProxyEndpoint(
+        transportKey: String,
+        sourcePanelId: UUID,
+        proxyEndpoint: BrowserProxyEndpoint?,
+        target: String
+    ) {
+        _ = target
+        guard detectedSSHPanelIdsByTransportKey[transportKey] != nil else { return }
+        let panelIds = detectedSSHPanelIdsByTransportKey[transportKey] ?? [sourcePanelId]
+        if let proxyEndpoint {
+            remoteProxyEndpointsByDetectedTransportKey[transportKey] = proxyEndpoint
+            for panelId in panelIds {
+                remoteProxyEndpointsBySourcePanelId[panelId] = proxyEndpoint
+                if let browserPanel = panels[panelId] as? BrowserPanel {
+                    browserPanel.setRemoteProxyEndpoint(proxyEndpoint)
+                }
+            }
+        } else {
+            remoteProxyEndpointsByDetectedTransportKey.removeValue(forKey: transportKey)
+            for panelId in panelIds {
+                remoteProxyEndpointsBySourcePanelId.removeValue(forKey: panelId)
+                if let browserPanel = panels[panelId] as? BrowserPanel {
+                    browserPanel.setRemoteProxyEndpoint(nil)
+                }
+            }
+        }
     }
 
     fileprivate func applyRemoteProxyEndpointUpdate(_ endpoint: BrowserProxyEndpoint?) {
@@ -10343,7 +11582,6 @@ final class Workspace: Identifiable, ObservableObject {
 
         guard let paneId = sourcePaneId else { return nil }
         let inheritedConfig = inheritedTerminalConfig(preferredPanelId: panelId, inPane: paneId)
-        let remoteTerminalStartupCommand = remoteTerminalStartupCommand()
 
         // Inherit working directory: prefer the source panel's reported cwd,
         // then its requested startup cwd if shell integration has not reported
@@ -10373,16 +11611,13 @@ final class Workspace: Identifiable, ObservableObject {
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: splitWorkingDirectory,
-            initialCommand: remoteTerminalStartupCommand,
+            initialCommand: nil,
             localTerminalMode: .auto,
-            localDaemonEligible: remoteTerminalStartupCommand == nil
+            localDaemonEligible: true
         )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle
-        if remoteTerminalStartupCommand != nil {
-            trackRemoteTerminalSurface(newPanel.id)
-        }
         seedTerminalInheritanceFontPoints(panelId: newPanel.id, configTemplate: inheritedConfig)
 
         // Pre-generate the bonsplit tab ID so we can install the panel mapping before bonsplit
@@ -10408,9 +11643,6 @@ final class Workspace: Identifiable, ObservableObject {
             panels.removeValue(forKey: newPanel.id)
             panelTitles.removeValue(forKey: newPanel.id)
             surfaceIdToPanelId.removeValue(forKey: newTab.id)
-            if remoteTerminalStartupCommand != nil {
-                untrackRemoteTerminalSurface(newPanel.id)
-            }
             terminalInheritanceFontPointsByPanelId.removeValue(forKey: newPanel.id)
             return nil
         }
@@ -10463,27 +11695,23 @@ final class Workspace: Identifiable, ObservableObject {
         let previousHostedView = focusedTerminalPanel?.hostedView
 
         let inheritedConfig = inheritedTerminalConfig(inPane: paneId)
-        let remoteTerminalStartupCommand = remoteTerminalStartupCommand()
 
         // Create new terminal panel
         guard let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: workingDirectory,
-            initialCommand: remoteTerminalStartupCommand,
+            initialCommand: nil,
             initialInput: initialInput,
             additionalEnvironment: startupEnvironment,
             localTerminalMode: localTerminalMode,
-            localDaemonEligible: remoteTerminalStartupCommand == nil
+            localDaemonEligible: true
         ) else {
             return nil
         }
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle
-        if remoteTerminalStartupCommand != nil {
-            trackRemoteTerminalSurface(newPanel.id)
-        }
         seedTerminalInheritanceFontPoints(panelId: newPanel.id, configTemplate: inheritedConfig)
 
         // Create tab in bonsplit
@@ -10497,9 +11725,6 @@ final class Workspace: Identifiable, ObservableObject {
         ) else {
             panels.removeValue(forKey: newPanel.id)
             panelTitles.removeValue(forKey: newPanel.id)
-            if remoteTerminalStartupCommand != nil {
-                untrackRemoteTerminalSurface(newPanel.id)
-            }
             terminalInheritanceFontPointsByPanelId.removeValue(forKey: newPanel.id)
             return nil
         }
@@ -10530,15 +11755,6 @@ final class Workspace: Identifiable, ObservableObject {
         return newPanel
     }
 
-    private func remoteTerminalStartupCommand() -> String? {
-        guard let command = remoteConfiguration?.terminalStartupCommand?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !command.isEmpty else {
-            return nil
-        }
-        return command
-    }
-
     /// Create a new browser panel split
     @discardableResult
     func newBrowserSplit(
@@ -10561,6 +11777,7 @@ final class Workspace: Identifiable, ObservableObject {
         }
 
         guard let paneId = sourcePaneId else { return nil }
+        let usesRemoteBrowserProxy = shouldUseRemoteBrowserProxy(forSourcePanelId: panelId)
 
         // Create browser panel
         let browserPanel = BrowserPanel(
@@ -10570,12 +11787,13 @@ final class Workspace: Identifiable, ObservableObject {
                 sourcePanelId: panelId
             ),
             initialURL: url,
-            proxyEndpoint: remoteProxyEndpoint,
-            isRemoteWorkspace: isRemoteWorkspace,
-            remoteWebsiteDataStoreIdentifier: isRemoteWorkspace ? id : nil
+            proxyEndpoint: remoteProxyEndpoint(forSourcePanelId: panelId),
+            isRemoteWorkspace: usesRemoteBrowserProxy,
+            remoteWebsiteDataStoreIdentifier: usesRemoteBrowserProxy ? id : nil
         )
         panels[browserPanel.id] = browserPanel
         panelTitles[browserPanel.id] = browserPanel.displayTitle
+        inheritRemoteAttachmentIfNeeded(from: panelId, to: browserPanel.id)
 
         // Pre-generate the bonsplit tab ID so the mapping exists before the split lands.
         let newTab = Bonsplit.Tab(
@@ -10641,6 +11859,7 @@ final class Workspace: Identifiable, ObservableObject {
         let sourcePanelId = effectiveSelectedPanelId(inPane: paneId)
         let previousFocusedPanelId = focusedPanelId
         let previousHostedView = focusedTerminalPanel?.hostedView
+        let usesRemoteBrowserProxy = shouldUseRemoteBrowserProxy(forSourcePanelId: sourcePanelId)
 
         let browserPanel = BrowserPanel(
             workspaceId: id,
@@ -10651,12 +11870,13 @@ final class Workspace: Identifiable, ObservableObject {
             initialURL: url,
             initialRequest: initialRequest,
             bypassInsecureHTTPHostOnce: bypassInsecureHTTPHostOnce,
-            proxyEndpoint: remoteProxyEndpoint,
-            isRemoteWorkspace: isRemoteWorkspace,
-            remoteWebsiteDataStoreIdentifier: isRemoteWorkspace ? id : nil
+            proxyEndpoint: remoteProxyEndpoint(forSourcePanelId: sourcePanelId),
+            isRemoteWorkspace: usesRemoteBrowserProxy,
+            remoteWebsiteDataStoreIdentifier: usesRemoteBrowserProxy ? id : nil
         )
         panels[browserPanel.id] = browserPanel
         panelTitles[browserPanel.id] = browserPanel.displayTitle
+        inheritRemoteAttachmentIfNeeded(from: sourcePanelId, to: browserPanel.id)
 
         guard let newTabId = bonsplitController.createTab(
             title: browserPanel.displayTitle,
@@ -11343,6 +12563,7 @@ final class Workspace: Identifiable, ObservableObject {
             surfaceTTYNames.removeValue(forKey: detached.panelId)
         }
         syncRemotePortScanTTYs()
+        scheduleDetectedSSHAttachmentRefresh(panelId: detached.panelId, reason: "surface_attach")
         if let cachedTitle = detached.cachedTitle {
             panelTitles[detached.panelId] = cachedTitle
         }
@@ -11376,6 +12597,7 @@ final class Workspace: Identifiable, ObservableObject {
             panels.removeValue(forKey: detached.panelId)
             panelDirectories.removeValue(forKey: detached.panelId)
             surfaceTTYNames.removeValue(forKey: detached.panelId)
+            setRemoteAttachment(nil, for: detached.panelId)
             syncRemotePortScanTTYs()
             panelTitles.removeValue(forKey: detached.panelId)
             panelCustomTitles.removeValue(forKey: detached.panelId)
@@ -13410,6 +14632,7 @@ extension Workspace: BonsplitDelegate {
 
         panels.removeValue(forKey: panelId)
         untrackRemoteTerminalSurface(panelId)
+        setRemoteAttachment(nil, for: panelId)
         pendingRemoteTerminalChildExitSurfaceIds.remove(panelId)
         surfaceIdToPanelId.removeValue(forKey: tabId)
         panelDirectories.removeValue(forKey: panelId)
@@ -13565,6 +14788,7 @@ extension Workspace: BonsplitDelegate {
                 panels[panelId]?.close()
                 panels.removeValue(forKey: panelId)
                 untrackRemoteTerminalSurface(panelId)
+                setRemoteAttachment(nil, for: panelId)
                 pendingRemoteTerminalChildExitSurfaceIds.remove(panelId)
                 panelDirectories.removeValue(forKey: panelId)
                 panelGitBranches.removeValue(forKey: panelId)

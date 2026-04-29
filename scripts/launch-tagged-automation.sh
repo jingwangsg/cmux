@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+BASE_APP_NAME="cmux DEV"
+MAX_TAGGED_APP_NAME_LENGTH=30
+
 usage() {
   cat <<'EOF'
 Usage: ./scripts/launch-tagged-automation.sh <tag> [options]
@@ -32,6 +35,23 @@ sanitize_path() {
     cleaned="agent"
   fi
   echo "$cleaned"
+}
+
+tagged_app_name() {
+  local tag="$1"
+  local full_name="${BASE_APP_NAME} ${tag}"
+  if [[ "${#full_name}" -le "$MAX_TAGGED_APP_NAME_LENGTH" ]]; then
+    echo "$full_name"
+    return 0
+  fi
+
+  local prefix="${BASE_APP_NAME} "
+  local max_tag_length=$((MAX_TAGGED_APP_NAME_LENGTH - ${#prefix}))
+  if [[ "$max_tag_length" -lt 1 ]]; then
+    echo "${full_name:0:$MAX_TAGGED_APP_NAME_LENGTH}"
+    return 0
+  fi
+  echo "${prefix}${tag:0:$max_tag_length}"
 }
 
 if [[ $# -lt 1 ]]; then
@@ -104,7 +124,8 @@ fi
 
 TAG_ID="$(sanitize_bundle "$TAG")"
 TAG_SLUG="$(sanitize_path "$TAG")"
-APP="$HOME/Library/Developer/Xcode/DerivedData/cmux-${TAG_SLUG}/Build/Products/Debug/cmux DEV ${TAG}.app"
+APP_NAME="$(tagged_app_name "$TAG")"
+APP="$HOME/Library/Developer/Xcode/DerivedData/cmux-${TAG_SLUG}/Build/Products/Debug/${APP_NAME}.app"
 BID="com.cmuxterm.app.debug.${TAG_ID}"
 SOCK="/tmp/cmux-debug-${TAG_SLUG}.sock"
 DSOCK="$HOME/Library/Application Support/cmux/cmuxd-dev-${TAG_SLUG}.sock"
@@ -117,7 +138,7 @@ fi
 
 /usr/bin/osascript -e "tell application id \"${BID}\" to quit" >/dev/null 2>&1 || true
 sleep 0.5
-pkill -f "cmux DEV ${TAG}.app/Contents/MacOS/cmux DEV" || true
+pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
 rm -f "$SOCK" "$DSOCK"
 sleep 0.5
 

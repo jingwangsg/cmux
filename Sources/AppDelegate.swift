@@ -4837,7 +4837,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if let existing = mainWindowContexts[key] {
             existing.window = window
         } else if let existing = mainWindowContexts.values.first(where: { $0.windowId == windowId }) {
-            existing.window = window
             reindexMainWindowContextIfNeeded(existing, for: window)
         } else {
             mainWindowContexts[key] = MainWindowContext(
@@ -4859,6 +4858,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         commandPaletteVisibilityByWindowId[windowId] = false
         commandPaletteSelectionByWindowId[windowId] = 0
         commandPaletteSnapshotByWindowId[windowId] = .empty
+        TerminalWindowPortalRegistry.allowPortalBinding(for: window)
 
 #if DEBUG
         dlog(
@@ -6110,9 +6110,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func reindexMainWindowContextIfNeeded(_ context: MainWindowContext, for window: NSWindow) {
+        let previousWindow = context.window
         let desiredKey = ObjectIdentifier(window)
         if mainWindowContexts[desiredKey] === context {
+            discardTerminalPortalIfWindowChanged(
+                previousWindow: previousWindow,
+                newWindow: window,
+                windowId: context.windowId,
+                reason: "mainWindow.reindex.sameKey"
+            )
             context.window = window
+            TerminalWindowPortalRegistry.allowPortalBinding(for: window)
             return
         }
 
@@ -6124,13 +6132,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if let conflicting = mainWindowContexts[desiredKey], conflicting !== context {
+            discardTerminalPortalIfWindowChanged(
+                previousWindow: previousWindow,
+                newWindow: window,
+                windowId: context.windowId,
+                reason: "mainWindow.reindex.conflict"
+            )
             context.window = window
+            TerminalWindowPortalRegistry.allowPortalBinding(for: window)
             return
         }
 
+        discardTerminalPortalIfWindowChanged(
+            previousWindow: previousWindow,
+            newWindow: window,
+            windowId: context.windowId,
+            reason: "mainWindow.reindex"
+        )
         mainWindowContexts[desiredKey] = context
         context.window = window
+        TerminalWindowPortalRegistry.allowPortalBinding(for: window)
         notifyMainWindowContextsDidChange()
+    }
+
+    private func discardTerminalPortalIfWindowChanged(
+        previousWindow: NSWindow?,
+        newWindow: NSWindow,
+        windowId: UUID,
+        reason: String
+    ) {
+        guard let previousWindow, previousWindow !== newWindow else { return }
+        TerminalWindowPortalRegistry.discardPortal(for: previousWindow, reason: reason)
+#if DEBUG
+        dlog(
+            "mainWindow.portal.discard windowId=\(String(windowId.uuidString.prefix(8))) " +
+                "old={\(debugWindowToken(previousWindow))} new={\(debugWindowToken(newWindow))} reason=\(reason)"
+        )
+#endif
     }
 
     private func contextForMainTerminalWindow(_ window: NSWindow, reindex: Bool = true) -> MainWindowContext? {

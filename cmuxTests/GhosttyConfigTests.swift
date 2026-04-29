@@ -350,6 +350,93 @@ final class GhosttyConfigTests: XCTestCase {
         )
     }
 
+    func testGhosttyConfigFallbackActivatesWhenDiagnosticsExist() {
+        XCTAssertFalse(GhosttyApp.shouldUseFallbackGhosttyConfig(diagnosticMessages: []))
+        XCTAssertTrue(
+            GhosttyApp.shouldUseFallbackGhosttyConfig(
+                diagnosticMessages: [
+                    "/Users/example/.config/ghostty/config:1:gtk-tabs-location: invalid value"
+                ]
+            )
+        )
+    }
+
+    func testEmbeddedSurfaceOverridesDisableGhosttyWindowVsync() throws {
+        guard let config = ghostty_config_new() else {
+            XCTFail("Expected Ghostty config allocation to succeed")
+            return
+        }
+        defer { ghostty_config_free(config) }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-embedded-ghostty-overrides-\(UUID().uuidString).conf")
+        try GhosttyApp.embeddedSurfaceGhosttyConfigOverrides.write(
+            to: url,
+            atomically: true,
+            encoding: .utf8
+        )
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        url.path.withCString { path in
+            ghostty_config_load_file(config, path)
+        }
+        ghostty_config_finalize(config)
+
+        XCTAssertEqual(ghostty_config_diagnostics_count(config), 0)
+
+        var windowVsync = true
+        let windowVsyncKey = "window-vsync"
+        XCTAssertTrue(
+            ghostty_config_get(
+                config,
+                &windowVsync,
+                windowVsyncKey,
+                UInt(windowVsyncKey.lengthOfBytes(using: .utf8))
+            )
+        )
+        XCTAssertFalse(windowVsync)
+
+        var shellIntegration: UnsafePointer<CChar>?
+        let shellIntegrationKey = "shell-integration"
+        XCTAssertTrue(
+            ghostty_config_get(
+                config,
+                &shellIntegration,
+                shellIntegrationKey,
+                UInt(shellIntegrationKey.lengthOfBytes(using: .utf8))
+            )
+        )
+        XCTAssertEqual(shellIntegration.map(String.init(cString:)), "none")
+    }
+
+    func testBackgroundLogRequiresExplicitBackgroundDebugFlag() throws {
+        let suiteName = "cmux-background-log-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertFalse(
+            GhosttyApp.shouldEnableBackgroundLog(
+                environment: ["CMUX_DEBUG_LOG": "/tmp/cmux-debug.log"],
+                userDefaults: defaults
+            )
+        )
+
+        XCTAssertTrue(
+            GhosttyApp.shouldEnableBackgroundLog(
+                environment: ["CMUX_DEBUG_BG": "1"],
+                userDefaults: defaults
+            )
+        )
+
+        defaults.set(true, forKey: "cmuxDebugBG")
+        XCTAssertTrue(
+            GhosttyApp.shouldEnableBackgroundLog(
+                environment: [:],
+                userDefaults: defaults
+            )
+        )
+    }
+
     func testCmuxAppSupportConfigURLsUseReleaseConfigForDebugBundleWithoutCurrentConfig() throws {
         try withTemporaryAppSupportDirectory { appSupportDirectory in
             let releaseConfigURL = try writeAppSupportConfig(
@@ -3292,6 +3379,52 @@ final class ZshShellIntegrationHandoffTests: XCTestCase {
         )
     }
 
+    func testShellIntegrationWrapsInteractiveSSHInZsh() throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("cmux-zsh-ssh-exec-\(UUID().uuidString)")
+        let binDir = root.appendingPathComponent("bin", isDirectory: true)
+        let logPath = root.appendingPathComponent("commands.log", isDirectory: false)
+
+        try fileManager.createDirectory(at: binDir, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        try writeExecutableScript(
+            at: binDir.appendingPathComponent("cmux", isDirectory: false),
+            contents: """
+            #!/bin/sh
+            printf 'cmux:%s\\n' "$*" >> "\(logPath.path)"
+            exit 0
+            """
+        )
+        try writeExecutableScript(
+            at: binDir.appendingPathComponent("ssh", isDirectory: false),
+            contents: """
+            #!/bin/sh
+            printf 'native:%s\\n' "$*" >> "\(logPath.path)"
+            exit 23
+            """
+        )
+
+        let output = try runInteractiveZsh(
+            cmuxLoadGhosttyIntegration: false,
+            cmuxLoadShellIntegration: true,
+            command: """
+            : > "\(logPath.path)"
+            ssh osmo_9000
+            cat "\(logPath.path)"
+            """,
+            extraEnvironment: [
+                "PATH": "\(binDir.path):/usr/bin:/bin:/usr/sbin:/sbin",
+                "CMUX_SSH_UPGRADE_INTERACTIVE": "1",
+                "CMUX_WORKSPACE_ID": "11111111-1111-1111-1111-111111111111",
+                "CMUX_PANEL_ID": "22222222-2222-2222-2222-222222222222",
+            ]
+        )
+
+        XCTAssertEqual(output, "cmux:ssh-exec osmo_9000", output)
+    }
+
     func testShellIntegrationRelayReportTTYUsesWorkspaceIDInBash() throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
@@ -3331,6 +3464,137 @@ final class ZshShellIntegrationHandoffTests: XCTestCase {
         XCTAssertTrue(
             result.stdout.contains(#"rpc surface.report_tty {"workspace_id":"11111111-1111-1111-1111-111111111111","tty_name":"ttys888","surface_id":"22222222-2222-2222-2222-222222222222"}"#),
             result.stdout
+        )
+    }
+
+    func testShellIntegrationWrapsInteractiveSSHInBash() throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("cmux-bash-ssh-exec-\(UUID().uuidString)")
+        let binDir = root.appendingPathComponent("bin", isDirectory: true)
+        let logPath = root.appendingPathComponent("commands.log", isDirectory: false)
+
+        try fileManager.createDirectory(at: binDir, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        try writeExecutableScript(
+            at: binDir.appendingPathComponent("cmux", isDirectory: false),
+            contents: """
+            #!/bin/sh
+            printf 'cmux:%s\\n' "$*" >> "\(logPath.path)"
+            exit 0
+            """
+        )
+        try writeExecutableScript(
+            at: binDir.appendingPathComponent("ssh", isDirectory: false),
+            contents: """
+            #!/bin/sh
+            printf 'native:%s\\n' "$*" >> "\(logPath.path)"
+            exit 23
+            """
+        )
+
+        let result = try runInteractiveBash(
+            cmuxLoadShellIntegration: true,
+            command: """
+            : > "\(logPath.path)"
+            ssh osmo_9000
+            cat "\(logPath.path)"
+            """,
+            extraEnvironment: [
+                "PATH": "\(binDir.path):/usr/bin:/bin:/usr/sbin:/sbin",
+                "CMUX_SSH_UPGRADE_INTERACTIVE": "1",
+                "CMUX_WORKSPACE_ID": "11111111-1111-1111-1111-111111111111",
+                "CMUX_PANEL_ID": "22222222-2222-2222-2222-222222222222",
+            ]
+        )
+
+        XCTAssertEqual(result.stdout, "cmux:ssh-exec osmo_9000", result.stdout)
+    }
+
+    func testShellIntegrationWrapsInteractiveSSHInFish() throws {
+        guard let fishPath = executablePath(named: "fish") else {
+            throw XCTSkip("fish shell is not installed")
+        }
+
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("cmux-fish-ssh-exec-\(UUID().uuidString)")
+        let binDir = root.appendingPathComponent("bin", isDirectory: true)
+        let logPath = root.appendingPathComponent("commands.log", isDirectory: false)
+
+        try fileManager.createDirectory(at: binDir, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        try writeExecutableScript(
+            at: binDir.appendingPathComponent("cmux", isDirectory: false),
+            contents: """
+            #!/bin/sh
+            printf 'cmux:%s\\n' "$*" >> "\(logPath.path)"
+            exit 0
+            """
+        )
+        try writeExecutableScript(
+            at: binDir.appendingPathComponent("ssh", isDirectory: false),
+            contents: """
+            #!/bin/sh
+            printf 'native:%s\\n' "$*" >> "\(logPath.path)"
+            exit 23
+            """
+        )
+
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let integrationDir = repoRoot.appendingPathComponent("Resources/shell-integration")
+        let existingDataDirs = ProcessInfo.processInfo.environment["XDG_DATA_DIRS"] ?? "/usr/local/share:/usr/share"
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: fishPath)
+        process.arguments = [
+            "-c",
+            """
+            : > "\(logPath.path)"
+            ssh osmo_9000
+            cat "\(logPath.path)"
+            """
+        ]
+        process.environment = [
+            "HOME": root.path,
+            "TERM": "xterm-256color",
+            "SHELL": fishPath,
+            "USER": NSUserName(),
+            "PATH": "\(binDir.path):/usr/bin:/bin:/usr/sbin:/sbin",
+            "XDG_DATA_DIRS": "\(integrationDir.path):\(existingDataDirs)",
+            "CMUX_SSH_UPGRADE_INTERACTIVE": "1",
+            "CMUX_WORKSPACE_ID": "11111111-1111-1111-1111-111111111111",
+            "CMUX_PANEL_ID": "22222222-2222-2222-2222-222222222222",
+        ]
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        try process.run()
+        let deadline = Date().addingTimeInterval(5)
+        while process.isRunning && Date() < deadline {
+            _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+            XCTFail("Timed out waiting for fish to exit")
+        }
+
+        let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let error = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        XCTAssertEqual(process.terminationStatus, 0, error)
+        XCTAssertEqual(
+            output.trimmingCharacters(in: .whitespacesAndNewlines),
+            "cmux:ssh-exec osmo_9000",
+            output
         )
     }
 
@@ -3785,6 +4049,21 @@ final class ZshShellIntegrationHandoffTests: XCTestCase {
     private func writeExecutableScript(at url: URL, contents: String) throws {
         try contents.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    private func executablePath(named name: String) -> String? {
+        let fileManager = FileManager.default
+        let searchPath = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+            + ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        for directory in searchPath {
+            let candidate = URL(fileURLWithPath: directory).appendingPathComponent(name).path
+            if fileManager.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
     }
 
     private func bindUnixSocket(at path: String) throws -> Int32 {

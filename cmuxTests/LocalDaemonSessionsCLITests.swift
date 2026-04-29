@@ -33,14 +33,18 @@ final class LocalDaemonSessionsCLITests: XCTestCase {
         throw XCTSkip("Bundled cmux CLI not found in \(appBundleURL.path)")
     }
 
-    private func writeAuthTokenFile() throws -> URL {
-        let url = tempDir.appendingPathComponent("locald.auth", isDirectory: false)
+    private func writeAuthTokenFile(name: String = "locald.auth") throws -> URL {
+        let url = tempDir.appendingPathComponent(name, isDirectory: false)
+        try writeAuthTokenFile(at: url)
+        return url
+    }
+
+    private func writeAuthTokenFile(at url: URL) throws {
         try "test-auth-token\n".write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o600))],
             ofItemAtPath: url.path
         )
-        return url
     }
 
     private func writeOrphan(id: String) throws {
@@ -133,23 +137,39 @@ final class LocalDaemonSessionsCLITests: XCTestCase {
         return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
-    func test_sessionsTable_rendersShellSafeReplayHint() {
-        let rendered = CMUXCLI.renderLocalDaemonSessionsTableForTesting(payload: [
-            "sessions": [
-                [
-                    "session_id": "orphan-'quoted'",
-                    "state": "orphaned",
-                    "attachments": [],
-                    "next_seq": 4,
-                    "working_directory": "/tmp",
-                ]
-            ]
-        ], replaySocketPath: "/tmp/socket-'quoted'.sock", replayAuthTokenFilePath: "/tmp/auth-'quoted'.txt")
+    func test_sessionsTable_rendersShellSafeReplayHint() throws {
+        let cli = try bundledCLIPath()
+        let authTokenFile = try writeAuthTokenFile(name: "auth-'quoted'.txt")
+        try writeOrphan(id: "orphan-'quoted'")
+
+        let socket = tempDir.appendingPathComponent("socket-'quoted'.sock").path
+        let daemon = Process()
+        daemon.executableURL = URL(fileURLWithPath: cli)
+        daemon.arguments = [
+            "local-daemon", "serve",
+            "--socket", socket,
+            "--auth-token-file", authTokenFile.path,
+            "--session-log-dir", tempDir.path,
+        ]
+        try daemon.run()
+        defer {
+            daemon.terminate()
+            daemon.waitUntilExit()
+        }
+
+        waitForSocket(socket)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: socket))
+
+        let rendered = try runSessionsCommand(cli: cli, socket: socket, authTokenFile: authTokenFile)
 
         XCTAssertTrue(rendered.contains(
-            "cmux local-daemon replay --socket '/tmp/socket-'\\''quoted'\\''.sock' --auth-token-file '/tmp/auth-'\\''quoted'\\''.txt' --session 'orphan-'\\''quoted'\\'''"
+            "cmux local-daemon replay --socket '\(shellSingleQuoted(socket))' --auth-token-file '\(shellSingleQuoted(authTokenFile.path))' --session 'orphan-'\\''quoted'\\'''"
         ))
         XCTAssertFalse(rendered.contains("rpc session.replay"))
+    }
+
+    private func shellSingleQuoted(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "'\\''")
     }
 
     func test_sessionsSubcommand_rendersHeaderAndRows() throws {

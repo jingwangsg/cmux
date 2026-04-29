@@ -44,6 +44,25 @@ _cmux_relay_cli_path() {
     command -v cmux 2>/dev/null
 }
 
+_CMUX_SSH_EXEC_WRAPPER_ENABLED=0
+_cmux_install_ssh_exec_wrapper() {
+    [[ "${CMUX_SSH_UPGRADE_INTERACTIVE:-0}" == "1" ]] || return 0
+    [[ -n "${CMUX_WORKSPACE_ID:-}" && -n "${CMUX_PANEL_ID:-}" ]] || return 0
+    _cmux_relay_cli_path >/dev/null || return 0
+
+    unalias ssh >/dev/null 2>&1 || true
+    eval 'ssh() {
+        local cmux_cli
+        cmux_cli="$(_cmux_relay_cli_path)" || {
+            command ssh "$@"
+            return $?
+        }
+        "$cmux_cli" ssh-exec "$@"
+    }'
+    _CMUX_SSH_EXEC_WRAPPER_ENABLED=1
+}
+_cmux_install_ssh_exec_wrapper
+
 _cmux_socket_uses_remote_relay() {
     [[ -n "$CMUX_SOCKET_PATH" ]] || return 1
     [[ "$CMUX_SOCKET_PATH" == /* ]] && return 1
@@ -215,6 +234,8 @@ _CMUX_TMUX_SYNC_KEYS=(
     CMUX_SOCKET_ENABLE
     CMUX_SOCKET_MODE
     CMUX_SOCKET_PATH
+    CMUX_SSH_PASSIVE_ENHANCEMENT
+    CMUX_SSH_UPGRADE_INTERACTIVE
     CMUX_TAB_ID
     CMUX_TAG
     CMUX_WORKSPACE_ID
@@ -916,6 +937,57 @@ _cmux_command_starts_nested_shell() {
     return 1
 }
 
+_cmux_ssh_auto_upgrade_preexec() {
+    local cmd="${1:-}"
+    [[ "${CMUX_SSH_UPGRADE_INTERACTIVE:-0}" == "1" ]] || return 0
+    [[ "${_CMUX_SSH_EXEC_WRAPPER_ENABLED:-0}" != "1" ]] || return 0
+    [[ -n "${CMUX_WORKSPACE_ID:-}" && -n "${CMUX_PANEL_ID:-}" ]] || return 0
+    [[ "$cmd" == "ssh" || "$cmd" == ssh\ * ]] || return 0
+    case "$cmd" in
+        *";"*|*"|"*|*"&&"*|*"||"*|*"<"*|*">"*)
+            return 0 ;;
+    esac
+
+    local cli=""
+    cli="$(_cmux_relay_cli_path)" || return 0
+    {
+        "$cli" ssh-upgrade \
+            --workspace "$CMUX_WORKSPACE_ID" \
+            --surface "$CMUX_PANEL_ID" \
+            --original-command "$cmd" >/dev/null 2>&1 || true
+    } >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+_cmux_ssh_passive_refresh_preexec() {
+    local cmd="${1:-}"
+    [[ "${CMUX_SSH_PASSIVE_ENHANCEMENT:-0}" == "1" ]] || return 0
+    [[ "$cmd" == "ssh" || "$cmd" == ssh\ * ]] || return 0
+    [[ -n "${CMUX_TAB_ID:-}" && -n "${CMUX_PANEL_ID:-}" ]] || return 0
+
+    if [[ -z "$_CMUX_TTY_NAME" ]]; then
+        local t
+        t="$(tty 2>/dev/null || true)"
+        t="${t##*/}"
+        [[ -n "$t" && "$t" != "not a tty" ]] && _CMUX_TTY_NAME="$t"
+    fi
+    [[ -n "$_CMUX_TTY_NAME" ]] || return 0
+    _cmux_has_port_scan_transport || return 0
+
+    {
+        sleep 0.35
+        _CMUX_TTY_REPORTED=0
+        _cmux_report_tty_once
+        sleep 0.9
+        _CMUX_TTY_REPORTED=0
+        _cmux_report_tty_once
+        sleep 1.6
+        _CMUX_TTY_REPORTED=0
+        _cmux_report_tty_once
+    } >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
 _cmux_preexec_command() {
     local cmd="${1:-${BASH_COMMAND:-}}"
     _cmux_tmux_sync_cmux_environment
@@ -934,6 +1006,8 @@ _cmux_preexec_command() {
     fi
 
     _cmux_report_shell_activity_state running
+    _cmux_ssh_auto_upgrade_preexec "$cmd"
+    _cmux_ssh_passive_refresh_preexec "$cmd"
     _cmux_report_tty_once
     _cmux_ports_kick command
     _cmux_halt_pr_poll_loop

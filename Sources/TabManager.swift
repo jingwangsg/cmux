@@ -6788,6 +6788,7 @@ extension TabManager {
             hasher.combine(workspace.panelPullRequests.count)
             hasher.combine(workspace.panelGitBranches.count)
             hasher.combine(workspace.surfaceListeningPorts.count)
+            hasher.combine(workspace.remoteAttachmentSnapshotRevision)
 
             if let progress = workspace.progress {
                 hasher.combine(Int((progress.value * 1000).rounded()))
@@ -6810,7 +6811,6 @@ extension TabManager {
 
     func sessionSnapshot(includeScrollback: Bool) -> SessionTabManagerSnapshot {
         let restorableTabs = tabs
-            .filter { !$0.isRemoteWorkspace }
             .prefix(SessionPersistencePolicy.maxWorkspacesPerWindow)
         let workspaceSnapshots = restorableTabs
             .map { $0.sessionSnapshot(includeScrollback: includeScrollback) }

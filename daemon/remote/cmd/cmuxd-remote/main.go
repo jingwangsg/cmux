@@ -317,6 +317,7 @@ func (s *rpcServer) handleRequest(req rpcRequest) rpcResponse {
 					"proxy.socks5",
 					"proxy.stream",
 					"proxy.stream.push",
+					"agent.hooks",
 				},
 			},
 		}

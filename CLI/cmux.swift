@@ -1079,7 +1079,7 @@ final class SocketClient {
         }
     }
 
-    func send(command: String) throws -> String {
+    func send(command: String, stopAtFirstNewline: Bool = false) throws -> String {
         if relayEndpoint != nil, socketFD < 0 {
             try connect()
         }
@@ -1124,7 +1124,11 @@ final class SocketClient {
                 break
             }
             data.append(buffer, count: count)
-            if data.contains(UInt8(0x0A)) {
+            if let newlineIndex = data.firstIndex(of: UInt8(0x0A)) {
+                if stopAtFirstNewline {
+                    data = data.subdata(in: 0..<newlineIndex)
+                    break
+                }
                 sawNewline = true
             }
         }
@@ -1132,7 +1136,7 @@ final class SocketClient {
         guard var response = String(data: data, encoding: .utf8) else {
             throw CLIError(message: "Invalid UTF-8 response")
         }
-        if response.hasSuffix("\n") {
+        if !stopAtFirstNewline, response.hasSuffix("\n") {
             response.removeLast()
         }
         return response
@@ -1597,7 +1601,7 @@ final class SocketClient {
             throw CLIError(message: "Failed to encode v2 request")
         }
 
-        let raw = try send(command: requestLine)
+        let raw = try send(command: requestLine, stopAtFirstNewline: true)
 
         // The server may return plain-text errors (e.g., "ERROR: Access denied ...")
         // before the JSON protocol starts. Surface these directly instead of letting
@@ -1634,6 +1638,23 @@ struct CLIProcessResult {
     let timedOut: Bool
 }
 
+private final class CLIProcessPipeCapture {
+    private let lock = NSLock()
+    private var storage = Data()
+
+    func append(_ data: Data) {
+        lock.lock()
+        storage.append(data)
+        lock.unlock()
+    }
+
+    func data() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
 enum CLIProcessRunner {
     static func runProcess(
         executablePath: String,
@@ -1649,6 +1670,9 @@ enum CLIProcessRunner {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        let stdoutCapture = CLIProcessPipeCapture()
+        let stderrCapture = CLIProcessPipeCapture()
+        let outputReaders = DispatchGroup()
 
         let stdinPipe: Pipe?
         if stdinText != nil {
@@ -1668,6 +1692,17 @@ enum CLIProcessRunner {
             try process.run()
         } catch {
             return CLIProcessResult(status: 1, stdout: "", stderr: String(describing: error), timedOut: false)
+        }
+
+        outputReaders.enter()
+        DispatchQueue.global(qos: .utility).async {
+            stdoutCapture.append(stdoutPipe.fileHandleForReading.readDataToEndOfFile())
+            outputReaders.leave()
+        }
+        outputReaders.enter()
+        DispatchQueue.global(qos: .utility).async {
+            stderrCapture.append(stderrPipe.fileHandleForReading.readDataToEndOfFile())
+            outputReaders.leave()
         }
 
         if let stdinText, let stdinPipe {
@@ -1691,8 +1726,11 @@ enum CLIProcessRunner {
             timedOut = false
         }
 
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        var stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        _ = outputReaders.wait(timeout: .now() + 1.0)
+        try? stdoutPipe.fileHandleForReading.close()
+        try? stderrPipe.fileHandleForReading.close()
+        let stdout = String(data: stdoutCapture.data(), encoding: .utf8) ?? ""
+        var stderr = String(data: stderrCapture.data(), encoding: .utf8) ?? ""
         if timedOut {
             let timeoutMessage = "process timed out"
             if stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2365,6 +2403,10 @@ struct CMUXCLI {
 
         case "ssh":
             try runSSH(commandArgs: commandArgs, client: client, jsonOutput: jsonOutput, idFormat: idFormat)
+        case "ssh-exec":
+            try runSSHExec(commandArgs: commandArgs, client: client, jsonOutput: jsonOutput)
+        case "ssh-upgrade":
+            try runSSHUpgrade(commandArgs: commandArgs, client: client, jsonOutput: jsonOutput)
         case "ssh-session-end":
             try runSSHSessionEnd(commandArgs: commandArgs, client: client)
 
@@ -4375,6 +4417,512 @@ struct CMUXCLI {
             throw CLIError(message: "failed to generate SSH relay credential")
         }
         return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func runSSHUpgrade(
+        commandArgs: [String],
+        client: SocketClient,
+        jsonOutput: Bool
+    ) throws {
+        let surface = optionValue(commandArgs, name: "--surface")
+            ?? optionValue(commandArgs, name: "--panel")
+            ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]
+        guard let surface, !surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CLIError(message: "ssh-upgrade requires --surface <id>")
+        }
+
+        let workspace = optionValue(commandArgs, name: "--workspace")
+            ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]
+        guard let workspace, !workspace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CLIError(message: "ssh-upgrade requires --workspace <id>")
+        }
+
+        guard let originalCommand = optionValue(commandArgs, name: "--original-command"),
+              !originalCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CLIError(message: "ssh-upgrade requires --original-command <command>")
+        }
+
+        let originalArgv = try shellSplitForSSHUpgrade(originalCommand)
+        let payload = try client.sendV2(method: "surface.ssh_upgrade", params: [
+            "workspace_id": workspace,
+            "surface_id": surface,
+            "original_argv": originalArgv,
+            "original_command": originalCommand,
+        ])
+
+        if jsonOutput {
+            print(jsonString(payload))
+        } else if (payload["fallback_required"] as? Bool) == true {
+            print("fallback")
+        } else if (payload["upgraded"] as? Bool) == true {
+            print("upgraded")
+        } else {
+            print("ignored")
+        }
+    }
+
+    private func shellSplitForSSHUpgrade(_ command: String) throws -> [String] {
+        var result: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaping = false
+
+        for character in command {
+            if escaping {
+                current.append(character)
+                escaping = false
+                continue
+            }
+            if character == "\\" {
+                escaping = true
+                continue
+            }
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                } else {
+                    current.append(character)
+                }
+                continue
+            }
+            if character == "'" || character == "\"" {
+                quote = character
+                continue
+            }
+            if character.isWhitespace {
+                if !current.isEmpty {
+                    result.append(current)
+                    current = ""
+                }
+                continue
+            }
+            current.append(character)
+        }
+
+        if escaping {
+            current.append("\\")
+        }
+        if quote != nil {
+            throw CLIError(message: "ssh-upgrade could not parse unmatched quote")
+        }
+        if !current.isEmpty {
+            result.append(current)
+        }
+        return result
+    }
+
+    private struct ParsedSSHExecCommand {
+        let destination: String
+        let port: Int?
+        let identityFile: String?
+        let sshOptions: [String]
+        let remoteCommandArguments: [String]
+        let hasForwardingOrStdioMode: Bool
+
+        var isEligibleForAutoUpgrade: Bool {
+            remoteCommandArguments.isEmpty && !hasForwardingOrStdioMode
+        }
+    }
+
+    private func runSSHExec(
+        commandArgs: [String],
+        client: SocketClient,
+        jsonOutput: Bool
+    ) throws {
+        var dryRun = false
+        var sshArgs: [String] = []
+        var index = 0
+        while index < commandArgs.count {
+            let arg = commandArgs[index]
+            if arg == "--dry-run" {
+                dryRun = true
+                index += 1
+                continue
+            }
+            if arg == "--" {
+                sshArgs.append(contentsOf: commandArgs.dropFirst(index + 1))
+                break
+            }
+            sshArgs.append(arg)
+            index += 1
+        }
+
+        let originalArgv = ["ssh"] + sshArgs
+        guard let parsed = parseSSHExecCommand(arguments: originalArgv),
+              parsed.isEligibleForAutoUpgrade else {
+            if dryRun {
+                print((["ssh"] + sshArgs).map(shellQuote).joined(separator: " "))
+                return
+            }
+            try runInteractiveSSHProcess(arguments: sshArgs)
+            return
+        }
+
+        let surface = ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]
+            ?? ProcessInfo.processInfo.environment["CMUX_PANEL_ID"]
+        guard let surface, !surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            if dryRun {
+                print((["ssh"] + sshArgs).map(shellQuote).joined(separator: " "))
+                return
+            }
+            try runInteractiveSSHProcess(arguments: sshArgs)
+            return
+        }
+
+        let workspace = ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]
+            ?? ProcessInfo.processInfo.environment["CMUX_TAB_ID"]
+        guard let workspace, !workspace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            if dryRun {
+                print((["ssh"] + sshArgs).map(shellQuote).joined(separator: " "))
+                return
+            }
+            try runInteractiveSSHProcess(arguments: sshArgs)
+            return
+        }
+
+        let localSocketPath = client.socketPath
+        let remoteRelayPort = generateRemoteRelayPort()
+        let relayID = UUID().uuidString.lowercased()
+        let relayToken = try randomHex(byteCount: 32)
+        let sshOptions = SSHCommandOptions(
+            destination: parsed.destination,
+            port: parsed.port,
+            identityFile: parsed.identityFile,
+            workspaceName: nil,
+            noFocus: true,
+            sshOptions: parsed.sshOptions,
+            extraArguments: [],
+            localSocketPath: localSocketPath,
+            remoteRelayPort: remoteRelayPort
+        )
+        let shellFeaturesValue = scopedGhosttyShellFeaturesValue()
+        let terminfoSource = localXtermGhosttyTerminfoSource()
+        let remoteTerminalBootstrapScript = buildInteractiveRemoteShellScript(
+            remoteRelayPort: remoteRelayPort,
+            shellFeatures: shellFeaturesValue,
+            terminfoSource: terminfoSource
+        )
+        let terminalSSHCommand = buildSSHCommandText(
+            sshOptions,
+            remoteBootstrapScript: remoteTerminalBootstrapScript
+        )
+        let terminalStartupCommand = try buildBootstrapSSHStartupCommand(
+            options: sshOptions,
+            remoteBootstrapScript: remoteTerminalBootstrapScript,
+            shellFeatures: shellFeaturesValue,
+            remoteRelayPort: remoteRelayPort
+        )
+        let effectiveOptions = effectiveSSHOptions(
+            parsed.sshOptions,
+            remoteRelayPort: remoteRelayPort
+        )
+
+        var upgradeParams: [String: Any] = [
+            "workspace_id": workspace,
+            "surface_id": surface,
+            "original_argv": originalArgv,
+            "original_command": originalArgv.map(shellQuote).joined(separator: " "),
+            "destination": parsed.destination,
+            "ssh_options": effectiveOptions,
+            "relay_port": remoteRelayPort,
+            "relay_id": relayID,
+            "relay_token": relayToken,
+            "local_socket_path": localSocketPath,
+            "terminal_startup_command": terminalStartupCommand,
+        ]
+        if let port = parsed.port {
+            upgradeParams["port"] = port
+        }
+        if let identityFile = normalizedSSHIdentityPath(parsed.identityFile) {
+            upgradeParams["identity_file"] = identityFile
+        }
+
+        let payload: [String: Any]
+        do {
+            payload = try client.sendV2(method: "surface.ssh_upgrade", params: upgradeParams)
+        } catch {
+            if dryRun {
+                throw error
+            }
+            try runInteractiveSSHProcess(arguments: sshArgs)
+            return
+        }
+
+        if (payload["fallback_required"] as? Bool) == true {
+            if dryRun {
+                print((["ssh"] + sshArgs).map(shellQuote).joined(separator: " "))
+                return
+            }
+            try runInteractiveSSHProcess(arguments: sshArgs)
+            return
+        }
+
+        if dryRun {
+            if jsonOutput {
+                var output = payload
+                output["ssh_terminal_command"] = terminalSSHCommand
+                output["ssh_terminal_startup_command"] = terminalStartupCommand
+                output["remote_relay_port"] = remoteRelayPort
+                print(jsonString(output))
+            } else {
+                print(terminalSSHCommand)
+            }
+            return
+        }
+
+        try runInteractiveShellCommand(terminalStartupCommand)
+    }
+
+    private func runInteractiveSSHProcess(arguments: [String]) throws {
+        try runInteractiveProcess(executablePath: "/usr/bin/ssh", arguments: arguments)
+    }
+
+    private func runInteractiveShellCommand(_ command: String) throws {
+        try runInteractiveProcess(executablePath: "/bin/sh", arguments: ["-c", "exec \(command)"])
+    }
+
+    private func runInteractiveProcess(executablePath: String, arguments: [String]) throws {
+        var argv = ([executablePath] + arguments).map { strdup($0) }
+        defer {
+            for item in argv {
+                free(item)
+            }
+        }
+        argv.append(nil)
+
+        execv(executablePath, &argv)
+        let code = errno
+        throw CLIError(message: "failed to launch interactive process: \(String(cString: strerror(code)))")
+    }
+
+    private func parseSSHExecCommand(arguments: [String]) -> ParsedSSHExecCommand? {
+        let noArgumentFlags = Set("46AaCfGgKkMNnqsTtVvXxYy")
+        let valueArgumentFlags = Set("BbcDEeFIiJLlmOopQRSWw")
+        let blockingOptionKeys: Set<String> = [
+            "dynamicforward",
+            "localforward",
+            "remoteforward",
+            "remotecommand",
+            "requesttty",
+            "sessiontype",
+            "stdioforward",
+        ]
+        let filteredOptionKeys: Set<String> = [
+            "batchmode",
+            "controlmaster",
+            "controlpersist",
+            "forkafterauthentication",
+            "localcommand",
+            "permitlocalcommand",
+            "remotecommand",
+            "requesttty",
+            "sendenv",
+            "sessiontype",
+            "setenv",
+            "stdioforward",
+        ]
+
+        var index = 0
+        if let executable = arguments.first?.split(separator: "/").last,
+           executable == "ssh" {
+            index = 1
+        }
+
+        var destination: String?
+        var port: Int?
+        var identityFile: String?
+        var loginName: String?
+        var sshOptions: [String] = []
+        var remoteCommandArguments: [String] = []
+        var hasForwardingOrStdioMode = false
+
+        func optionKey(_ option: String) -> String? {
+            let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return trimmed
+                .split(whereSeparator: { $0 == "=" || $0.isWhitespace })
+                .first
+                .map(String.init)?
+                .lowercased()
+        }
+
+        func optionValue(_ option: String) -> String? {
+            let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            if let equalIndex = trimmed.firstIndex(of: "=") {
+                let value = trimmed[trimmed.index(after: equalIndex)...].trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : value
+            }
+            let parts = trimmed.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+            guard parts.count == 2 else { return nil }
+            let value = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
+        }
+
+        func appendOption(_ key: String, _ value: String) {
+            sshOptions.append("\(key)=\(value)")
+        }
+
+        func consumeSSHOption(_ option: String) -> Bool {
+            let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return false }
+            let key = optionKey(trimmed)
+            let value = optionValue(trimmed)
+            if let key, blockingOptionKeys.contains(key) {
+                switch key {
+                case "requesttty":
+                    if let value, value.lowercased() == "yes" || value.lowercased() == "force" {
+                        break
+                    }
+                    hasForwardingOrStdioMode = true
+                default:
+                    hasForwardingOrStdioMode = true
+                }
+            }
+            switch key {
+            case "port":
+                guard let value, let parsedPort = Int(value) else { return false }
+                port = parsedPort
+                return true
+            case "identityfile":
+                guard let value, !value.isEmpty else { return false }
+                identityFile = value
+                return true
+            case "user":
+                guard let value, !value.isEmpty else { return false }
+                loginName = value
+                return true
+            case "proxyjump":
+                guard let value, !value.isEmpty else { return false }
+                appendOption("ProxyJump", value)
+                return true
+            case "controlpath":
+                guard let value, !value.isEmpty else { return false }
+                appendOption("ControlPath", value)
+                return true
+            case let key? where filteredOptionKeys.contains(key):
+                return true
+            case .some, .none:
+                sshOptions.append(trimmed)
+                return true
+            }
+        }
+
+        func markBlockingIfNeeded(_ option: Character) {
+            switch option {
+            case "D", "L", "N", "R", "T", "W", "w":
+                hasForwardingOrStdioMode = true
+            default:
+                break
+            }
+        }
+
+        func consumeValue(_ value: String, for option: Character) -> Bool {
+            let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedValue.isEmpty else { return false }
+            markBlockingIfNeeded(option)
+            switch option {
+            case "p":
+                guard let parsedPort = Int(trimmedValue) else { return false }
+                port = parsedPort
+                return true
+            case "i":
+                identityFile = trimmedValue
+                return true
+            case "J":
+                appendOption("ProxyJump", trimmedValue)
+                return true
+            case "S":
+                appendOption("ControlPath", trimmedValue)
+                return true
+            case "l":
+                loginName = trimmedValue
+                return true
+            case "F":
+                return false
+            case "o":
+                return consumeSSHOption(trimmedValue)
+            default:
+                return valueArgumentFlags.contains(option)
+            }
+        }
+
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--" {
+                index += 1
+                if index < arguments.count {
+                    destination = arguments[index]
+                    remoteCommandArguments = Array(arguments.dropFirst(index + 1))
+                }
+                break
+            }
+            if !argument.hasPrefix("-") || argument == "-" {
+                destination = argument
+                remoteCommandArguments = Array(arguments.dropFirst(index + 1))
+                break
+            }
+            if argument.count > 2,
+               let option = argument.dropFirst().first,
+               valueArgumentFlags.contains(option) {
+                guard consumeValue(String(argument.dropFirst(2)), for: option) else { return nil }
+                index += 1
+                continue
+            }
+            if argument.count == 2,
+               let option = argument.dropFirst().first,
+               valueArgumentFlags.contains(option) {
+                guard index + 1 < arguments.count,
+                      consumeValue(arguments[index + 1], for: option) else {
+                    return nil
+                }
+                index += 2
+                continue
+            }
+
+            let flags = Array(argument.dropFirst())
+            guard !flags.isEmpty, flags.allSatisfy({ noArgumentFlags.contains($0) }) else {
+                return nil
+            }
+            for flag in flags {
+                switch flag {
+                case "4":
+                    appendOption("AddressFamily", "inet")
+                case "6":
+                    appendOption("AddressFamily", "inet6")
+                case "A":
+                    appendOption("ForwardAgent", "yes")
+                case "C":
+                    appendOption("Compression", "yes")
+                case "N", "T":
+                    hasForwardingOrStdioMode = true
+                default:
+                    break
+                }
+            }
+            index += 1
+        }
+
+        guard let rawDestination = destination?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawDestination.isEmpty else {
+            return nil
+        }
+        let finalDestination: String
+        if let loginName = loginName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !loginName.isEmpty,
+           !rawDestination.contains("@") {
+            finalDestination = "\(loginName)@\(rawDestination)"
+        } else {
+            finalDestination = rawDestination
+        }
+        return ParsedSSHExecCommand(
+            destination: finalDestination,
+            port: port,
+            identityFile: identityFile,
+            sshOptions: sshOptions,
+            remoteCommandArguments: remoteCommandArguments,
+            hasForwardingOrStdioMode: hasForwardingOrStdioMode
+        )
     }
 
     private func runSSH(

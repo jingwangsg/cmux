@@ -6,6 +6,7 @@ import Bonsplit
 
 private var cmuxWindowTerminalPortalKey: UInt8 = 0
 private var cmuxWindowTerminalPortalCloseObserverKey: UInt8 = 0
+private var cmuxWindowTerminalPortalRetiredKey: UInt8 = 0
 
 #if DEBUG
 private func portalDebugToken(_ view: NSView?) -> String {
@@ -1843,6 +1844,18 @@ enum TerminalWindowPortalRegistry {
         removePortal(windowId: ObjectIdentifier(window), window: window)
     }
 
+    static func discardPortal(for window: NSWindow, reason: String) {
+        objc_setAssociatedObject(window, &cmuxWindowTerminalPortalRetiredKey, true, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        removePortal(for: window)
+#if DEBUG
+        dlog("portal.discard window=\(window.windowNumber) reason=\(reason)")
+#endif
+    }
+
+    static func allowPortalBinding(for window: NSWindow) {
+        objc_setAssociatedObject(window, &cmuxWindowTerminalPortalRetiredKey, nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
+
     private static func removePortal(windowId: ObjectIdentifier, window: NSWindow?) {
         if let portal = portalsByWindowId.removeValue(forKey: windowId) {
             portal.tearDown()
@@ -1895,6 +1908,15 @@ enum TerminalWindowPortalRegistry {
         expectedGeneration: UInt64? = nil
     ) {
         guard let window = anchorView.window else { return }
+        if (objc_getAssociatedObject(window, &cmuxWindowTerminalPortalRetiredKey) as? Bool) == true {
+#if DEBUG
+            dlog(
+                "portal.bind.blocked hosted=\(portalDebugToken(hostedView)) " +
+                    "anchor=\(portalDebugToken(anchorView)) reason=retiredWindow window=\(window.windowNumber)"
+            )
+#endif
+            return
+        }
 
         let windowId = ObjectIdentifier(window)
         let hostedId = ObjectIdentifier(hostedView)
