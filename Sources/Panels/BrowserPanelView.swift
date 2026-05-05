@@ -608,10 +608,10 @@ struct BrowserPanelView: View {
         }
         .coordinateSpace(name: "BrowserPanelViewSpace")
         .onPreferenceChange(OmnibarPillFramePreferenceKey.self) { frame in
-            omnibarPillFrame = frame
+            setOmnibarPillFrameIfMeaningfullyChanged(frame)
         }
         .onPreferenceChange(BrowserAddressBarHeightPreferenceKey.self) { height in
-            addressBarHeight = height
+            setAddressBarHeightIfMeaningfullyChanged(height)
         }
         .onReceive(NotificationCenter.default.publisher(for: .webViewDidReceiveClick).filter { [weak panel] note in
             // Only handle clicks from our own webview.
@@ -1352,6 +1352,23 @@ struct BrowserPanelView: View {
             for: colorScheme,
             themeBackgroundColor: GhosttyBackgroundTheme.currentColor()
         )
+    }
+
+    private func setOmnibarPillFrameIfMeaningfullyChanged(_ frame: CGRect) {
+        guard !rectsNearlyEqual(omnibarPillFrame, frame) else { return }
+        omnibarPillFrame = frame
+    }
+
+    private func setAddressBarHeightIfMeaningfullyChanged(_ height: CGFloat) {
+        guard abs(addressBarHeight - height) > 0.5 else { return }
+        addressBarHeight = height
+    }
+
+    private func rectsNearlyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.origin.x - rhs.origin.x) <= 0.5 &&
+            abs(lhs.origin.y - rhs.origin.y) <= 0.5 &&
+            abs(lhs.size.width - rhs.size.width) <= 0.5 &&
+            abs(lhs.size.height - rhs.size.height) <= 0.5
     }
 
     private func syncWebViewResponderPolicyWithViewState(
