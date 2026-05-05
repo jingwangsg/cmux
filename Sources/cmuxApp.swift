@@ -6866,9 +6866,9 @@ private struct SettingsSSHRegisteredHostsView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(String(localized: "settings.terminal.sshRegisteredHosts", defaultValue: "Registered SSH Hosts"))
+                    Text(String(localized: "settings.terminal.sshRegisteredHosts", defaultValue: "Remote Hosts"))
                         .font(.system(size: 13, weight: .medium))
-                    Text(String(localized: "settings.terminal.sshRegisteredHosts.subtitle", defaultValue: "Prewarm remote daemons for hosts you use often. A host only becomes an SSH session after you run ssh yourself."))
+                    Text(String(localized: "settings.terminal.sshRegisteredHosts.subtitle", defaultValue: "Auto-deploy remote daemons for selected SSH config hosts when cmux starts. Project-configured remotes connect even if they are not selected here."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -6991,13 +6991,13 @@ private struct SettingsSSHRegisteredHostRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Toggle(String(localized: "settings.terminal.sshRegisteredHosts.autoPrepare", defaultValue: "Auto-prepare"), isOn: $autoPrepare)
+            Toggle(String(localized: "settings.terminal.sshRegisteredHosts.autoPrepare", defaultValue: "Auto-deploy"), isOn: $autoPrepare)
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .fixedSize()
                 .accessibilityIdentifier("SettingsSSHHostAutoPrepareToggle.\(accessibilitySuffix)")
 
-            Button(status?.state == .error ? String(localized: "settings.terminal.sshRegisteredHosts.retry", defaultValue: "Retry") : String(localized: "settings.terminal.sshRegisteredHosts.prepare", defaultValue: "Prepare")) {
+            Button(status?.state == .error ? String(localized: "settings.terminal.sshRegisteredHosts.retry", defaultValue: "Retry") : String(localized: "settings.terminal.sshRegisteredHosts.prepare", defaultValue: "Deploy")) {
                 prepare()
             }
             .buttonStyle(.bordered)

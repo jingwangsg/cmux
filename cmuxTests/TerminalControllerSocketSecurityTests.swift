@@ -24,6 +24,8 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
 
     override func tearDown() {
         TerminalController.shared.stop()
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = nil
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = nil
         super.tearDown()
     }
 
@@ -174,6 +176,134 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertNil(payload["ssh_options"])
         XCTAssertEqual(payload["has_identity_file"] as? Bool, true)
         XCTAssertEqual(payload["has_ssh_options"] as? Bool, true)
+    }
+
+    func testWorkspaceCreateCanOptOutOfProjectRemoteInferenceForExplicitSSH() async throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["project-host"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-socket-project-remote-\(UUID().uuidString)", isDirectory: true)
+        let nested = root.appendingPathComponent("repo", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        let tabManager = TabManager()
+        var createdWorkspaceForCleanup: Workspace?
+        defer {
+            if let createdWorkspaceForCleanup {
+                if let owner = AppDelegate.shared?.tabManagerFor(tabId: createdWorkspaceForCleanup.id) {
+                    owner.closeWorkspace(createdWorkspaceForCleanup)
+                } else if tabManager.tabs.contains(where: { $0.id == createdWorkspaceForCleanup.id }) {
+                    tabManager.closeWorkspace(createdWorkspaceForCleanup)
+                }
+            }
+            try? fm.removeItem(at: root)
+        }
+
+        try """
+        {
+          "remote": { "host": "project-host" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        let socketPath = makeSocketPath("ssh-opt-out")
+
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { _ in nil }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+        }
+
+        TerminalController.shared.start(
+            tabManager: tabManager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try await sendV2RequestAsync(
+            method: "workspace.create",
+            params: [
+                "cwd": nested.path,
+                "initial_command": "ssh explicit-host",
+                "infer_project_remote": false,
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        let workspaceIDString = try XCTUnwrap(result["workspace_id"] as? String)
+        let workspaceID = try XCTUnwrap(UUID(uuidString: workspaceIDString))
+        let createdWorkspace = try XCTUnwrap(
+            tabManager.tabs.first(where: { $0.id == workspaceID })
+                ?? AppDelegate.shared?.workspaceFor(tabId: workspaceID)
+        )
+        createdWorkspaceForCleanup = createdWorkspace
+        let terminal = try XCTUnwrap(createdWorkspace.focusedTerminalPanel)
+
+        XCTAssertEqual(createdWorkspace.currentDirectory, nested.path)
+        XCTAssertNil(createdWorkspace.remoteConfiguration)
+        XCTAssertFalse(createdWorkspace.isRemoteTerminalSurface(terminal.id))
+        XCTAssertEqual(terminal.surface.debugInitialCommand(), "ssh explicit-host")
+    }
+
+    func testProjectRemoteWorkspaceCreateUsesActiveSocketPathForRelay() async throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["project-host"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-socket-project-remote-relay-\(UUID().uuidString)", isDirectory: true)
+        let nested = root.appendingPathComponent("repo", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        let tabManager = TabManager()
+        var createdWorkspaceForCleanup: Workspace?
+        defer {
+            if let createdWorkspaceForCleanup {
+                if let owner = AppDelegate.shared?.tabManagerFor(tabId: createdWorkspaceForCleanup.id) {
+                    owner.closeWorkspace(createdWorkspaceForCleanup)
+                } else if tabManager.tabs.contains(where: { $0.id == createdWorkspaceForCleanup.id }) {
+                    tabManager.closeWorkspace(createdWorkspaceForCleanup)
+                }
+            }
+            try? fm.removeItem(at: root)
+        }
+
+        try """
+        {
+          "remote": { "host": "project-host" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        let socketPath = makeSocketPath("relay-path")
+        TerminalController.shared.start(
+            tabManager: tabManager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try await sendV2RequestAsync(
+            method: "workspace.create",
+            params: ["cwd": nested.path],
+            to: socketPath
+        )
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        let workspaceIDString = try XCTUnwrap(result["workspace_id"] as? String)
+        let workspaceID = try XCTUnwrap(UUID(uuidString: workspaceIDString))
+        let createdWorkspace = try XCTUnwrap(
+            tabManager.tabs.first(where: { $0.id == workspaceID })
+                ?? AppDelegate.shared?.workspaceFor(tabId: workspaceID)
+        )
+        createdWorkspaceForCleanup = createdWorkspace
+        let terminal = try XCTUnwrap(createdWorkspace.focusedTerminalPanel)
+
+        XCTAssertEqual(createdWorkspace.remoteConfiguration?.destination, "project-host")
+        XCTAssertEqual(createdWorkspace.remoteConfiguration?.localSocketPath, socketPath)
+        XCTAssertEqual(
+            terminal.surface.debugInitialCommand(),
+            createdWorkspace.remoteConfiguration?.terminalStartupCommand
+        )
+        XCTAssertTrue(createdWorkspace.isRemoteTerminalSurface(terminal.id))
     }
 
     func testNotificationCreateUsesExplicitSurfaceIDWhenProvided() async throws {

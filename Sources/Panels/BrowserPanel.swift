@@ -2884,7 +2884,11 @@ final class BrowserPanel: Panel, ObservableObject {
             )
         }
         applyRemoteProxyConfigurationIfAvailable()
-        resumePendingRemoteNavigationIfNeeded()
+        if usesRemoteWorkspaceProxy {
+            resumePendingRemoteNavigationIfNeeded()
+        } else {
+            resumePendingRemoteNavigationLocallyIfNeeded()
+        }
     }
 
     @discardableResult
@@ -3823,6 +3827,21 @@ final class BrowserPanel: Panel, ObservableObject {
 
     private func resumePendingRemoteNavigationIfNeeded() {
         guard remoteProxyEndpoint != nil,
+              let pendingRemoteNavigation else {
+            return
+        }
+        self.pendingRemoteNavigation = nil
+        guard let originalURL = pendingRemoteNavigation.request.url else { return }
+        performNavigation(
+            request: pendingRemoteNavigation.request,
+            originalURL: originalURL,
+            recordTypedNavigation: pendingRemoteNavigation.recordTypedNavigation,
+            preserveRestoredSessionHistory: pendingRemoteNavigation.preserveRestoredSessionHistory
+        )
+    }
+
+    private func resumePendingRemoteNavigationLocallyIfNeeded() {
+        guard !usesRemoteWorkspaceProxy,
               let pendingRemoteNavigation else {
             return
         }

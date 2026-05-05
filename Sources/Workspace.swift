@@ -365,7 +365,10 @@ extension Workspace {
 
         recomputeListeningPorts()
         if let restoredRemoteConfiguration {
-            configureRemoteConnection(restoredRemoteConfiguration, autoConnect: true)
+            configureRemoteConnection(
+                restoredRemoteConfiguration,
+                autoConnect: restoredRemoteConfiguration.foregroundAuthToken == nil
+            )
         }
 
         if let focusedOldPanelId = snapshot.focusedPanelId,
@@ -612,7 +615,11 @@ extension Workspace {
                 .first
 
             if anchorPanelId == nil {
-                anchorPanelId = newTerminalSurface(inPane: paneId, focus: false)?.id
+                anchorPanelId = newTerminalSurface(
+                    inPane: paneId,
+                    focus: false,
+                    managedRemoteStartup: false
+                )?.id
             }
 
             guard let anchorPanelId,
@@ -620,7 +627,8 @@ extension Workspace {
                     from: anchorPanelId,
                     orientation: split.orientation.splitOrientation,
                     insertFirst: false,
-                    focus: false
+                    focus: false,
+                    managedRemoteStartup: false
                   ),
                   let secondPaneId = self.paneId(forPanelId: newSplitPanel.id) else {
                 leaves.append(
@@ -894,14 +902,26 @@ extension Workspace {
         guard let rootPaneId = bonsplitController.allPaneIds.first else { return }
 
         var leaves: [(paneId: PaneID, surfaces: [CmuxSurfaceDefinition])] = []
-        buildCustomLayoutTree(layout, inPane: rootPaneId, leaves: &leaves)
+        var scaffoldTerminalPanelIds = Set<UUID>()
+        buildCustomLayoutTree(
+            layout,
+            inPane: rootPaneId,
+            leaves: &leaves,
+            scaffoldTerminalPanelIds: &scaffoldTerminalPanelIds
+        )
 
         // First leaf reuses the initial terminal created by addWorkspace;
         // subsequent leaves were created via newTerminalSplit which also seeds
         // a placeholder terminal.
         var focusPanelId: UUID?
         for leaf in leaves {
-            populateCustomPane(leaf.paneId, surfaces: leaf.surfaces, baseCwd: baseCwd, focusPanelId: &focusPanelId)
+            populateCustomPane(
+                leaf.paneId,
+                surfaces: leaf.surfaces,
+                baseCwd: baseCwd,
+                focusPanelId: &focusPanelId,
+                scaffoldTerminalPanelIds: scaffoldTerminalPanelIds
+            )
         }
 
         let liveRoot = bonsplitController.treeSnapshot()
@@ -915,7 +935,8 @@ extension Workspace {
     private func buildCustomLayoutTree(
         _ node: CmuxLayoutNode,
         inPane paneId: PaneID,
-        leaves: inout [(paneId: PaneID, surfaces: [CmuxSurfaceDefinition])]
+        leaves: inout [(paneId: PaneID, surfaces: [CmuxSurfaceDefinition])],
+        scaffoldTerminalPanelIds: inout Set<UUID>
     ) {
         switch node {
         case .pane(let pane):
@@ -934,7 +955,14 @@ extension Workspace {
                 .first
 
             if anchorPanelId == nil {
-                anchorPanelId = newTerminalSurface(inPane: paneId, focus: false)?.id
+                anchorPanelId = newTerminalSurface(
+                    inPane: paneId,
+                    focus: false,
+                    managedRemoteStartup: false
+                )?.id
+                if let anchorPanelId {
+                    scaffoldTerminalPanelIds.insert(anchorPanelId)
+                }
             }
 
             guard let anchorPanelId,
@@ -942,15 +970,27 @@ extension Workspace {
                       from: anchorPanelId,
                       orientation: split.splitOrientation,
                       insertFirst: false,
-                      focus: false
+                      focus: false,
+                      managedRemoteStartup: false
                   ),
                   let secondPaneId = self.paneId(forPanelId: newSplitPanel.id) else {
                 leaves.append((paneId: paneId, surfaces: []))
                 return
             }
 
-            buildCustomLayoutTree(split.children[0], inPane: paneId, leaves: &leaves)
-            buildCustomLayoutTree(split.children[1], inPane: secondPaneId, leaves: &leaves)
+            scaffoldTerminalPanelIds.insert(newSplitPanel.id)
+            buildCustomLayoutTree(
+                split.children[0],
+                inPane: paneId,
+                leaves: &leaves,
+                scaffoldTerminalPanelIds: &scaffoldTerminalPanelIds
+            )
+            buildCustomLayoutTree(
+                split.children[1],
+                inPane: secondPaneId,
+                leaves: &leaves,
+                scaffoldTerminalPanelIds: &scaffoldTerminalPanelIds
+            )
         }
     }
 
@@ -958,13 +998,21 @@ extension Workspace {
         _ paneId: PaneID,
         surfaces: [CmuxSurfaceDefinition],
         baseCwd: String,
-        focusPanelId: inout UUID?
+        focusPanelId: inout UUID?,
+        scaffoldTerminalPanelIds: Set<UUID>
     ) {
         let existingPanelIds = bonsplitController
             .tabs(inPane: paneId)
             .compactMap { panelIdFromSurfaceId($0.id) }
 
-        guard !surfaces.isEmpty else { return }
+        guard !surfaces.isEmpty else {
+            replaceScaffoldTerminalIfNeeded(
+                inPane: paneId,
+                existingPanelIds: existingPanelIds,
+                scaffoldTerminalPanelIds: scaffoldTerminalPanelIds
+            )
+            return
+        }
 
         let firstSurface = surfaces[0]
         if let placeholderPanelId = existingPanelIds.first {
@@ -973,7 +1021,8 @@ extension Workspace {
                 inPane: paneId,
                 surface: firstSurface,
                 baseCwd: baseCwd,
-                focusPanelId: &focusPanelId
+                focusPanelId: &focusPanelId,
+                scaffoldTerminalPanelIds: scaffoldTerminalPanelIds
             )
         }
 
@@ -992,9 +1041,24 @@ extension Workspace {
         inPane paneId: PaneID,
         surface: CmuxSurfaceDefinition,
         baseCwd: String,
-        focusPanelId: inout UUID?
+        focusPanelId: inout UUID?,
+        scaffoldTerminalPanelIds: Set<UUID>
     ) {
         switch surface.type {
+        case .terminal where isProjectConfiguredRemoteWorkspace && scaffoldTerminalPanelIds.contains(panelId):
+            let resolvedCwd = CmuxConfigStore.resolveCwd(surface.cwd, relativeTo: baseCwd)
+            if let panel = newTerminalSurface(
+                inPane: paneId,
+                focus: false,
+                workingDirectory: resolvedCwd,
+                startupEnvironment: surface.env ?? [:]
+            ) {
+                _ = closePanel(panelId, force: true)
+                if let name = surface.name { setPanelCustomTitle(panelId: panel.id, title: name) }
+                if surface.focus == true { focusPanelId = panel.id }
+                if let command = surface.command { sendInputWhenReady(command + "\n", to: panel) }
+            }
+
         case .terminal where surface.cwd != nil || surface.env != nil:
             // Placeholder can't change cwd/env — replace it
             let resolvedCwd = CmuxConfigStore.resolveCwd(surface.cwd, relativeTo: baseCwd)
@@ -1024,6 +1088,21 @@ extension Workspace {
                 if let name = surface.name { setPanelCustomTitle(panelId: panel.id, title: name) }
                 if surface.focus == true { focusPanelId = panel.id }
             }
+        }
+    }
+
+    private func replaceScaffoldTerminalIfNeeded(
+        inPane paneId: PaneID,
+        existingPanelIds: [UUID],
+        scaffoldTerminalPanelIds: Set<UUID>
+    ) {
+        guard let placeholderPanelId = existingPanelIds.first,
+              isProjectConfiguredRemoteWorkspace,
+              scaffoldTerminalPanelIds.contains(placeholderPanelId) else {
+            return
+        }
+        if newTerminalSurface(inPane: paneId, focus: false) != nil {
+            _ = closePanel(placeholderPanelId, force: true)
         }
     }
 
@@ -6416,6 +6495,7 @@ struct WorkspaceRemoteConfiguration: Equatable {
     let localSocketPath: String?
     let terminalStartupCommand: String?
     let foregroundAuthToken: String?
+    let projectConfigPath: String?
 
     init(
         destination: String,
@@ -6429,7 +6509,8 @@ struct WorkspaceRemoteConfiguration: Equatable {
         relayToken: String?,
         localSocketPath: String?,
         terminalStartupCommand: String?,
-        foregroundAuthToken: String? = nil
+        foregroundAuthToken: String? = nil,
+        projectConfigPath: String? = nil
     ) {
         self.destination = destination
         self.port = port
@@ -6443,6 +6524,7 @@ struct WorkspaceRemoteConfiguration: Equatable {
         self.localSocketPath = localSocketPath
         self.terminalStartupCommand = terminalStartupCommand
         self.foregroundAuthToken = foregroundAuthToken
+        self.projectConfigPath = projectConfigPath
     }
 
     func withLocalRelayPort(_ localRelayPort: Int?) -> WorkspaceRemoteConfiguration {
@@ -6458,7 +6540,8 @@ struct WorkspaceRemoteConfiguration: Equatable {
             relayToken: relayToken,
             localSocketPath: localSocketPath,
             terminalStartupCommand: terminalStartupCommand,
-            foregroundAuthToken: foregroundAuthToken
+            foregroundAuthToken: foregroundAuthToken,
+            projectConfigPath: projectConfigPath
         )
     }
 
@@ -6495,6 +6578,643 @@ struct WorkspaceRemoteConfiguration: Equatable {
             .first
             .map(String.init)?
             .lowercased()
+    }
+}
+
+struct ProjectRemoteWorkspaceBootstrap: Equatable {
+    let configuration: WorkspaceRemoteConfiguration
+
+    #if DEBUG
+    nonisolated(unsafe) static var startupScriptWriterOverrideForTesting: ((String, Int) -> String?)?
+    #endif
+
+    static func build(host: String, configPath: String) -> ProjectRemoteWorkspaceBootstrap? {
+        let relayPort = Int.random(in: 49152...65535)
+        let relayID = UUID().uuidString.lowercased()
+        let relayToken = randomHex(byteCount: 32)
+        let sshOptions = effectiveSSHOptions(remoteRelayPort: relayPort)
+        let foregroundAuthToken = UUID().uuidString.lowercased()
+        let foregroundAuthCommand = deferredRemoteReconnectLocalCommand(
+            in: sshOptions,
+            foregroundAuthToken: foregroundAuthToken
+        )
+        let startupCommand = buildTerminalStartupCommand(
+            host: host,
+            relayPort: relayPort,
+            localCommand: foregroundAuthCommand
+        )
+        guard let startupCommand else {
+            NSLog("[ProjectRemote] failed to build managed terminal startup command for %@", host)
+            return nil
+        }
+
+        return ProjectRemoteWorkspaceBootstrap(
+            configuration: WorkspaceRemoteConfiguration(
+                destination: host,
+                port: nil,
+                identityFile: nil,
+                sshOptions: sshOptions,
+                localProxyPort: nil,
+                relayPort: relayPort,
+                relayID: relayID,
+                relayToken: relayToken,
+                localSocketPath: TerminalController.activeSocketPathForCurrentProcess(),
+                terminalStartupCommand: startupCommand,
+                foregroundAuthToken: foregroundAuthCommand == nil ? nil : foregroundAuthToken,
+                projectConfigPath: configPath
+            )
+        )
+    }
+
+    private static func randomHex(byteCount: Int) -> String {
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func buildTerminalStartupCommand(
+        host: String,
+        relayPort: Int,
+        localCommand: String?
+    ) -> String? {
+        let shellFeatures = scopedGhosttyShellFeaturesValue()
+        let remoteBootstrapScript = buildInteractiveRemoteShellScript(
+            remoteRelayPort: relayPort,
+            shellFeatures: shellFeatures,
+            terminfoSource: localXtermGhosttyTerminfoSource()
+        )
+        let sshSnippet = buildSSHBootstrapCommandSnippet(
+            host: host,
+            remoteBootstrapScript: remoteBootstrapScript,
+            remoteRelayPort: relayPort,
+            localCommand: localCommand
+        )
+        return buildSSHStartupCommand(
+            sshCommand: sshSnippet,
+            shellFeatures: shellFeatures,
+            relayPort: relayPort,
+            isShellSnippet: true
+        )
+    }
+
+    private static func buildSSHStartupCommand(
+        sshCommand: String,
+        shellFeatures: String,
+        relayPort: Int,
+        isShellSnippet: Bool
+    ) -> String? {
+        let trimmedFeatures = shellFeatures.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shellFeaturesBootstrap = trimmedFeatures.isEmpty
+            ? ""
+            : "export GHOSTTY_SHELL_FEATURES=\(shellQuote(trimmedFeatures))"
+        let lifecycleCleanup = buildSSHSessionEndShellCommand(relayPort: relayPort)
+        var scriptLines: [String] = ["#!/bin/sh"]
+        if !shellFeaturesBootstrap.isEmpty {
+            scriptLines.append(shellFeaturesBootstrap)
+        }
+        scriptLines += [
+            "CMUX_SSH_SESSION_ENDED=0",
+            "cmux_ssh_session_end() { if [ \"${CMUX_SSH_SESSION_ENDED:-0}\" = 1 ]; then return; fi; CMUX_SSH_SESSION_ENDED=1; \(lifecycleCleanup); }",
+            "trap 'cmux_ssh_session_end' EXIT HUP INT TERM",
+        ]
+        scriptLines.append(isShellSnippet ? sshCommand : "command \(sshCommand)")
+        scriptLines += [
+            "cmux_ssh_status=$?",
+            "trap - EXIT HUP INT TERM",
+            "cmux_ssh_session_end",
+            "exit $cmux_ssh_status",
+        ]
+        return writeStartupScript(scriptLines.joined(separator: "\n"), relayPort: relayPort)
+    }
+
+    private static func buildSSHBootstrapCommandSnippet(
+        host: String,
+        remoteBootstrapScript: String,
+        remoteRelayPort: Int,
+        localCommand: String?
+    ) -> String {
+        let encodedBootstrapScript = Data(remoteBootstrapScript.utf8).base64EncodedString()
+        let installSSHPrefix = baseSSHArguments(
+            remoteRelayPort: remoteRelayPort,
+            localCommand: localCommand
+        )
+        .map(shellQuote)
+        .joined(separator: " ")
+        let sessionSSHPrefix = baseSSHArguments(remoteRelayPort: remoteRelayPort).map(shellQuote).joined(separator: " ")
+        let remoteCommandTemplate = sshPercentEscapedRemoteCommand(
+            stagedRemoteBootstrapCommandShell(remoteRelayPort: remoteRelayPort)
+        )
+        let remoteBootstrapInstallCommand = "/bin/sh -c " + shellQuote(
+            remoteBootstrapInstallShell(remoteRelayPort: remoteRelayPort)
+        )
+        var lines: [String] = [
+            "cmux_workspace_id=\"${CMUX_WORKSPACE_ID:-}\"",
+            "cmux_surface_id=\"${CMUX_SURFACE_ID:-}\"",
+            "cmux_remote_bootstrap_b64=\(shellQuote(encodedBootstrapScript))",
+            "cmux_remote_bootstrap=\"$(printf %s \"$cmux_remote_bootstrap_b64\" | base64 -d 2>/dev/null || printf %s \"$cmux_remote_bootstrap_b64\" | base64 -D 2>/dev/null)\"",
+            "cmux_remote_bootstrap=\"$(printf '%s' \"$cmux_remote_bootstrap\" | sed \"s/__CMUX_WORKSPACE_ID__/$cmux_workspace_id/g; s/__CMUX_SURFACE_ID__/$cmux_surface_id/g\")\"",
+            "if ! printf '%s' \"$cmux_remote_bootstrap\" | command \(installSSHPrefix) -T \(shellQuote(host)) \(shellQuote(remoteBootstrapInstallCommand)); then",
+            "  exit 1",
+            "fi",
+            "cmux_remote_command_template=\(shellQuote(remoteCommandTemplate))",
+            "cmux_remote_command=\"$(printf '%s' \"$cmux_remote_command_template\" | sed \"s/__CMUX_WORKSPACE_ID__/$cmux_workspace_id/g; s/__CMUX_SURFACE_ID__/$cmux_surface_id/g\")\"",
+        ]
+
+        var sshInvocation = "command \(sessionSSHPrefix) -o \"RemoteCommand=$cmux_remote_command\""
+        sshInvocation += " -tt " + shellQuote(host)
+        lines.append(sshInvocation)
+        return lines.joined(separator: "\n")
+    }
+
+    private static func buildSSHSessionEndShellCommand(relayPort: Int) -> String {
+        [
+            "if [ -n \"${CMUX_BUNDLED_CLI_PATH:-}\" ]",
+            "&& [ -x \"${CMUX_BUNDLED_CLI_PATH}\" ]",
+            "&& [ -n \"${CMUX_SOCKET_PATH:-}\" ]",
+            "&& [ -n \"${CMUX_WORKSPACE_ID:-}\" ]",
+            "&& [ -n \"${CMUX_SURFACE_ID:-}\" ]; then",
+            "\"${CMUX_BUNDLED_CLI_PATH}\" --socket \"${CMUX_SOCKET_PATH}\" ssh-session-end --relay-port \(relayPort) --workspace \"${CMUX_WORKSPACE_ID}\" --surface \"${CMUX_SURFACE_ID}\" >/dev/null 2>&1 || true;",
+            "elif command -v cmux >/dev/null 2>&1",
+            "&& [ -n \"${CMUX_WORKSPACE_ID:-}\" ]",
+            "&& [ -n \"${CMUX_SURFACE_ID:-}\" ]; then",
+            "cmux ssh-session-end --relay-port \(relayPort) --workspace \"${CMUX_WORKSPACE_ID}\" --surface \"${CMUX_SURFACE_ID}\" >/dev/null 2>&1 || true;",
+            "fi",
+        ].joined(separator: " ")
+    }
+
+    private static func baseSSHArguments(
+        remoteRelayPort: Int,
+        localCommand: String? = nil
+    ) -> [String] {
+        var parts = [
+            "ssh",
+            "-o", "ConnectTimeout=6",
+            "-o", "ServerAliveInterval=20",
+            "-o", "ServerAliveCountMax=2",
+            "-o", "SetEnv COLORTERM=truecolor",
+            "-o", "SendEnv TERM_PROGRAM TERM_PROGRAM_VERSION",
+        ]
+        for option in effectiveSSHOptions(remoteRelayPort: remoteRelayPort) {
+            parts += ["-o", option]
+        }
+        if let localCommand, !localCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let escapedLocalCommand = localCommand.replacingOccurrences(of: "%", with: "%%")
+            parts += ["-o", "PermitLocalCommand=yes"]
+            parts += ["-o", "LocalCommand=\(escapedLocalCommand)"]
+        }
+        return parts
+    }
+
+    private static func effectiveSSHOptions(remoteRelayPort: Int) -> [String] {
+        [
+            "StrictHostKeyChecking=accept-new",
+            "ControlMaster=auto",
+            "ControlPersist=600",
+            "ControlPath=/tmp/cmux-ssh-\(getuid())-\(remoteRelayPort)-%C",
+        ]
+    }
+
+    private static func deferredRemoteReconnectLocalCommand(
+        in options: [String],
+        foregroundAuthToken: String
+    ) -> String? {
+        guard shouldDeferRemoteReconnect(in: options) else { return nil }
+        let escapedForegroundAuthToken = foregroundAuthToken
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return [
+            "cmux_reconnect_cli=\"\";",
+            "cmux_reconnect_socket=\"${CMUX_SOCKET_PATH:-${CMUX_SOCKET:-}}\";",
+            "if [ -z \"$cmux_reconnect_cli\" ] && [ -n \"${CMUX_BUNDLED_CLI_PATH:-}\" ]; then cmux_reconnect_cli=\"$CMUX_BUNDLED_CLI_PATH\"; fi;",
+            "if [ ! -x \"$cmux_reconnect_cli\" ]; then cmux_reconnect_cli=\"$(command -v cmux 2>/dev/null || true)\"; fi;",
+            "if [ -n \"${CMUX_WORKSPACE_ID:-}\" ]; then",
+            "if [ -z \"$cmux_reconnect_socket\" ]; then printf '%s\\n' 'cmux: deferred SSH reconnect skipped, local cmux socket not found' >&2;",
+            "elif [ -z \"$cmux_reconnect_cli\" ] || [ ! -x \"$cmux_reconnect_cli\" ]; then printf '%s\\n' 'cmux: deferred SSH reconnect skipped, local cmux CLI not found' >&2;",
+            "else",
+            "cmux_reconnect_payload=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"foreground_auth_token\\\":\\\"\(escapedForegroundAuthToken)\\\"}\";",
+            "\"$cmux_reconnect_cli\" --socket \"$cmux_reconnect_socket\" rpc workspace.remote.foreground_auth_ready \"$cmux_reconnect_payload\" >/dev/null 2>&1 || true;",
+            "unset cmux_reconnect_payload;",
+            "fi;",
+            "fi;",
+            "unset cmux_reconnect_socket cmux_reconnect_cli;",
+        ].joined(separator: " ")
+    }
+
+    private static func shouldDeferRemoteReconnect(in options: [String]) -> Bool {
+        guard !hasSSHOptionKey(options, key: "LocalCommand"),
+              !hasSSHOptionKey(options, key: "PermitLocalCommand") else {
+            return false
+        }
+
+        guard let controlPath = sshOptionValue(named: "ControlPath", in: options)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !controlPath.isEmpty,
+              controlPath.lowercased() != "none" else {
+            return false
+        }
+
+        let controlMaster = sshOptionValue(named: "ControlMaster", in: options)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? "auto"
+        switch controlMaster {
+        case "no", "false", "off":
+            return false
+        default:
+            return true
+        }
+    }
+
+    private static func hasSSHOptionKey(_ options: [String], key: String) -> Bool {
+        let loweredKey = key.lowercased()
+        for option in options {
+            if sshOptionKey(option) == loweredKey {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func sshOptionValue(named key: String, in options: [String]) -> String? {
+        let loweredKey = key.lowercased()
+        for option in options {
+            let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let parts = trimmed.split(
+                maxSplits: 1,
+                omittingEmptySubsequences: true,
+                whereSeparator: { $0 == "=" || $0.isWhitespace }
+            )
+            if parts.count == 2, parts[0].lowercased() == loweredKey {
+                let value = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !value.isEmpty {
+                    return value
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func sshOptionKey(_ option: String) -> String? {
+        let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+            .split(whereSeparator: { $0 == "=" || $0.isWhitespace })
+            .first
+            .map(String.init)?
+            .lowercased()
+    }
+
+    private static func stagedRemoteBootstrapCommandShell(remoteRelayPort: Int) -> String {
+        var lines = remoteBootstrapTTYCaptureLines(remoteRelayPort: remoteRelayPort, includeRelayRPC: true)
+        lines.append("/bin/sh \"$HOME/.cmux/relay/\(remoteRelayPort).bootstrap.sh\"")
+        return lines.joined(separator: "\n")
+    }
+
+    private static func remoteBootstrapInstallShell(remoteRelayPort: Int) -> String {
+        [
+            "set -eu",
+            "umask 077",
+            "cmux_bootstrap_path=\"$HOME/.cmux/relay/\(remoteRelayPort).bootstrap.sh\"",
+            "mkdir -p \"$HOME/.cmux/relay\"",
+            "cat > \"$cmux_bootstrap_path\"",
+            "chmod 700 \"$cmux_bootstrap_path\" >/dev/null 2>&1 || true",
+        ].joined(separator: "\n")
+    }
+
+    private static func remoteBootstrapTTYCaptureLines(
+        remoteRelayPort: Int,
+        includeRelayRPC: Bool
+    ) -> [String] {
+        guard remoteRelayPort > 0 else { return [] }
+
+        var lines: [String] = [
+            "cmux_bootstrap_tty=\"$(tty 2>/dev/null || true)\"",
+            "cmux_bootstrap_tty=\"${cmux_bootstrap_tty##*/}\"",
+            "if [ -n \"$cmux_bootstrap_tty\" ] && [ \"$cmux_bootstrap_tty\" != \"not a tty\" ]; then",
+            "  mkdir -p \"$HOME/.cmux/relay\" >/dev/null 2>&1 || true",
+            "  printf '%s' \"$cmux_bootstrap_tty\" > \"$HOME/.cmux/relay/\(remoteRelayPort).tty\" 2>/dev/null || true",
+            "  export CMUX_BOOTSTRAP_TTY=\"$cmux_bootstrap_tty\"",
+        ]
+
+        if includeRelayRPC {
+            lines += [
+                "  cmux_relay_cli=\"$HOME/.cmux/bin/cmux\"",
+                "  if [ ! -x \"$cmux_relay_cli\" ]; then cmux_relay_cli=\"$(command -v cmux 2>/dev/null || true)\"; fi",
+                "  if [ -n \"$cmux_relay_cli\" ]; then",
+                "    cmux_relay_report_tty='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"tty_name\":\"'$cmux_bootstrap_tty'\"}'",
+                "    cmux_relay_ports_kick='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"reason\":\"command\"}'",
+                "    if [ -n \"__CMUX_SURFACE_ID__\" ]; then",
+                "      cmux_relay_report_tty='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"surface_id\":\"__CMUX_SURFACE_ID__\",\"tty_name\":\"'$cmux_bootstrap_tty'\"}'",
+                "      cmux_relay_ports_kick='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"surface_id\":\"__CMUX_SURFACE_ID__\",\"reason\":\"command\"}'",
+                "    fi",
+                "    CMUX_SOCKET_PATH=\"127.0.0.1:\(remoteRelayPort)\" CMUX_SOCKET=\"127.0.0.1:\(remoteRelayPort)\" \"$cmux_relay_cli\" rpc surface.report_tty \"$cmux_relay_report_tty\" >/dev/null 2>&1 || true",
+                "    CMUX_SOCKET_PATH=\"127.0.0.1:\(remoteRelayPort)\" CMUX_SOCKET=\"127.0.0.1:\(remoteRelayPort)\" \"$cmux_relay_cli\" rpc surface.ports_kick \"$cmux_relay_ports_kick\" >/dev/null 2>&1 || true",
+                "    unset cmux_relay_cli cmux_relay_report_tty cmux_relay_ports_kick",
+                "  fi",
+            ]
+        }
+
+        lines.append("fi")
+        return lines
+    }
+
+    private static func buildInteractiveRemoteShellScript(
+        remoteRelayPort: Int,
+        shellFeatures: String,
+        terminfoSource: String? = nil
+    ) -> String {
+        let remoteTerminalLines = interactiveRemoteTerminalSetupLines(terminfoSource: terminfoSource)
+        let remoteEnvExportLines = interactiveRemoteShellExportLines(shellFeatures: shellFeatures)
+        let shellStateDir = "$HOME/.cmux/relay/\(max(remoteRelayPort, 0)).shell"
+        let remoteCallerExportLines = [
+            "if [ -n '__CMUX_WORKSPACE_ID__' ]; then export CMUX_WORKSPACE_ID='__CMUX_WORKSPACE_ID__'; fi",
+            "if [ -n '__CMUX_WORKSPACE_ID__' ]; then export CMUX_TAB_ID='__CMUX_WORKSPACE_ID__'; fi",
+            "if [ -n '__CMUX_SURFACE_ID__' ]; then export CMUX_SURFACE_ID='__CMUX_SURFACE_ID__'; export CMUX_PANEL_ID='__CMUX_SURFACE_ID__'; fi",
+        ]
+        let relaySocket = remoteRelayPort > 0 ? "127.0.0.1:\(remoteRelayPort)" : nil
+        var commonShellExportLines = remoteTerminalLines
+        commonShellExportLines.append(contentsOf: remoteEnvExportLines)
+        commonShellExportLines.append("export PATH=\"$HOME/.cmux/bin:$PATH\"")
+        commonShellExportLines.append("export CMUX_BUNDLED_CLI_PATH=\"$HOME/.cmux/bin/cmux\"")
+        commonShellExportLines.append("export CMUX_SHELL_INTEGRATION_DIR=\"\(shellStateDir)\"")
+        if let relaySocket {
+            commonShellExportLines.append("export CMUX_SOCKET_PATH=\(relaySocket)")
+            commonShellExportLines.append("export CMUX_SOCKET=\(relaySocket)")
+        }
+        commonShellExportLines.append(contentsOf: remoteCallerExportLines)
+        commonShellExportLines += [
+            "hash -r >/dev/null 2>&1 || true",
+            "rehash >/dev/null 2>&1 || true",
+        ]
+
+        var zshShellLines = commonShellExportLines
+        zshShellLines.append(
+            #"if [ "${CMUX_SHELL_INTEGRATION:-1}" != "0" ] && [ -r "${CMUX_SHELL_INTEGRATION_DIR}/cmux-zsh-integration.zsh" ]; then . "${CMUX_SHELL_INTEGRATION_DIR}/cmux-zsh-integration.zsh"; fi"#
+        )
+        var bashShellLines = commonShellExportLines
+        bashShellLines.append(
+            #"if [ "${CMUX_SHELL_INTEGRATION:-1}" != "0" ] && [ -r "${CMUX_SHELL_INTEGRATION_DIR}/cmux-bash-integration.bash" ]; then . "${CMUX_SHELL_INTEGRATION_DIR}/cmux-bash-integration.bash"; fi"#
+        )
+
+        let zshBootstrap = RemoteRelayZshBootstrap(shellStateDir: shellStateDir)
+        let zshEnvLines = zshBootstrap.zshEnvLines
+        let zshProfileLines = zshBootstrap.zshProfileLines
+        let zshRCLines = zshBootstrap.zshRCLines(commonShellLines: zshShellLines)
+        let zshLoginLines = zshBootstrap.zshLoginLines
+        let relayWarmupLines = interactiveRemoteRelayWarmupLines(remoteRelayPort: remoteRelayPort)
+        var outerLines: [String] = [
+            "mkdir -p \"$HOME/.cmux/relay\"",
+            "cmux_shell_dir=\"\(shellStateDir)\"",
+            "mkdir -p \"$cmux_shell_dir\"",
+        ]
+        if let bundledZshIntegration = bundledShellIntegrationScript(named: "cmux-zsh-integration.zsh") {
+            outerLines += [
+                "cat > \"$cmux_shell_dir/cmux-zsh-integration.zsh\" <<'CMUXCMUXZSH'",
+                bundledZshIntegration,
+                "CMUXCMUXZSH",
+            ]
+        }
+        if let bundledBashIntegration = bundledShellIntegrationScript(named: "cmux-bash-integration.bash") {
+            outerLines += [
+                "cat > \"$cmux_shell_dir/cmux-bash-integration.bash\" <<'CMUXCMUXBASH'",
+                bundledBashIntegration,
+                "CMUXCMUXBASH",
+            ]
+        }
+
+        outerLines.append(contentsOf: commonShellExportLines)
+        outerLines += [
+            "CMUX_LOGIN_SHELL=\"${SHELL:-/bin/zsh}\"",
+            "case \"${CMUX_LOGIN_SHELL##*/}\" in",
+            "  zsh)",
+            "    cat > \"$cmux_shell_dir/.zshenv\" <<'CMUXZSHENV'",
+        ]
+        outerLines.append(contentsOf: zshEnvLines)
+        outerLines += [
+            "CMUXZSHENV",
+            "    cat > \"$cmux_shell_dir/.zprofile\" <<'CMUXZSHPROFILE'",
+        ]
+        outerLines.append(contentsOf: zshProfileLines)
+        outerLines += [
+            "CMUXZSHPROFILE",
+            "    cat > \"$cmux_shell_dir/.zshrc\" <<'CMUXZSHRC'",
+        ]
+        outerLines.append(contentsOf: zshRCLines)
+        outerLines += [
+            "CMUXZSHRC",
+            "    cat > \"$cmux_shell_dir/.zlogin\" <<'CMUXZSHLOGIN'",
+        ]
+        outerLines.append(contentsOf: zshLoginLines)
+        outerLines += [
+            "CMUXZSHLOGIN",
+            "    chmod 600 \"$cmux_shell_dir/.zshenv\" \"$cmux_shell_dir/.zprofile\" \"$cmux_shell_dir/.zshrc\" \"$cmux_shell_dir/.zlogin\" >/dev/null 2>&1 || true",
+        ]
+        outerLines.append(contentsOf: relayWarmupLines.map { "    " + $0 })
+        outerLines += [
+            "    export CMUX_REAL_ZDOTDIR=\"${ZDOTDIR:-$HOME}\"",
+            "    export ZDOTDIR=\"$cmux_shell_dir\"",
+            "    exec \"$CMUX_LOGIN_SHELL\" -il",
+            "    ;;",
+            "  bash)",
+            "    cat > \"$cmux_shell_dir/.bashrc\" <<'CMUXBASHRC'",
+        ]
+        outerLines.append(contentsOf: bashShellLines)
+        outerLines += [
+            "CMUXBASHRC",
+            "    chmod 600 \"$cmux_shell_dir/.bashrc\" >/dev/null 2>&1 || true",
+        ]
+        outerLines.append(contentsOf: relayWarmupLines.map { "    " + $0 })
+        outerLines += [
+            "    exec \"$CMUX_LOGIN_SHELL\" --rcfile \"$cmux_shell_dir/.bashrc\" -i",
+            "    ;;",
+            "  *)",
+        ]
+        outerLines.append(contentsOf: commonShellExportLines)
+        outerLines.append(contentsOf: relayWarmupLines)
+        outerLines += [
+            "exec \"$CMUX_LOGIN_SHELL\" -i",
+            ";;",
+            "esac",
+        ]
+
+        return outerLines.joined(separator: "\n")
+    }
+
+    private static func interactiveRemoteTerminalSetupLines(terminfoSource: String?) -> [String] {
+        var lines: [String] = [
+            "cmux_term='xterm-256color'",
+            "if command -v infocmp >/dev/null 2>&1 && infocmp xterm-ghostty >/dev/null 2>&1; then",
+            "  cmux_term='xterm-ghostty'",
+            "fi",
+            "export TERM=\"$cmux_term\"",
+        ]
+        guard let trimmedTerminfoSource = terminfoSource?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmedTerminfoSource.isEmpty else {
+            return lines
+        }
+        lines += [
+            "if [ \"$cmux_term\" != 'xterm-ghostty' ]; then",
+            "  (",
+            "    command -v tic >/dev/null 2>&1 || exit 0",
+            "    mkdir -p \"$HOME/.terminfo\" 2>/dev/null || exit 0",
+            "    cat <<'CMUXTERMINFO' | tic -x - >/dev/null 2>&1",
+            trimmedTerminfoSource,
+            "CMUXTERMINFO",
+            "  ) >/dev/null 2>&1 &",
+            "fi",
+        ]
+        return lines
+    }
+
+    private static func interactiveRemoteShellExportLines(shellFeatures: String) -> [String] {
+        let environment = ProcessInfo.processInfo.environment
+        let colorTerm = normalizedEnvValue(environment["COLORTERM"]) ?? "truecolor"
+        let termProgram = normalizedEnvValue(environment["TERM_PROGRAM"]) ?? "ghostty"
+        let termProgramVersion = normalizedEnvValue(environment["TERM_PROGRAM_VERSION"])
+            ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
+            ?? ""
+        let trimmedShellFeatures = shellFeatures.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var exports: [String] = [
+            "export COLORTERM=\(shellQuote(colorTerm))",
+            "export TERM_PROGRAM=\(shellQuote(termProgram))",
+        ]
+        if !termProgramVersion.isEmpty {
+            exports.append("export TERM_PROGRAM_VERSION=\(shellQuote(termProgramVersion))")
+        }
+        if !trimmedShellFeatures.isEmpty {
+            exports.append("export GHOSTTY_SHELL_FEATURES=\(shellQuote(trimmedShellFeatures))")
+        }
+        return exports
+    }
+
+    private static func interactiveRemoteRelayWarmupLines(remoteRelayPort: Int) -> [String] {
+        guard remoteRelayPort > 0 else { return [] }
+        return [
+            "cmux_relay_cli=\"${CMUX_BUNDLED_CLI_PATH:-$HOME/.cmux/bin/cmux}\"",
+            "if [ ! -x \"$cmux_relay_cli\" ]; then cmux_relay_cli=\"$(command -v cmux 2>/dev/null || true)\"; fi",
+            "cmux_relay_tty=\"${CMUX_BOOTSTRAP_TTY:-}\"",
+            "if [ -z \"$cmux_relay_tty\" ]; then cmux_relay_tty=\"$(tty 2>/dev/null || true)\"; fi",
+            "cmux_relay_tty=\"${cmux_relay_tty##*/}\"",
+            "if [ -n \"$cmux_relay_tty\" ] && [ \"$cmux_relay_tty\" != \"not a tty\" ]; then",
+            "  mkdir -p \"$HOME/.cmux/relay\" >/dev/null 2>&1 || true",
+            "  printf '%s' \"$cmux_relay_tty\" > \"$HOME/.cmux/relay/\(remoteRelayPort).tty\" 2>/dev/null || true",
+            "fi",
+            "if [ -n \"$cmux_relay_cli\" ] && [ -n \"$CMUX_WORKSPACE_ID\" ] && [ -n \"$cmux_relay_tty\" ] && [ \"$cmux_relay_tty\" != \"not a tty\" ]; then",
+            "  cmux_relay_report_tty=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"tty_name\\\":\\\"$cmux_relay_tty\\\"}\"",
+            "  cmux_relay_ports_kick=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"reason\\\":\\\"command\\\"}\"",
+            "  if [ -n \"$CMUX_SURFACE_ID\" ]; then",
+            "    cmux_relay_report_tty=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"surface_id\\\":\\\"$CMUX_SURFACE_ID\\\",\\\"tty_name\\\":\\\"$cmux_relay_tty\\\"}\"",
+            "    cmux_relay_ports_kick=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"surface_id\\\":\\\"$CMUX_SURFACE_ID\\\",\\\"reason\\\":\\\"command\\\"}\"",
+            "  fi",
+            "  \"$cmux_relay_cli\" rpc surface.report_tty \"$cmux_relay_report_tty\" >/dev/null 2>&1 || true",
+            "  \"$cmux_relay_cli\" rpc surface.ports_kick \"$cmux_relay_ports_kick\" >/dev/null 2>&1 || true",
+            "fi",
+            "unset CMUX_BOOTSTRAP_TTY cmux_relay_cli cmux_relay_tty cmux_relay_report_tty cmux_relay_ports_kick",
+        ]
+    }
+
+    private static func localXtermGhosttyTerminfoSource() -> String? {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/infocmp")
+        process.arguments = ["-0", "-x", "xterm-ghostty"]
+        process.standardOutput = stdoutPipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard process.terminationStatus == 0 else { return nil }
+        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return output.isEmpty ? nil : output
+    }
+
+    private static func scopedGhosttyShellFeaturesValue() -> String {
+        let rawExisting = ProcessInfo.processInfo.environment["GHOSTTY_SHELL_FEATURES"] ?? ""
+        var seen: Set<String> = []
+        var merged: [String] = []
+
+        for token in rawExisting.split(separator: ",") {
+            let feature = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !feature.isEmpty else { continue }
+            if seen.insert(feature).inserted {
+                merged.append(feature)
+            }
+        }
+
+        for required in ["ssh-env", "ssh-terminfo"] {
+            if seen.insert(required).inserted {
+                merged.append(required)
+            }
+        }
+
+        return merged.joined(separator: ",")
+    }
+
+    private static func bundledShellIntegrationScript(named fileName: String) -> String? {
+        let fileManager = FileManager.default
+        let resourceCandidate = Bundle.main.resourceURL?
+            .appendingPathComponent("shell-integration", isDirectory: true)
+            .appendingPathComponent(fileName, isDirectory: false)
+        let sourceCandidate = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("shell-integration", isDirectory: true)
+            .appendingPathComponent(fileName, isDirectory: false)
+
+        for url in [resourceCandidate, sourceCandidate].compactMap({ $0 }) {
+            guard fileManager.fileExists(atPath: url.path),
+                  let data = try? Data(contentsOf: url),
+                  let contents = String(data: data, encoding: .utf8) else {
+                continue
+            }
+            return contents
+        }
+        return nil
+    }
+
+    private static func writeStartupScript(_ script: String, relayPort: Int) -> String? {
+        #if DEBUG
+        if let startupScriptWriterOverrideForTesting {
+            return startupScriptWriterOverrideForTesting(script, relayPort)
+        }
+        #endif
+        let scriptURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "cmux-project-remote-startup-\(relayPort)-\(UUID().uuidString.lowercased()).sh"
+        )
+        do {
+            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+            return shellQuote(scriptURL.path)
+        } catch {
+            NSLog("[ProjectRemote] failed to write terminal startup script: %@", String(describing: error))
+            return nil
+        }
+    }
+
+    private static func sshPercentEscapedRemoteCommand(_ remoteCommand: String) -> String {
+        remoteCommand.replacingOccurrences(of: "%", with: "%%")
+    }
+
+    private static func normalizedEnvValue(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        let safePattern = "^[A-Za-z0-9_@%+=:,./-]+$"
+        if value.range(of: safePattern, options: .regularExpression) != nil {
+            return value
+        }
+        return "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }
 
@@ -7176,6 +7896,7 @@ final class Workspace: Identifiable, ObservableObject {
         return formatter
     }()
     nonisolated(unsafe) static var runSSHControlMasterCommandOverrideForTesting: (([String]) -> Void)?
+    nonisolated(unsafe) static var terminalPanelCreationObserverForTesting: ((UUID, String?) -> Void)?
     nonisolated(unsafe) static var localTerminalLaunchConfigurationOverrideForTesting: ((LocalTerminalLaunchRequest) -> LocalTerminalLaunchConfiguration?)?
     nonisolated(unsafe) static var localTerminalStatusPayloadOverrideForTesting: ((String) -> [String: Any]?)?
     nonisolated(unsafe) static var localTerminalReplayPayloadOverrideForTesting: ((String) -> [String: Any]?)?
@@ -7441,7 +8162,8 @@ final class Workspace: Identifiable, ObservableObject {
         configTemplate: CmuxSurfaceConfigTemplate? = nil,
         initialTerminalCommand: String? = nil,
         initialTerminalInput: String? = nil,
-        initialTerminalEnvironment: [String: String] = [:]
+        initialTerminalEnvironment: [String: String] = [:],
+        initialTerminalLocalDaemonEligible: Bool = true
     ) {
         self.id = UUID()
         self.portOrdinal = portOrdinal
@@ -7490,7 +8212,8 @@ final class Workspace: Identifiable, ObservableObject {
             workingDirectory: hasWorkingDirectory ? trimmedWorkingDirectory : nil,
             initialCommand: initialTerminalCommand,
             initialInput: initialTerminalInput,
-            initialEnvironmentOverrides: initialTerminalEnvironment
+            initialEnvironmentOverrides: initialTerminalEnvironment,
+            localDaemonEligible: initialTerminalLocalDaemonEligible
         )!
         configureTerminalPanel(terminalPanel)
         panels[terminalPanel.id] = terminalPanel
@@ -8804,7 +9527,7 @@ final class Workspace: Identifiable, ObservableObject {
         setManagedEnvironmentValue("CMUX_WORKSPACE_ID", id.uuidString)
         setManagedEnvironmentValue("CMUX_TAB_ID", id.uuidString)
 
-        let socketPath = SocketControlSettings.socketPath()
+        let socketPath = TerminalController.activeSocketPathForCurrentProcess()
         setManagedEnvironmentValue("CMUX_SOCKET_PATH", socketPath)
         setManagedEnvironmentValue("CMUX_SOCKET", socketPath)
 
@@ -9088,6 +9811,7 @@ final class Workspace: Identifiable, ObservableObject {
         localDaemonEligible: Bool = true
     ) -> TerminalPanel? {
         let panelID = UUID()
+        Self.terminalPanelCreationObserverForTesting?(panelID, initialCommand)
         let launchConfiguration: LocalTerminalLaunchConfiguration? = {
             guard localDaemonEligible else { return nil }
             let requestEnvironment = mergedLocalTerminalEnvironment(
@@ -9441,6 +10165,22 @@ final class Workspace: Identifiable, ObservableObject {
         for panel in panels.values {
             guard let browserPanel = panel as? BrowserPanel else { continue }
             browserPanel.setRemoteWorkspaceStatus(snapshot)
+        }
+    }
+
+    private func reattachBrowserPanelsToCurrentRemoteMode() {
+        let usesRemoteBrowserProxy = isRemoteWorkspace
+        let endpoint = usesRemoteBrowserProxy ? remoteProxyEndpoint : nil
+        let status = browserRemoteWorkspaceStatusSnapshot()
+        for panel in panels.values {
+            guard let browserPanel = panel as? BrowserPanel else { continue }
+            browserPanel.reattachToWorkspace(
+                id,
+                isRemoteWorkspace: usesRemoteBrowserProxy,
+                remoteWebsiteDataStoreIdentifier: usesRemoteBrowserProxy ? id : nil,
+                proxyEndpoint: endpoint,
+                remoteStatus: status
+            )
         }
     }
 
@@ -10801,8 +11541,9 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func disconnectRemoteConnection(clearConfiguration: Bool = false) {
+        let effectiveClearConfiguration = clearConfiguration || isProjectConfiguredRemoteWorkspace
         let shouldCleanupControlMaster =
-            clearConfiguration
+            effectiveClearConfiguration
             && !isDetachingCloseTransaction
             && pendingDetachedSurfaces.isEmpty
             && !skipControlMasterCleanupAfterDetachedRemoteTransfer
@@ -10812,6 +11553,11 @@ final class Workspace: Identifiable, ObservableObject {
         remoteSessionController = nil
         previousController?.stop()
         pendingRemoteForegroundAuthToken = nil
+        if effectiveClearConfiguration {
+            // The remote shell may report child-exit after disconnect has already cleared
+            // remoteConfiguration. Keep those exits on the remote demotion/replacement path.
+            pendingRemoteTerminalChildExitSurfaceIds.formUnion(activeRemoteTerminalSurfaceIds)
+        }
         activeRemoteTerminalSurfaceIds.removeAll()
         activeRemoteTerminalSessionCount = 0
         pendingRemoteSurfaceTTYName = nil
@@ -10835,12 +11581,16 @@ final class Workspace: Identifiable, ObservableObject {
         remoteLastErrorFingerprint = nil
         remoteLastDaemonErrorFingerprint = nil
         remoteLastPortConflictFingerprint = nil
-        if clearConfiguration {
+        if effectiveClearConfiguration {
             remoteConfiguration = nil
+            refreshManagedRemoteAttachments()
             skipControlMasterCleanupAfterDetachedRemoteTransfer = false
+            reattachBrowserPanelsToCurrentRemoteMode()
         }
-        applyRemoteProxyEndpointUpdate(nil)
-        applyBrowserRemoteWorkspaceStatusToPanels()
+        if !effectiveClearConfiguration {
+            applyRemoteProxyEndpointUpdate(nil)
+            applyBrowserRemoteWorkspaceStatusToPanels()
+        }
         recomputeListeningPorts()
         if let configurationForCleanup {
             Self.requestSSHControlMasterCleanupIfNeeded(configuration: configurationForCleanup)
@@ -10849,6 +11599,7 @@ final class Workspace: Identifiable, ObservableObject {
 
     private func clearRemoteConfigurationIfWorkspaceBecameLocal() {
         guard !isDetachingCloseTransaction, panels.isEmpty, remoteConfiguration != nil else { return }
+        guard !isProjectConfiguredRemoteWorkspace else { return }
         disconnectRemoteConnection(clearConfiguration: true)
     }
 
@@ -10944,6 +11695,9 @@ final class Workspace: Identifiable, ObservableObject {
 
     private func maybeDemoteRemoteWorkspaceAfterSSHSessionEnded() {
         guard activeRemoteTerminalSurfaceIds.isEmpty, remoteConfiguration != nil else { return }
+        if isProjectConfiguredRemoteWorkspace {
+            return
+        }
         let hasBrowserPanels = panels.values.contains { $0 is BrowserPanel }
         if !hasBrowserPanels {
             if remoteConnectionState == .error || remoteDaemonStatus.state == .error || remoteConnectionState == .connecting {
@@ -10951,6 +11705,45 @@ final class Workspace: Identifiable, ObservableObject {
             }
             disconnectRemoteConnection(clearConfiguration: true)
         }
+    }
+
+    private var isProjectConfiguredRemoteWorkspace: Bool {
+        remoteConfiguration?.projectConfigPath?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+    }
+
+    func reconcileProjectRemoteConfigurationWithProjectConfig() {
+        guard let remoteConfiguration,
+              let projectConfigPath = remoteConfiguration.projectConfigPath?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !projectConfigPath.isEmpty else {
+            return
+        }
+
+        let projectDirectory = (projectConfigPath as NSString).deletingLastPathComponent
+        guard let resolvedRemote = CmuxConfigStore.projectRemoteDefinition(startingFrom: projectDirectory),
+              resolvedRemote.configPath == projectConfigPath,
+              resolvedRemote.host.caseInsensitiveCompare(remoteConfiguration.destination) == .orderedSame else {
+            disconnectRemoteConnection(clearConfiguration: true)
+            return
+        }
+    }
+
+    private func managedRemoteTerminalStartupCommand() -> String? {
+        guard isProjectConfiguredRemoteWorkspace else { return nil }
+        let startupCommand = remoteConfiguration?.terminalStartupCommand?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard startupCommand?.isEmpty == false else { return nil }
+        return startupCommand
+    }
+
+    private func trackManagedRemoteTerminalIfNeeded(_ panelId: UUID, startupCommand: String?) {
+        guard isProjectConfiguredRemoteWorkspace else { return }
+        guard startupCommand?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            return
+        }
+        trackRemoteTerminalSurface(panelId)
     }
 
     @MainActor
@@ -11567,7 +12360,8 @@ final class Workspace: Identifiable, ObservableObject {
         from panelId: UUID,
         orientation: SplitOrientation,
         insertFirst: Bool = false,
-        focus: Bool = true
+        focus: Bool = true,
+        managedRemoteStartup: Bool = true
     ) -> TerminalPanel? {
         // Find the pane containing the source panel
         guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
@@ -11607,13 +12401,14 @@ final class Workspace: Identifiable, ObservableObject {
 #endif
 
         // Create the new terminal panel.
+        let remoteStartupCommand = managedRemoteStartup ? managedRemoteTerminalStartupCommand() : nil
         let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: splitWorkingDirectory,
-            initialCommand: nil,
+            initialCommand: remoteStartupCommand,
             localTerminalMode: .auto,
-            localDaemonEligible: true
+            localDaemonEligible: managedRemoteStartup && remoteStartupCommand == nil
         )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
@@ -11646,6 +12441,7 @@ final class Workspace: Identifiable, ObservableObject {
             terminalInheritanceFontPointsByPanelId.removeValue(forKey: newPanel.id)
             return nil
         }
+        trackManagedRemoteTerminalIfNeeded(newPanel.id, startupCommand: remoteStartupCommand)
 
 #if DEBUG
         dlog("split.created pane=\(paneId.id.uuidString.prefix(5)) orientation=\(orientation)")
@@ -11688,7 +12484,8 @@ final class Workspace: Identifiable, ObservableObject {
         workingDirectory: String? = nil,
         initialInput: String? = nil,
         startupEnvironment: [String: String] = [:],
-        localTerminalMode: LocalTerminalMode = .auto
+        localTerminalMode: LocalTerminalMode = .auto,
+        managedRemoteStartup: Bool = true
     ) -> TerminalPanel? {
         let shouldFocusNewTab = focus ?? (bonsplitController.focusedPaneId == paneId)
         let previousFocusedPanelId = focusedPanelId
@@ -11697,15 +12494,16 @@ final class Workspace: Identifiable, ObservableObject {
         let inheritedConfig = inheritedTerminalConfig(inPane: paneId)
 
         // Create new terminal panel
+        let remoteStartupCommand = managedRemoteStartup ? managedRemoteTerminalStartupCommand() : nil
         guard let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: workingDirectory,
-            initialCommand: nil,
+            initialCommand: remoteStartupCommand,
             initialInput: initialInput,
             additionalEnvironment: startupEnvironment,
             localTerminalMode: localTerminalMode,
-            localDaemonEligible: true
+            localDaemonEligible: managedRemoteStartup && remoteStartupCommand == nil
         ) else {
             return nil
         }
@@ -11730,6 +12528,7 @@ final class Workspace: Identifiable, ObservableObject {
         }
 
         surfaceIdToPanelId[newTabId] = newPanel.id
+        trackManagedRemoteTerminalIfNeeded(newPanel.id, startupCommand: remoteStartupCommand)
 
         // bonsplit's createTab may not reliably emit didSelectTab, and its internal selection
         // updates can be deferred. Force a deterministic selection + focus path so the new
@@ -13062,10 +13861,13 @@ final class Workspace: Identifiable, ObservableObject {
             preferredPanelId: focusedPanelId,
             inPane: bonsplitController.focusedPaneId
         )
+        let remoteStartupCommand = managedRemoteTerminalStartupCommand()
         let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_TAB,
             configTemplate: inheritedConfig,
-            localTerminalMode: .auto
+            initialCommand: remoteStartupCommand,
+            localTerminalMode: .auto,
+            localDaemonEligible: remoteStartupCommand == nil
         )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
@@ -13081,6 +13883,7 @@ final class Workspace: Identifiable, ObservableObject {
             isPinned: false
         ) {
             surfaceIdToPanelId[newTabId] = newPanel.id
+            trackManagedRemoteTerminalIfNeeded(newPanel.id, startupCommand: remoteStartupCommand)
         }
 
         return newPanel
@@ -13914,12 +14717,15 @@ final class Workspace: Identifiable, ObservableObject {
     ) -> TerminalPanel? {
         let inheritedConfig = inheritedTerminalConfig(inPane: paneId)
 
+        let remoteStartupCommand = managedRemoteTerminalStartupCommand()
         let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: workingDirectory,
+            initialCommand: remoteStartupCommand,
             initialInput: initialInput,
-            localTerminalMode: .auto
+            localTerminalMode: .auto,
+            localDaemonEligible: remoteStartupCommand == nil
         )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
@@ -13950,6 +14756,7 @@ final class Workspace: Identifiable, ObservableObject {
             return nil
         }
 
+        trackManagedRemoteTerminalIfNeeded(newPanel.id, startupCommand: remoteStartupCommand)
         bonsplitController.selectTab(newTab.id)
         newPanel.focus()
         return newPanel
@@ -14923,17 +15730,21 @@ extension Workspace: BonsplitDelegate {
                     // This avoids an extra create+close tab churn that can transiently render an
                     // empty pane during drag-to-split of a single-tab pane.
                     let inheritedConfig = inheritedTerminalConfig(inPane: originalPane)
+                    let remoteStartupCommand = managedRemoteTerminalStartupCommand()
 
                     let replacementPanel = makeTerminalPanel(
                         context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
                         configTemplate: inheritedConfig,
-                        localTerminalMode: .auto
+                        initialCommand: remoteStartupCommand,
+                        localTerminalMode: .auto,
+                        localDaemonEligible: remoteStartupCommand == nil
                     )!
                     configureTerminalPanel(replacementPanel)
                     panels[replacementPanel.id] = replacementPanel
                     panelTitles[replacementPanel.id] = replacementPanel.displayTitle
                     seedTerminalInheritanceFontPoints(panelId: replacementPanel.id, configTemplate: inheritedConfig)
                     surfaceIdToPanelId[replacementTab.id] = replacementPanel.id
+                    trackManagedRemoteTerminalIfNeeded(replacementPanel.id, startupCommand: remoteStartupCommand)
 
                     bonsplitController.updateTab(
                         replacementTab.id,
@@ -14990,10 +15801,13 @@ extension Workspace: BonsplitDelegate {
             inPane: originalPane
         )
 
+        let remoteStartupCommand = managedRemoteTerminalStartupCommand()
         let newPanel = makeTerminalPanel(
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
-            localTerminalMode: .auto
+            initialCommand: remoteStartupCommand,
+            localTerminalMode: .auto,
+            localDaemonEligible: remoteStartupCommand == nil
         )!
         configureTerminalPanel(newPanel)
         panels[newPanel.id] = newPanel
@@ -15015,6 +15829,7 @@ extension Workspace: BonsplitDelegate {
         }
 
         surfaceIdToPanelId[newTabId] = newPanel.id
+        trackManagedRemoteTerminalIfNeeded(newPanel.id, startupCommand: remoteStartupCommand)
         normalizePinnedTabs(in: newPane)
 #if DEBUG
         dlog(

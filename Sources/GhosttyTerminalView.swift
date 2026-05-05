@@ -3890,6 +3890,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         initialCommand
     }
 
+    func debugInitialInput() -> String? {
+        initialInput
+    }
+
     func debugAdditionalEnvironment() -> [String: String] {
         additionalEnvironment
     }
@@ -4392,7 +4396,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // Backward-compatible shell integration keys used by existing scripts/tests.
         setManagedEnvironmentValue("CMUX_PANEL_ID", id.uuidString)
         setManagedEnvironmentValue("CMUX_TAB_ID", tabId.uuidString)
-        let socketPath = SocketControlSettings.socketPath()
+        let socketPath = TerminalController.activeSocketPathForCurrentProcess()
         setManagedEnvironmentValue("CMUX_SOCKET_PATH", socketPath)
         // Backward-compatible alias expected by older scripts and third-party integrations.
         setManagedEnvironmentValue("CMUX_SOCKET", socketPath)

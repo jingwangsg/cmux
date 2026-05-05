@@ -878,6 +878,32 @@ final class KeyboardShortcutSettingsFileStoreTests: XCTestCase {
         )
     }
 
+    func testSSHConfigHostScannerExtractsExplicitAliasesFromIncludes() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-ssh-config-\(UUID().uuidString)", isDirectory: true)
+        let includeDir = root.appendingPathComponent("conf.d", isDirectory: true)
+        try fm.createDirectory(at: includeDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let configURL = root.appendingPathComponent("config", isDirectory: false)
+        let includeURL = includeDir.appendingPathComponent("remote.conf", isDirectory: false)
+        try """
+        Include conf.d/*.conf
+
+        Host root-host
+          HostName 192.168.1.10
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+        try """
+        Host included-host *.wildcard !negated
+          HostName 192.168.1.11
+        """.write(to: includeURL, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(
+            SSHConfigHostScanner.hostAliases(configPath: configURL.path),
+            ["included-host", "root-host"]
+        )
+    }
+
     @MainActor
     func testAutoPrepareRegisteredHostPublishesReadyStatusWithoutCreatingSSHSession() throws {
         let suiteName = "RegisteredSSHHosts.AutoPrepare.\(UUID().uuidString)"
@@ -1695,7 +1721,8 @@ final class WorkspaceCreationPlacementTests: XCTestCase {
             configTemplate: CmuxSurfaceConfigTemplate?,
             initialTerminalCommand: String?,
             initialTerminalInput: String?,
-            initialTerminalEnvironment: [String: String]
+            initialTerminalEnvironment: [String: String],
+            initialTerminalLocalDaemonEligible: Bool
         ) -> Workspace {
             beforeCreateWorkspace?()
             return super.makeWorkspaceForCreation(
@@ -1705,7 +1732,8 @@ final class WorkspaceCreationPlacementTests: XCTestCase {
                 configTemplate: configTemplate,
                 initialTerminalCommand: initialTerminalCommand,
                 initialTerminalInput: initialTerminalInput,
-                initialTerminalEnvironment: initialTerminalEnvironment
+                initialTerminalEnvironment: initialTerminalEnvironment,
+                initialTerminalLocalDaemonEligible: initialTerminalLocalDaemonEligible
             )
         }
     }
@@ -1956,7 +1984,8 @@ final class WorkspaceCreationConfigSanitizationTests: XCTestCase {
             configTemplate: CmuxSurfaceConfigTemplate?,
             initialTerminalCommand: String?,
             initialTerminalInput: String?,
-            initialTerminalEnvironment: [String: String]
+            initialTerminalEnvironment: [String: String],
+            initialTerminalLocalDaemonEligible: Bool
         ) -> Workspace {
             capturedConfigTemplate = configTemplate
             return super.makeWorkspaceForCreation(
@@ -1966,7 +1995,8 @@ final class WorkspaceCreationConfigSanitizationTests: XCTestCase {
                 configTemplate: configTemplate,
                 initialTerminalCommand: initialTerminalCommand,
                 initialTerminalInput: initialTerminalInput,
-                initialTerminalEnvironment: initialTerminalEnvironment
+                initialTerminalEnvironment: initialTerminalEnvironment,
+                initialTerminalLocalDaemonEligible: initialTerminalLocalDaemonEligible
             )
         }
     }

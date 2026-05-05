@@ -5021,6 +5021,7 @@ struct CMUXCLI {
 
         let workspaceCreateParams: [String: Any] = [
             "initial_command": initialSSHStartupCommand,
+            "infer_project_remote": false,
         ]
 
         let workspaceCreateStartedAt = Date()

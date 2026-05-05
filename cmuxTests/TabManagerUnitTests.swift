@@ -254,6 +254,118 @@ final class TabManagerChildExitCloseTests: XCTestCase {
         XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 0)
     }
 
+    func testRepeatedChildExitInProjectRemoteWorkspaceKeepsReplacementTerminalManagedRemote() throws {
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace,
+              let firstPanelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with focused panel")
+            return
+        }
+
+        let configuration = WorkspaceRemoteConfiguration(
+            destination: "cmux-macmini",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: 64017,
+            relayID: String(repeating: "a", count: 16),
+            relayToken: String(repeating: "b", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh cmux-macmini",
+            projectConfigPath: "/tmp/project/cmux.json"
+        )
+        workspace.configureRemoteConnection(configuration, autoConnect: false)
+        workspace.markRemoteTerminalSessionEnded(surfaceId: firstPanelId, relayPort: 64017)
+
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            XCTFail("Project remote replacement terminals must run their bootstrap directly, not via local daemon: \(request)")
+            return nil
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+        }
+
+        manager.closePanelAfterChildExited(tabId: workspace.id, surfaceId: firstPanelId)
+        drainMainQueue()
+        drainMainQueue()
+
+        let firstReplacement = try XCTUnwrap(workspace.focusedTerminalPanel)
+        XCTAssertNotEqual(firstReplacement.id, firstPanelId)
+        XCTAssertTrue(workspace.isRemoteWorkspace)
+        XCTAssertEqual(workspace.remoteConfiguration?.projectConfigPath, "/tmp/project/cmux.json")
+        XCTAssertEqual(firstReplacement.surface.debugInitialCommand(), "ssh cmux-macmini")
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(firstReplacement.id))
+        XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 1)
+
+        workspace.markRemoteTerminalSessionEnded(surfaceId: firstReplacement.id, relayPort: 64017)
+        manager.closePanelAfterChildExited(tabId: workspace.id, surfaceId: firstReplacement.id)
+        drainMainQueue()
+        drainMainQueue()
+
+        let secondReplacement = try XCTUnwrap(workspace.focusedTerminalPanel)
+        XCTAssertNotEqual(secondReplacement.id, firstPanelId)
+        XCTAssertNotEqual(secondReplacement.id, firstReplacement.id)
+        XCTAssertTrue(workspace.isRemoteWorkspace)
+        XCTAssertEqual(workspace.remoteConfiguration?.projectConfigPath, "/tmp/project/cmux.json")
+        XCTAssertEqual(secondReplacement.surface.debugInitialCommand(), "ssh cmux-macmini")
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(secondReplacement.id))
+        XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 1)
+    }
+
+    func testProjectRemoteExplicitDisconnectThenChildExitKeepsWorkspaceLocal() throws {
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace,
+              let remotePanelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with focused panel")
+            return
+        }
+
+        workspace.configureRemoteConnection(
+            WorkspaceRemoteConfiguration(
+                destination: "cmux-macmini",
+                port: nil,
+                identityFile: nil,
+                sshOptions: [],
+                localProxyPort: nil,
+                relayPort: 64018,
+                relayID: String(repeating: "a", count: 16),
+                relayToken: String(repeating: "b", count: 64),
+                localSocketPath: "/tmp/cmux-debug-test.sock",
+                terminalStartupCommand: "ssh cmux-macmini",
+                projectConfigPath: "/tmp/project/cmux.json"
+            ),
+            autoConnect: false
+        )
+
+        XCTAssertTrue(workspace.isRemoteWorkspace)
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(remotePanelId))
+
+        workspace.disconnectRemoteConnection(clearConfiguration: false)
+
+        XCTAssertFalse(workspace.isRemoteWorkspace)
+        XCTAssertNil(workspace.remoteConfiguration)
+        XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 0)
+
+        manager.closePanelAfterChildExited(tabId: workspace.id, surfaceId: remotePanelId)
+        drainMainQueue()
+        drainMainQueue()
+
+        let replacement = try XCTUnwrap(workspace.focusedTerminalPanel)
+        XCTAssertEqual(manager.tabs.count, 1)
+        XCTAssertEqual(manager.selectedTabId, workspace.id)
+        XCTAssertEqual(manager.tabs.first?.id, workspace.id)
+        XCTAssertFalse(workspace.isRemoteWorkspace)
+        XCTAssertNil(workspace.remoteConfiguration)
+        XCTAssertNil(workspace.panels[remotePanelId])
+        XCTAssertEqual(workspace.panels.count, 1)
+        XCTAssertNotEqual(replacement.id, remotePanelId)
+        XCTAssertNil(replacement.surface.debugInitialCommand())
+        XCTAssertFalse(workspace.isRemoteTerminalSurface(replacement.id))
+        XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 0)
+    }
+
     func testChildExitOnNonLastPanelClosesOnlyPanel() {
         let manager = TabManager()
         guard let workspace = manager.selectedWorkspace,

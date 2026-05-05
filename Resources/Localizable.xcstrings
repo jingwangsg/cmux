@@ -89949,13 +89949,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Registered SSH Hosts"
+            "value": "Remote Hosts"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "登録済み SSH ホスト"
+            "value": "リモートホスト"
           }
         }
       }
@@ -89983,13 +89983,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Auto-prepare"
+            "value": "Auto-deploy"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "自動準備"
+            "value": "自動デプロイ"
           }
         }
       }
@@ -90068,13 +90068,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Prepare"
+            "value": "Deploy"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "準備"
+            "value": "デプロイ"
           }
         }
       }
@@ -90204,13 +90204,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Prewarm remote daemons for hosts you use often. A host only becomes an SSH session after you run ssh yourself."
+            "value": "Auto-deploy remote daemons for selected SSH config hosts when cmux starts. Project-configured remotes connect even if they are not selected here."
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "よく使うホストのリモートデーモンを事前準備します。自分で ssh を実行した場合だけ、そのホストは SSH セッションになります。"
+            "value": "cmux の起動時に、選択した SSH 設定ホストへリモートデーモンを自動デプロイします。プロジェクト設定のリモートは、ここで選択されていなくても接続します。"
           }
         }
       }

@@ -3,7 +3,51 @@ import Combine
 import Foundation
 
 struct CmuxConfigFile: Codable, Sendable {
+    var remote: CmuxProjectRemoteDefinition?
     var commands: [CmuxCommandDefinition]
+
+    private enum CodingKeys: String, CodingKey {
+        case remote
+        case commands
+    }
+
+    init(remote: CmuxProjectRemoteDefinition? = nil, commands: [CmuxCommandDefinition] = []) {
+        self.remote = remote
+        self.commands = commands
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        remote = try container.decodeIfPresent(CmuxProjectRemoteDefinition.self, forKey: .remote)
+        commands = try container.decodeIfPresent([CmuxCommandDefinition].self, forKey: .commands) ?? []
+    }
+}
+
+struct CmuxProjectRemoteDefinition: Codable, Sendable, Equatable {
+    var host: String
+
+    init(host: String) {
+        self.host = host
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rawHost = try container.decode(String.self, forKey: .host)
+        let trimmedHost = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .host,
+                in: container,
+                debugDescription: "remote.host must not be blank"
+            )
+        }
+        host = trimmedHost
+    }
+}
+
+struct CmuxResolvedProjectRemoteDefinition: Sendable, Equatable {
+    let host: String
+    let configPath: String
 }
 
 struct CmuxCommandDefinition: Codable, Sendable, Identifiable {
@@ -258,6 +302,10 @@ enum CmuxSurfaceType: String, Codable, Sendable {
 
 @MainActor
 final class CmuxConfigStore: ObservableObject {
+#if DEBUG
+    nonisolated(unsafe) static var sshHostAliasesOverrideForTesting: (() -> [String])?
+#endif
+
     @Published private(set) var loadedCommands: [CmuxCommandDefinition] = []
     @Published private(set) var configRevision: UInt64 = 0
 
@@ -275,7 +323,10 @@ final class CmuxConfigStore: ObservableObject {
     private var localFileDescriptor: Int32 = -1
     private var globalFileWatchSource: DispatchSourceFileSystemObject?
     private var globalFileDescriptor: Int32 = -1
+    private var projectConfigWatchSources: [String: DispatchSourceFileSystemObject] = [:]
+    private var projectConfigFileDescriptors: [String: Int32] = [:]
     private let watchQueue = DispatchQueue(label: "com.cmux.config-file-watch")
+    private var projectRemoteCancellables = Set<AnyCancellable>()
 
     private static let maxReattachAttempts = 5
     private static let reattachDelay: TimeInterval = 0.5
@@ -287,12 +338,16 @@ final class CmuxConfigStore: ObservableObject {
     deinit {
         localFileWatchSource?.cancel()
         globalFileWatchSource?.cancel()
+        for source in projectConfigWatchSources.values {
+            source.cancel()
+        }
     }
 
     // MARK: - Public API
 
     func wireDirectoryTracking(tabManager: TabManager) {
         cancellables.removeAll()
+        projectRemoteCancellables.removeAll()
 
         tabManager.$selectedTabId
             .compactMap { [weak tabManager] tabId -> Workspace? in
@@ -311,15 +366,63 @@ final class CmuxConfigStore: ObservableObject {
             }
             .store(in: &cancellables)
 
+        tabManager.$tabs
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak tabManager] _ in
+                self?.rebuildProjectRemoteConfigSubscriptions(tabManager: tabManager)
+            }
+            .store(in: &cancellables)
+
         if let directory = tabManager.selectedWorkspace?.currentDirectory {
             updateLocalConfigPath(directory)
+        }
+        rebuildProjectRemoteConfigSubscriptions(tabManager: tabManager)
+    }
+
+    private func rebuildProjectRemoteConfigSubscriptions(tabManager: TabManager?) {
+        projectRemoteCancellables.removeAll()
+        guard let tabManager else {
+            updateProjectRemoteConfigWatchPaths([])
+            return
+        }
+
+        for workspace in tabManager.tabs {
+            workspace.$remoteConfiguration
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self, weak tabManager] _ in
+                    self?.updateProjectRemoteConfigWatchPaths(
+                        Self.projectRemoteConfigPaths(from: tabManager?.tabs ?? [])
+                    )
+                }
+                .store(in: &projectRemoteCancellables)
+        }
+
+        updateProjectRemoteConfigWatchPaths(Self.projectRemoteConfigPaths(from: tabManager.tabs))
+    }
+
+    private static func projectRemoteConfigPaths(from workspaces: [Workspace]) -> Set<String> {
+        Set(workspaces.compactMap { workspace in
+            let path = workspace.remoteConfiguration?.projectConfigPath?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let path, !path.isEmpty else { return nil }
+            return path
+        })
+    }
+
+    private func updateProjectRemoteConfigWatchPaths(_ paths: Set<String>) {
+        let current = Set(projectConfigWatchSources.keys)
+        for removedPath in current.subtracting(paths) {
+            stopProjectConfigWatcher(path: removedPath)
+        }
+        for addedPath in paths.subtracting(current) {
+            startProjectConfigWatcher(path: addedPath)
         }
     }
 
     private func updateLocalConfigPath(_ directory: String?) {
         let newPath: String?
         if let directory, !directory.isEmpty {
-            newPath = findCmuxConfig(startingFrom: directory)
+            newPath = Self.findCmuxConfig(startingFrom: directory)
                 ?? (directory as NSString).appendingPathComponent("cmux.json")
         } else {
             newPath = nil
@@ -334,7 +437,47 @@ final class CmuxConfigStore: ObservableObject {
         loadAll()
     }
 
-    private func findCmuxConfig(startingFrom directory: String) -> String? {
+    nonisolated static func projectRemoteDefinition(startingFrom directory: String) -> CmuxResolvedProjectRemoteDefinition? {
+        #if DEBUG
+        if let sshHostAliasesOverrideForTesting {
+            return projectRemoteDefinition(
+                startingFrom: directory,
+                sshHostAliases: sshHostAliasesOverrideForTesting()
+            )
+        }
+        #endif
+        return projectRemoteDefinition(
+            startingFrom: directory,
+            sshHostAliases: SSHConfigHostScanner.hostAliases()
+        )
+    }
+
+    nonisolated static func projectRemoteDefinition(
+        startingFrom directory: String,
+        sshHostAliases: [String]
+    ) -> CmuxResolvedProjectRemoteDefinition? {
+        guard let configPath = findCmuxConfig(startingFrom: directory),
+              let config = parseConfig(at: configPath),
+              let remote = config.remote else {
+            return nil
+        }
+
+        let host = remote.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else { return nil }
+        let allowedAliases = Set(sshHostAliases.map { $0.lowercased() })
+        guard allowedAliases.contains(host.lowercased()) else {
+            NSLog(
+                "[CmuxConfig] ignoring remote.host '%@' in %@ because it is not an explicit ~/.ssh/config Host alias",
+                host,
+                configPath
+            )
+            return nil
+        }
+
+        return CmuxResolvedProjectRemoteDefinition(host: host, configPath: configPath)
+    }
+
+    nonisolated static func findCmuxConfig(startingFrom directory: String) -> String? {
         var current = directory
         let fs = FileManager.default
         while true {
@@ -356,7 +499,7 @@ final class CmuxConfigStore: ObservableObject {
 
         // Local config takes precedence
         if let localPath = localConfigPath {
-            if let localConfig = parseConfig(at: localPath) {
+            if let localConfig = Self.parseConfig(at: localPath) {
                 for command in localConfig.commands {
                     if !seenNames.contains(command.name) {
                         commands.append(command)
@@ -368,7 +511,7 @@ final class CmuxConfigStore: ObservableObject {
         }
 
         // Global config fills in the rest
-        if let globalConfig = parseConfig(at: globalConfigPath) {
+        if let globalConfig = Self.parseConfig(at: globalConfigPath) {
             for command in globalConfig.commands {
                 if !seenNames.contains(command.name) {
                     commands.append(command)
@@ -385,7 +528,7 @@ final class CmuxConfigStore: ObservableObject {
 
     // MARK: - Parsing
 
-    private func parseConfig(at path: String) -> CmuxConfigFile? {
+    nonisolated static func parseConfig(at path: String) -> CmuxConfigFile? {
         guard FileManager.default.fileExists(atPath: path),
               let data = FileManager.default.contents(atPath: path),
               !data.isEmpty else {
@@ -496,6 +639,86 @@ final class CmuxConfigStore: ObservableObject {
             localFileWatchSource = nil
         }
         localFileDescriptor = -1
+    }
+
+    // MARK: - File watching (project remotes)
+
+    private func startProjectConfigWatcher(path: String) {
+        guard projectConfigWatchSources[path] == nil else { return }
+        let fd = open(path, O_EVTONLY)
+        if fd >= 0 {
+            startProjectConfigFileWatcher(path: path, fileDescriptor: fd)
+        } else {
+            startProjectConfigDirectoryWatcher(path: path)
+        }
+    }
+
+    private func startProjectConfigFileWatcher(path: String, fileDescriptor fd: Int32) {
+        projectConfigFileDescriptors[path] = fd
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .delete, .rename, .extend],
+            queue: watchQueue
+        )
+
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let flags = source.data
+            DispatchQueue.main.async {
+                if flags.contains(.delete) || flags.contains(.rename) {
+                    self.stopProjectConfigWatcher(path: path)
+                    self.loadAll()
+                    self.startProjectConfigDirectoryWatcher(path: path)
+                } else {
+                    self.loadAll()
+                }
+            }
+        }
+
+        source.setCancelHandler {
+            Darwin.close(fd)
+        }
+
+        source.resume()
+        projectConfigWatchSources[path] = source
+    }
+
+    private func startProjectConfigDirectoryWatcher(path: String) {
+        guard projectConfigWatchSources[path] == nil else { return }
+        let dirPath = (path as NSString).deletingLastPathComponent
+        let fd = open(dirPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        projectConfigFileDescriptors[path] = fd
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .link, .rename],
+            queue: watchQueue
+        )
+
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                guard FileManager.default.fileExists(atPath: path) else { return }
+                self.stopProjectConfigWatcher(path: path)
+                self.loadAll()
+                self.startProjectConfigWatcher(path: path)
+            }
+        }
+
+        source.setCancelHandler {
+            Darwin.close(fd)
+        }
+
+        source.resume()
+        projectConfigWatchSources[path] = source
+    }
+
+    private func stopProjectConfigWatcher(path: String) {
+        if let source = projectConfigWatchSources.removeValue(forKey: path) {
+            source.cancel()
+        }
+        projectConfigFileDescriptors.removeValue(forKey: path)
     }
 
     // MARK: - File watching (global)

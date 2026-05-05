@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 
 #if canImport(cmux_DEV)
 @testable import cmux_DEV
@@ -75,6 +76,31 @@ final class CmuxConfigDecodingTests: XCTestCase {
         """
         let config = try decode(json)
         XCTAssertTrue(config.commands.isEmpty)
+    }
+
+    func testDecodeTopLevelRemoteHost() throws {
+        let json = """
+        {
+          "remote": {
+            "host": "tether"
+          },
+          "commands": []
+        }
+        """
+        let config = try decode(json)
+        XCTAssertEqual(config.remote?.host, "tether")
+    }
+
+    func testRejectsBlankTopLevelRemoteHost() {
+        let json = """
+        {
+          "remote": {
+            "host": "   "
+          },
+          "commands": []
+        }
+        """
+        XCTAssertThrowsError(try decode(json))
     }
 
     // MARK: Workspace commands
@@ -647,6 +673,392 @@ final class CmuxConfigCwdResolutionTests: XCTestCase {
             CmuxConfigStore.resolveCwd("src", relativeTo: baseCwd),
             "/Users/test/project/src"
         )
+    }
+
+    func testProjectRemoteHostResolvesFromNearestCmuxConfigWhenHostIsExplicitSSHAlias() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-\(UUID().uuidString)", isDirectory: true)
+        let nested = root.appendingPathComponent("subdir", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let configURL = root.appendingPathComponent("cmux.json", isDirectory: false)
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let remote = CmuxConfigStore.projectRemoteDefinition(
+            startingFrom: nested.path,
+            sshHostAliases: ["other", "tether"]
+        )
+
+        XCTAssertEqual(remote?.host, "tether")
+        XCTAssertEqual(remote?.configPath, configURL.path)
+    }
+
+    func testProjectRemoteHostIgnoresHostsThatAreNotExplicitSSHAliases() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        try """
+        {
+          "remote": { "host": "wildcard-only" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        let remote = CmuxConfigStore.projectRemoteDefinition(
+            startingFrom: root.path,
+            sshHostAliases: ["*.example.com"]
+        )
+
+        XCTAssertNil(remote)
+    }
+}
+
+// MARK: - Project remote workspaces
+
+@MainActor
+final class CmuxConfigProjectRemoteWorkspaceTests: XCTestCase {
+    override func tearDown() {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = nil
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = nil
+        Workspace.terminalPanelCreationObserverForTesting = nil
+        ProjectRemoteWorkspaceBootstrap.startupScriptWriterOverrideForTesting = nil
+        super.tearDown()
+    }
+
+    func testWorkspaceCreatedInsideProjectRemoteConfigStartsAsManagedRemoteWorkspace() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-\(UUID().uuidString)", isDirectory: true)
+        let nested = root.appendingPathComponent("app", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        let manager = TabManager()
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            XCTFail("Initial project remote terminal must run its bootstrap directly, not via local daemon: \(request)")
+            return nil
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+        }
+
+        let workspace = manager.addWorkspace(workingDirectory: nested.path, select: false)
+
+        XCTAssertEqual(workspace.remoteConfiguration?.destination, "tether")
+        XCTAssertNotNil(workspace.remoteConfiguration?.foregroundAuthToken)
+        XCTAssertTrue(workspace.remoteConfiguration?.sshOptions.contains("ControlMaster=auto") == true)
+        XCTAssertTrue(workspace.remoteConfiguration?.sshOptions.contains("ControlPersist=600") == true)
+        XCTAssertTrue(workspace.remoteConfiguration?.sshOptions.contains("StrictHostKeyChecking=accept-new") == true)
+        XCTAssertTrue(workspace.remoteConfiguration?.sshOptions.contains(where: { $0.hasPrefix("ControlPath=") }) == true)
+        XCTAssertEqual(workspace.remoteConnectionState, .disconnected)
+        XCTAssertTrue(workspace.isRemoteWorkspace)
+        let terminalId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(terminalId))
+        XCTAssertFalse(
+            workspace.focusedTerminalPanel?.surface.debugInitialCommand()?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty ?? true
+        )
+    }
+
+    func testWorkspaceCreatedInsideProjectRemoteConfigRunsInitialCommandInRemoteShell() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-\(UUID().uuidString)", isDirectory: true)
+        let nested = root.appendingPathComponent("app", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        let manager = TabManager()
+        let workspace = manager.addWorkspace(
+            workingDirectory: nested.path,
+            initialTerminalCommand: "echo remote-project",
+            select: false
+        )
+
+        let terminal = try XCTUnwrap(workspace.focusedTerminalPanel)
+        XCTAssertEqual(workspace.remoteConfiguration?.destination, "tether")
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(terminal.id))
+        XCTAssertNotEqual(terminal.surface.debugInitialCommand(), "echo remote-project")
+        XCTAssertEqual(terminal.surface.debugInitialInput(), "echo remote-project\n")
+    }
+
+    func testProjectRemoteCustomLayoutCreatesFinalTerminalsAsManagedRemote() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-layout-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        let manager = TabManager()
+        let workspace = manager.addWorkspace(workingDirectory: root.path, select: false)
+        let remoteStartupCommand = try XCTUnwrap(workspace.remoteConfiguration?.terminalStartupCommand)
+        let layout = CmuxLayoutNode.split(CmuxSplitDefinition(
+            direction: .horizontal,
+            split: 0.5,
+            children: [
+                .pane(CmuxPaneDefinition(surfaces: [
+                    CmuxSurfaceDefinition(type: .terminal, name: "shell")
+                ])),
+                .pane(CmuxPaneDefinition(surfaces: [
+                    CmuxSurfaceDefinition(type: .terminal, name: "worker", command: "echo worker")
+                ]))
+            ]
+        ))
+
+        workspace.applyCustomLayout(layout, baseCwd: root.path)
+
+        let terminalPanels = workspace.panels.values.compactMap { $0 as? TerminalPanel }
+        XCTAssertEqual(terminalPanels.count, 2)
+        XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 2)
+        XCTAssertTrue(terminalPanels.allSatisfy { workspace.isRemoteTerminalSurface($0.id) })
+        XCTAssertTrue(terminalPanels.allSatisfy { $0.surface.debugInitialCommand() == remoteStartupCommand })
+    }
+
+    func testProjectRemoteCustomLayoutDoesNotBootstrapScaffoldTerminalForReplacedPane() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-replaced-layout-\(UUID().uuidString)", isDirectory: true)
+        let workerDirectory = root.appendingPathComponent("worker", isDirectory: true)
+        try fm.createDirectory(at: workerDirectory, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        var createdInitialCommands: [String?] = []
+        Workspace.terminalPanelCreationObserverForTesting = { _, initialCommand in
+            createdInitialCommands.append(initialCommand)
+        }
+
+        let manager = TabManager()
+        let workspace = manager.addWorkspace(workingDirectory: root.path, select: false)
+        let remoteStartupCommand = try XCTUnwrap(workspace.remoteConfiguration?.terminalStartupCommand)
+        let layout = CmuxLayoutNode.split(CmuxSplitDefinition(
+            direction: .horizontal,
+            split: 0.5,
+            children: [
+                .pane(CmuxPaneDefinition(surfaces: [
+                    CmuxSurfaceDefinition(type: .terminal, name: "shell")
+                ])),
+                .pane(CmuxPaneDefinition(surfaces: [
+                    CmuxSurfaceDefinition(type: .terminal, name: "worker", cwd: "worker")
+                ]))
+            ]
+        ))
+
+        workspace.applyCustomLayout(layout, baseCwd: root.path)
+
+        XCTAssertEqual(workspace.panels.values.compactMap { $0 as? TerminalPanel }.count, 2)
+        XCTAssertEqual(
+            createdInitialCommands.filter { $0 == remoteStartupCommand }.count,
+            2,
+            "Only the final terminal should run the managed remote bootstrap; layout scaffold terminals must not bootstrap SSH."
+        )
+    }
+
+    func testExplicitSSHWorkspaceCreationCanOptOutOfAmbientProjectRemoteConfig() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-\(UUID().uuidString)", isDirectory: true)
+        let nested = root.appendingPathComponent("app", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { _ in nil }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+        }
+
+        let manager = TabManager()
+        let projectWorkspace = manager.addWorkspace(workingDirectory: nested.path, select: true)
+        XCTAssertEqual(projectWorkspace.remoteConfiguration?.destination, "tether")
+
+        let explicitSSHWorkspace = manager.addWorkspace(
+            initialTerminalCommand: "ssh other-host",
+            select: false,
+            inferProjectRemote: false
+        )
+        let terminal = try XCTUnwrap(explicitSSHWorkspace.focusedTerminalPanel)
+
+        XCTAssertEqual(explicitSSHWorkspace.currentDirectory, nested.path)
+        XCTAssertNil(explicitSSHWorkspace.remoteConfiguration)
+        XCTAssertFalse(explicitSSHWorkspace.isRemoteTerminalSurface(terminal.id))
+        XCTAssertEqual(terminal.surface.debugInitialCommand(), "ssh other-host")
+    }
+
+    func testProjectRemoteBootstrapFailureKeepsWorkspaceLocalInsteadOfUnmanagedSSH() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        ProjectRemoteWorkspaceBootstrap.startupScriptWriterOverrideForTesting = { _, _ in nil }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(
+            "cmux-project-remote-bootstrap-failure-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: root.appendingPathComponent("cmux.json"), atomically: true, encoding: .utf8)
+
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { _ in nil }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+        }
+
+        let manager = TabManager()
+        let workspace = manager.addWorkspace(workingDirectory: root.path, select: false)
+        let terminal = try XCTUnwrap(workspace.focusedTerminalPanel)
+
+        XCTAssertNil(workspace.remoteConfiguration)
+        XCTAssertFalse(workspace.isRemoteWorkspace)
+        XCTAssertFalse(workspace.isRemoteTerminalSurface(terminal.id))
+        XCTAssertNotEqual(terminal.surface.debugInitialCommand(), "ssh -tt tether")
+    }
+
+    func testConfigRevisionReconcilesProjectRemoteStateForAllWorkspaces() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-\(UUID().uuidString)", isDirectory: true)
+        let first = root.appendingPathComponent("first", isDirectory: true)
+        let second = root.appendingPathComponent("second", isDirectory: true)
+        try fm.createDirectory(at: first, withIntermediateDirectories: true)
+        try fm.createDirectory(at: second, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let configURL = root.appendingPathComponent("cmux.json", isDirectory: false)
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let manager = TabManager()
+        let firstWorkspace = manager.addWorkspace(workingDirectory: first.path, select: true)
+        let secondWorkspace = manager.addWorkspace(workingDirectory: second.path, select: false)
+
+        XCTAssertEqual(firstWorkspace.remoteConfiguration?.projectConfigPath, configURL.path)
+        XCTAssertEqual(secondWorkspace.remoteConfiguration?.projectConfigPath, configURL.path)
+
+        try """
+        {
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        manager.reconcileProjectRemoteWorkspacesWithProjectConfig()
+
+        XCTAssertNil(firstWorkspace.remoteConfiguration)
+        XCTAssertNil(secondWorkspace.remoteConfiguration)
+        XCTAssertFalse(firstWorkspace.isRemoteWorkspace)
+        XCTAssertFalse(secondWorkspace.isRemoteWorkspace)
+    }
+
+    func testUnselectedProjectRemoteConfigChangePublishesRevisionForReconcile() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-watch-\(UUID().uuidString)", isDirectory: true)
+        let first = root.appendingPathComponent("first", isDirectory: true)
+        let second = root.appendingPathComponent("second", isDirectory: true)
+        try fm.createDirectory(at: first, withIntermediateDirectories: true)
+        try fm.createDirectory(at: second, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let firstConfigURL = first.appendingPathComponent("cmux.json", isDirectory: false)
+        let secondConfigURL = second.appendingPathComponent("cmux.json", isDirectory: false)
+        let remoteConfig = """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """
+        try remoteConfig.write(to: firstConfigURL, atomically: true, encoding: .utf8)
+        try remoteConfig.write(to: secondConfigURL, atomically: true, encoding: .utf8)
+
+        let manager = TabManager()
+        let selectedWorkspace = manager.addWorkspace(workingDirectory: first.path, select: true)
+        let unselectedWorkspace = manager.addWorkspace(workingDirectory: second.path, select: false)
+        XCTAssertEqual(selectedWorkspace.remoteConfiguration?.projectConfigPath, firstConfigURL.path)
+        XCTAssertEqual(unselectedWorkspace.remoteConfiguration?.projectConfigPath, secondConfigURL.path)
+
+        let store = CmuxConfigStore()
+        store.wireDirectoryTracking(tabManager: manager)
+        store.loadAll()
+
+        let baselineRevision = store.configRevision
+        let revisionPublished = expectation(description: "unselected project config publishes revision")
+        var didFulfill = false
+        var cancellables = Set<AnyCancellable>()
+        store.$configRevision
+            .dropFirst()
+            .sink { revision in
+                guard !didFulfill, revision > baselineRevision else { return }
+                didFulfill = true
+                revisionPublished.fulfill()
+            }
+            .store(in: &cancellables)
+
+        try """
+        {
+          "commands": []
+        }
+        """.write(to: secondConfigURL, atomically: true, encoding: .utf8)
+
+        wait(for: [revisionPublished], timeout: 2.0)
+        manager.reconcileProjectRemoteWorkspacesWithProjectConfig()
+
+        XCTAssertEqual(selectedWorkspace.remoteConfiguration?.destination, "tether")
+        XCTAssertNil(unselectedWorkspace.remoteConfiguration)
+        XCTAssertTrue(selectedWorkspace.isRemoteWorkspace)
+        XCTAssertFalse(unselectedWorkspace.isRemoteWorkspace)
     }
 }
 

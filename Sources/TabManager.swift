@@ -1893,7 +1893,8 @@ class TabManager: ObservableObject {
         configTemplate: CmuxSurfaceConfigTemplate?,
         initialTerminalCommand: String?,
         initialTerminalInput: String? = nil,
-        initialTerminalEnvironment: [String: String]
+        initialTerminalEnvironment: [String: String],
+        initialTerminalLocalDaemonEligible: Bool = true
     ) -> Workspace {
         Workspace(
             title: title,
@@ -1902,7 +1903,8 @@ class TabManager: ObservableObject {
             configTemplate: configTemplate,
             initialTerminalCommand: initialTerminalCommand,
             initialTerminalInput: initialTerminalInput,
-            initialTerminalEnvironment: initialTerminalEnvironment
+            initialTerminalEnvironment: initialTerminalEnvironment,
+            initialTerminalLocalDaemonEligible: initialTerminalLocalDaemonEligible
         )
     }
 
@@ -1958,7 +1960,8 @@ class TabManager: ObservableObject {
         select: Bool = true,
         eagerLoadTerminal: Bool = false,
         placementOverride: NewWorkspacePlacement? = nil,
-        autoWelcomeIfNeeded: Bool = true
+        autoWelcomeIfNeeded: Bool = true,
+        inferProjectRemote: Bool = true
     ) -> Workspace {
         let sourceWorkspace = selectedWorkspace
         let capturedTabs = tabs
@@ -1986,6 +1989,30 @@ class TabManager: ObservableObject {
             sentryBreadcrumb("workspace.create", data: ["tabCount": nextTabCount])
             let explicitWorkingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory)
             let workingDirectory = explicitWorkingDirectory ?? snapshot.preferredWorkingDirectory
+            let projectRemoteBootstrap: ProjectRemoteWorkspaceBootstrap? = {
+                guard inferProjectRemote else {
+                    return nil
+                }
+                guard let projectDirectory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !projectDirectory.isEmpty,
+                      let remote = CmuxConfigStore.projectRemoteDefinition(startingFrom: projectDirectory) else {
+                    return nil
+                }
+                return ProjectRemoteWorkspaceBootstrap.build(
+                    host: remote.host,
+                    configPath: remote.configPath
+                )
+            }()
+            let remoteStartupCommand = projectRemoteBootstrap?.configuration.terminalStartupCommand
+            let initialInputForWorkspace: String? = {
+                guard remoteStartupCommand != nil,
+                      let rawCommand = initialTerminalCommand,
+                      !rawCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return initialTerminalInput
+                }
+                let commandInput = rawCommand.hasSuffix("\n") ? rawCommand : rawCommand + "\n"
+                return commandInput + (initialTerminalInput ?? "")
+            }()
             let inheritedConfig = workspaceCreationConfigTemplate(
                 inheritedTerminalFontPoints: snapshot.inheritedTerminalFontPoints
             )
@@ -2000,9 +2027,10 @@ class TabManager: ObservableObject {
                 workingDirectory: workingDirectory,
                 portOrdinal: ordinal,
                 configTemplate: inheritedConfig,
-                initialTerminalCommand: initialTerminalCommand,
-                initialTerminalInput: initialTerminalInput,
-                initialTerminalEnvironment: initialTerminalEnvironment
+                initialTerminalCommand: remoteStartupCommand ?? initialTerminalCommand,
+                initialTerminalInput: initialInputForWorkspace,
+                initialTerminalEnvironment: initialTerminalEnvironment,
+                initialTerminalLocalDaemonEligible: remoteStartupCommand == nil
             )
             applyCreationChromeInheritance(
                 to: newWorkspace,
@@ -2011,6 +2039,18 @@ class TabManager: ObservableObject {
             newWorkspace.owningTabManager = self
             if title != nil {
                 newWorkspace.setCustomTitle(title)
+            }
+            if let remoteConfiguration = projectRemoteBootstrap?.configuration {
+#if DEBUG
+                dlog(
+                    "workspace.projectRemote.configure workspace=\(newWorkspace.id.uuidString.prefix(5)) " +
+                    "host=\(remoteConfiguration.destination) config=\(remoteConfiguration.projectConfigPath ?? "nil")"
+                )
+#endif
+                newWorkspace.configureRemoteConnection(
+                    remoteConfiguration,
+                    autoConnect: remoteConfiguration.foregroundAuthToken == nil
+                )
             }
             wireClosedBrowserTracking(for: newWorkspace)
             if eagerLoadTerminal && !select {
@@ -6807,6 +6847,12 @@ extension TabManager {
         }
 
         return hasher.finalize()
+    }
+
+    func reconcileProjectRemoteWorkspacesWithProjectConfig() {
+        for workspace in tabs {
+            workspace.reconcileProjectRemoteConfigurationWithProjectConfig()
+        }
     }
 
     func sessionSnapshot(includeScrollback: Bool) -> SessionTabManagerSnapshot {

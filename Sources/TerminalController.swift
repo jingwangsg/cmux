@@ -246,6 +246,10 @@ class TerminalController {
         return preferredPath
     }
 
+    nonisolated static func activeSocketPathForCurrentProcess() -> String {
+        shared.activeSocketPath(preferredPath: SocketControlSettings.socketPath())
+    }
+
     private nonisolated func shouldContinueAcceptLoop(generation: UInt64) -> Bool {
         withListenerState {
             isRunning && generation == activeAcceptLoopGeneration
@@ -3400,6 +3404,7 @@ class TerminalController {
         let requestedTitle = v2RawString(params, "title")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = (requestedTitle?.isEmpty == false) ? requestedTitle : nil
         let description = v2RawString(params, "description")
+        let inferProjectRemote = v2Bool(params, "infer_project_remote") ?? true
 
         // Decode optional layout param (same JSON schema as cmux.json layout field).
         // Validate before creating the workspace so malformed layouts fail fast.
@@ -3425,7 +3430,8 @@ class TerminalController {
                 initialTerminalCommand: layoutNode == nil ? initialCommand : nil,
                 initialTerminalEnvironment: layoutNode == nil ? initialEnv : [:],
                 select: shouldFocus,
-                eagerLoadTerminal: !shouldFocus
+                eagerLoadTerminal: !shouldFocus,
+                inferProjectRemote: inferProjectRemote
             )
             ws.setCustomDescription(description)
             if let layoutNode {

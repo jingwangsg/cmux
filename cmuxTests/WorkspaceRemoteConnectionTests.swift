@@ -1,4 +1,5 @@
 import XCTest
+import WebKit
 
 #if canImport(cmux_DEV)
 @testable import cmux_DEV
@@ -1148,6 +1149,186 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectRemoteWorkspaceKeepsRemoteConfigurationAfterLastTerminalEnds() throws {
+        let workspace = Workspace()
+        let config = WorkspaceRemoteConfiguration(
+            destination: "cmux-macmini",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: 64009,
+            relayID: String(repeating: "a", count: 16),
+            relayToken: String(repeating: "b", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh cmux-macmini",
+            projectConfigPath: "/tmp/project/cmux.json"
+        )
+
+        workspace.configureRemoteConnection(config, autoConnect: false)
+
+        let panelID = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(panelID))
+
+        workspace.markRemoteTerminalSessionEnded(surfaceId: panelID, relayPort: 64009)
+
+        XCTAssertFalse(workspace.isRemoteTerminalSurface(panelID))
+        XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 0)
+        XCTAssertTrue(workspace.isRemoteWorkspace)
+        XCTAssertEqual(workspace.remoteConfiguration?.projectConfigPath, "/tmp/project/cmux.json")
+    }
+
+    @MainActor
+    func testProjectRemoteWorkspaceExplicitDisconnectClearsProjectRemoteMode() throws {
+        let workspace = Workspace()
+        let config = WorkspaceRemoteConfiguration(
+            destination: "cmux-macmini",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: 64011,
+            relayID: String(repeating: "a", count: 16),
+            relayToken: String(repeating: "b", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh cmux-macmini",
+            projectConfigPath: "/tmp/project/cmux.json"
+        )
+
+        workspace.configureRemoteConnection(config, autoConnect: false)
+        XCTAssertTrue(workspace.isRemoteWorkspace)
+
+        let paneId = try XCTUnwrap(workspace.bonsplitController.focusedPaneId)
+        let remoteBrowser = try XCTUnwrap(
+            workspace.newBrowserSurface(
+                inPane: paneId,
+                url: URL(string: "http://localhost:3000/demo"),
+                focus: false
+            )
+        )
+        XCTAssertFalse(remoteBrowser.webView.configuration.websiteDataStore === WKWebsiteDataStore.default())
+        XCTAssertNil(remoteBrowser.webView.url)
+
+        workspace.disconnectRemoteConnection(clearConfiguration: false)
+
+        XCTAssertFalse(workspace.isRemoteWorkspace)
+        XCTAssertNil(workspace.remoteConfiguration)
+        XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 0)
+        XCTAssertNil(workspace.remoteAttachmentPayload(for: remoteBrowser.id))
+        XCTAssertTrue(remoteBrowser.webView.configuration.websiteDataStore === WKWebsiteDataStore.default())
+
+        let deadline = Date().addingTimeInterval(1.0)
+        while remoteBrowser.webView.url == nil, RunLoop.main.run(mode: .default, before: deadline), Date() < deadline {}
+        XCTAssertEqual(remoteBrowser.webView.url?.host, "localhost")
+
+        workspace.focusPanel(remoteBrowser.id)
+        let childBrowser = try XCTUnwrap(
+            workspace.newBrowserSurface(
+                inPane: paneId,
+                url: URL(string: "http://localhost:3001/from-demoted-browser"),
+                focus: true
+            )
+        )
+        XCTAssertNil(workspace.remoteAttachmentPayload(for: childBrowser.id))
+        XCTAssertTrue(childBrowser.webView.configuration.websiteDataStore === WKWebsiteDataStore.default())
+
+        let newTerminal = try XCTUnwrap(workspace.newTerminalSurface(inPane: paneId, focus: true))
+        XCTAssertNil(newTerminal.surface.debugInitialCommand())
+        XCTAssertFalse(workspace.isRemoteTerminalSurface(newTerminal.id))
+    }
+
+    @MainActor
+    func testProjectRemoteWorkspaceReconcileClearsRemoteModeWhenConfigRemovesRemoteHost() throws {
+        let fileManager = FileManager.default
+        let projectRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("cmux-project-remote-reconcile-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: projectRoot) }
+
+        let configURL = projectRoot.appendingPathComponent("cmux.json", isDirectory: false)
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        defer { CmuxConfigStore.sshHostAliasesOverrideForTesting = nil }
+
+        let workspace = Workspace()
+        let config = WorkspaceRemoteConfiguration(
+            destination: "tether",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: 64013,
+            relayID: String(repeating: "a", count: 16),
+            relayToken: String(repeating: "b", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh tether",
+            projectConfigPath: configURL.path
+        )
+        workspace.configureRemoteConnection(config, autoConnect: false)
+        XCTAssertTrue(workspace.isRemoteWorkspace)
+
+        try """
+        {
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        workspace.reconcileProjectRemoteConfigurationWithProjectConfig()
+
+        XCTAssertFalse(workspace.isRemoteWorkspace)
+        XCTAssertNil(workspace.remoteConfiguration)
+    }
+
+    @MainActor
+    func testProjectRemoteWorkspaceReplacementTerminalRemainsRemoteAfterLastPanelCloses() throws {
+        let workspace = Workspace()
+        let config = WorkspaceRemoteConfiguration(
+            destination: "cmux-macmini",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: 64010,
+            relayID: String(repeating: "a", count: 16),
+            relayToken: String(repeating: "b", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh cmux-macmini",
+            projectConfigPath: "/tmp/project/cmux.json"
+        )
+
+        workspace.configureRemoteConnection(config, autoConnect: false)
+
+        let closingPanelID = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        workspace.markRemoteTerminalSessionEnded(surfaceId: closingPanelID, relayPort: 64010)
+
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            XCTFail("Project remote replacement terminals must run their bootstrap directly, not via local daemon: \(request)")
+            return nil
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+        }
+
+        XCTAssertTrue(workspace.closePanel(closingPanelID, force: true))
+
+        let replacement = try XCTUnwrap(workspace.focusedTerminalPanel)
+        XCTAssertNotEqual(replacement.id, closingPanelID)
+        XCTAssertTrue(workspace.isRemoteWorkspace)
+        XCTAssertEqual(workspace.remoteConfiguration?.destination, "cmux-macmini")
+        XCTAssertEqual(workspace.remoteConfiguration?.projectConfigPath, "/tmp/project/cmux.json")
+        XCTAssertEqual(replacement.surface.debugInitialCommand(), "ssh cmux-macmini")
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(replacement.id))
+        XCTAssertEqual(workspace.activeRemoteTerminalSessionCount, 1)
+    }
+
+    @MainActor
     func testNewTerminalInManagedRemoteWorkspaceStaysLocalUntilUserRunsSSH() throws {
         let workspace = Workspace()
         let config = WorkspaceRemoteConfiguration(
@@ -1173,6 +1354,46 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
         XCTAssertNil(newTerminal.surface.debugInitialCommand())
         XCTAssertFalse(workspace.isRemoteTerminalSurface(newTerminal.id))
         XCTAssertNil(workspace.remoteAttachmentPayload(for: newTerminal.id))
+    }
+
+    @MainActor
+    func testNewTerminalInProjectRemoteWorkspaceStartsManagedRemoteSession() throws {
+        let workspace = Workspace()
+        let config = WorkspaceRemoteConfiguration(
+            destination: "cmux-macmini",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: 64008,
+            relayID: String(repeating: "a", count: 16),
+            relayToken: String(repeating: "b", count: 64),
+            localSocketPath: "/tmp/cmux-debug-test.sock",
+            terminalStartupCommand: "ssh cmux-macmini",
+            projectConfigPath: "/tmp/project/cmux.json"
+        )
+
+        workspace.configureRemoteConnection(config, autoConnect: false)
+
+        let existingPanelId = try XCTUnwrap(workspace.focusedTerminalPanel?.id)
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(existingPanelId))
+
+        let previousLaunchOverride = Workspace.localTerminalLaunchConfigurationOverrideForTesting
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            XCTFail("Project remote terminals must run their bootstrap directly, not via local daemon: \(request)")
+            return nil
+        }
+        defer {
+            Workspace.localTerminalLaunchConfigurationOverrideForTesting = previousLaunchOverride
+        }
+
+        let paneId = try XCTUnwrap(workspace.bonsplitController.focusedPaneId)
+        let newTerminal = try XCTUnwrap(workspace.newTerminalSurface(inPane: paneId, focus: true))
+        XCTAssertEqual(newTerminal.surface.debugInitialCommand(), "ssh cmux-macmini")
+        XCTAssertTrue(workspace.isRemoteTerminalSurface(newTerminal.id))
+        let payload = try XCTUnwrap(workspace.remoteAttachmentPayload(for: newTerminal.id))
+        XCTAssertEqual(payload["kind"] as? String, "managed_remote")
+        XCTAssertEqual(payload["destination"] as? String, "cmux-macmini")
     }
 
     @MainActor
@@ -3352,6 +3573,7 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
         let createParams = try XCTUnwrap(requests[0]["params"] as? [String: Any])
         let initialCommand = try XCTUnwrap(createParams["initial_command"] as? String)
         XCTAssertFalse(initialCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        XCTAssertEqual(createParams["infer_project_remote"] as? Bool, false)
 
         let renameParams = try XCTUnwrap(requests[1]["params"] as? [String: Any])
         XCTAssertEqual(renameParams["workspace_id"] as? String, workspaceID)
@@ -3802,7 +4024,7 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
             1,
             "Expected the staged bootstrap installer to be passed as one SSH remote command, saw \(firstInvocation)"
         )
-        XCTAssertTrue(remoteCommandArgs[0].contains("/bin/sh -lc"), "Expected a POSIX shell wrapper in \(remoteCommandArgs)")
+        XCTAssertTrue(remoteCommandArgs[0].contains("/bin/sh -c"), "Expected a POSIX shell wrapper in \(remoteCommandArgs)")
         XCTAssertTrue(remoteCommandArgs[0].contains("set -eu"), "Expected installer command body in \(remoteCommandArgs)")
         XCTAssertFalse(remoteCommandArgs.contains("sh"))
         XCTAssertFalse(remoteCommandArgs.contains("-c"))
@@ -3825,6 +4047,168 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
         let foregroundAuthParams = try XCTUnwrap(foregroundAuthPayload["params"] as? [String: Any])
         XCTAssertEqual(foregroundAuthParams["workspace_id"] as? String, workspaceID)
         XCTAssertEqual(foregroundAuthParams["foreground_auth_token"] as? String, foregroundAuthToken)
+    }
+
+    func testProjectRemoteBootstrapStartupCommandDefersDaemonConnectUntilForegroundSSHAuth() throws {
+        let bootstrap = try XCTUnwrap(ProjectRemoteWorkspaceBootstrap.build(
+            host: "cmux-macmini",
+            configPath: "/tmp/cmux-project/cmux.json"
+        ))
+        let configuration = bootstrap.configuration
+        let foregroundAuthToken = try XCTUnwrap(configuration.foregroundAuthToken)
+        XCTAssertTrue(configuration.sshOptions.contains("ControlMaster=auto"))
+        XCTAssertTrue(configuration.sshOptions.contains("ControlPersist=600"))
+        XCTAssertTrue(configuration.sshOptions.contains("StrictHostKeyChecking=accept-new"))
+        XCTAssertTrue(configuration.sshOptions.contains(where: { $0.hasPrefix("ControlPath=") }))
+
+        let fileManager = FileManager.default
+        let tempRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("cmux-project-ssh-bootstrap-\(UUID().uuidString)")
+        let fakeBin = tempRoot.appendingPathComponent("bin")
+        let fakeSSHLog = tempRoot.appendingPathComponent("fake-ssh.jsonl")
+        let fakeCmuxLog = tempRoot.appendingPathComponent("fake-cmux.jsonl")
+        let fakeSSH = fakeBin.appendingPathComponent("ssh")
+        let fakeCmux = fakeBin.appendingPathComponent("cmux")
+
+        try fileManager.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempRoot) }
+
+        let fakeSSHScript = """
+        #!/bin/sh
+        python3 - "$@" <<'PY'
+        import json
+        import os
+        import subprocess
+        import sys
+
+        args = sys.argv[1:]
+        with open(os.environ["CMUX_FAKE_SSH_LOG"], "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(args) + "\\n")
+
+        local_command = None
+        for index, arg in enumerate(args):
+            if arg == "-o" and index + 1 < len(args) and args[index + 1].startswith("LocalCommand="):
+                local_command = args[index + 1].split("=", 1)[1]
+                break
+
+        if local_command:
+            subprocess.run(["/bin/sh", "-c", local_command], check=False, env=os.environ.copy())
+        PY
+        cat >/dev/null
+        exit 0
+        """
+        try fakeSSHScript.write(to: fakeSSH, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeSSH.path)
+
+        let fakeCmuxScript = """
+        #!/bin/sh
+        python3 - "$@" <<'PY'
+        import json
+        import os
+        import sys
+
+        with open(os.environ["CMUX_FAKE_CMUX_LOG"], "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sys.argv[1:]) + "\\n")
+        PY
+        exit 0
+        """
+        try fakeCmuxScript.write(to: fakeCmux, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeCmux.path)
+
+        var startupEnvironment = ProcessInfo.processInfo.environment
+        startupEnvironment["HOME"] = tempRoot.path
+        startupEnvironment["PATH"] = "\(fakeBin.path):/usr/bin:/bin:/usr/sbin:/sbin"
+        startupEnvironment["CMUX_FAKE_SSH_LOG"] = fakeSSHLog.path
+        startupEnvironment["CMUX_FAKE_CMUX_LOG"] = fakeCmuxLog.path
+        startupEnvironment["CMUX_SOCKET_PATH"] = "/tmp/cmux-project-bootstrap.sock"
+        startupEnvironment["CMUX_WORKSPACE_ID"] = "11111111-1111-1111-1111-111111111111"
+        startupEnvironment["CMUX_SURFACE_ID"] = "22222222-2222-2222-2222-222222222222"
+        startupEnvironment["CMUX_BUNDLED_CLI_PATH"] = fakeCmux.path
+        startupEnvironment["CMUX_CLI_SENTRY_DISABLED"] = "1"
+        startupEnvironment["CMUX_CLAUDE_HOOK_SENTRY_DISABLED"] = "1"
+
+        let startupResult = runProcess(
+            executablePath: "/bin/sh",
+            arguments: ["-c", configuration.terminalStartupCommand ?? ""],
+            environment: startupEnvironment,
+            timeout: 5
+        )
+
+        XCTAssertFalse(startupResult.timedOut, startupResult.stderr)
+        XCTAssertEqual(startupResult.status, 0, startupResult.stderr)
+
+        let sshLogLines = try String(contentsOf: fakeSSHLog, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        XCTAssertGreaterThanOrEqual(sshLogLines.count, 2)
+
+        let firstInvocationData = try XCTUnwrap(sshLogLines.first?.data(using: .utf8))
+        let firstInvocation = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: firstInvocationData, options: []) as? [String]
+        )
+        let localCommandArgument = try XCTUnwrap(
+            firstInvocation.first(where: { $0.hasPrefix("LocalCommand=") })
+        )
+        let localCommand = String(localCommandArgument.dropFirst("LocalCommand=".count))
+        XCTAssertTrue(
+            localCommand.contains("workspace.remote.foreground_auth_ready"),
+            "Expected project remote bootstrap install hop to signal foreground auth readiness, saw \(firstInvocation)"
+        )
+        XCTAssertTrue(
+            localCommand.contains("%%s\\n"),
+            "Expected LocalCommand to percent-escape literal percent signs for OpenSSH, saw \(localCommand)"
+        )
+
+        let localCommandSyntaxCheck = runProcess(
+            executablePath: "/bin/sh",
+            arguments: ["-n", "-c", localCommand],
+            environment: ProcessInfo.processInfo.environment,
+            timeout: 5
+        )
+        XCTAssertEqual(
+            localCommandSyntaxCheck.status,
+            0,
+            "Expected LocalCommand shell snippet to parse cleanly, stderr: \(localCommandSyntaxCheck.stderr)"
+        )
+
+        let destinationIndex = try XCTUnwrap(firstInvocation.lastIndex(of: "cmux-macmini"))
+        let remoteCommandArgs = Array(firstInvocation.suffix(from: firstInvocation.index(after: destinationIndex)))
+        XCTAssertEqual(
+            remoteCommandArgs.count,
+            1,
+            "Expected the staged bootstrap installer to be passed as one SSH remote command, saw \(firstInvocation)"
+        )
+        XCTAssertTrue(remoteCommandArgs[0].contains("set -eu"), "Expected installer command body in \(remoteCommandArgs)")
+
+        let secondInvocationData = try XCTUnwrap(sshLogLines.dropFirst().first?.data(using: .utf8))
+        let secondInvocation = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: secondInvocationData, options: []) as? [String]
+        )
+        XCTAssertFalse(
+            secondInvocation.contains(where: { $0.contains("LocalCommand=") }),
+            "Expected only the bootstrap install hop to trigger LocalCommand, saw \(secondInvocation)"
+        )
+
+        let cmuxLogLines = try String(contentsOf: fakeCmuxLog, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        let foregroundAuthCmuxLogLines = cmuxLogLines.filter {
+            $0.contains("workspace.remote.foreground_auth_ready")
+        }
+        XCTAssertEqual(foregroundAuthCmuxLogLines.count, 1)
+        let cmuxInvocationData = try XCTUnwrap(foregroundAuthCmuxLogLines.first?.data(using: .utf8))
+        let cmuxInvocation = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: cmuxInvocationData, options: []) as? [String]
+        )
+        XCTAssertTrue(cmuxInvocation.contains("rpc"))
+        XCTAssertTrue(cmuxInvocation.contains("workspace.remote.foreground_auth_ready"))
+        let payloadString = try XCTUnwrap(cmuxInvocation.last)
+        let payloadData = try XCTUnwrap(payloadString.data(using: .utf8))
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: payloadData, options: []) as? [String: Any]
+        )
+        XCTAssertEqual(payload["workspace_id"] as? String, "11111111-1111-1111-1111-111111111111")
+        XCTAssertEqual(payload["foreground_auth_token"] as? String, foregroundAuthToken)
     }
 
     @MainActor

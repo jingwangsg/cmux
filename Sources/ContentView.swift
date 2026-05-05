@@ -3369,6 +3369,10 @@ struct ContentView: View {
             syncSidebarSelectedWorkspaceIds()
         })
 
+        view = AnyView(view.onChange(of: cmuxConfigStore.configRevision) { _ in
+            tabManager.reconcileProjectRemoteWorkspacesWithProjectConfig()
+        })
+
         // File explorer: reactively sync CWD when selected workspace or its directory changes.
         // Uses switchToLatest to automatically unsubscribe from the old workspace's publisher.
         view = AnyView(view.onReceive(

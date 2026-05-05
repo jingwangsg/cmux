@@ -12,6 +12,14 @@ final class SessionPersistenceTests: XCTestCase {
         let display: SessionDisplaySnapshot?
     }
 
+    override func tearDown() {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = nil
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = nil
+        Workspace.terminalPanelCreationObserverForTesting = nil
+        ProjectRemoteWorkspaceBootstrap.startupScriptWriterOverrideForTesting = nil
+        super.tearDown()
+    }
+
     @MainActor
     func testWorkspaceSessionSnapshotRestoresMarkdownPanel() throws {
         let root = FileManager.default.temporaryDirectory
@@ -70,6 +78,256 @@ final class SessionPersistenceTests: XCTestCase {
         let panelSnapshot = try XCTUnwrap(snapshot.panels.first { $0.id == panelId })
 
         XCTAssertTrue(panelSnapshot.listeningPorts.isEmpty)
+    }
+
+    @MainActor
+    func testProjectRemoteSessionSnapshotPersistsIntentOnlyAndRestoreRebuildsBootstrap() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-restore-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let configURL = root.appendingPathComponent("cmux.json", isDirectory: false)
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let workspace = Workspace(workingDirectory: root.path)
+        let configuration = try XCTUnwrap(ProjectRemoteWorkspaceBootstrap.build(
+            host: "tether",
+            configPath: configURL.path
+        )).configuration
+        let staleStartupCommand = try XCTUnwrap(configuration.terminalStartupCommand)
+        workspace.configureRemoteConnection(configuration, autoConnect: false)
+
+        var snapshot = workspace.sessionSnapshot(includeScrollback: false)
+        let persistedRemote = try XCTUnwrap(snapshot.remoteConfiguration)
+        XCTAssertEqual(persistedRemote.destination, "tether")
+        XCTAssertEqual(persistedRemote.projectConfigPath, configURL.path)
+        XCTAssertNil(persistedRemote.terminalStartupCommand)
+        XCTAssertNil(persistedRemote.relayPort)
+        XCTAssertNil(persistedRemote.relayID)
+        XCTAssertNil(persistedRemote.relayToken)
+
+        snapshot.remoteConfiguration?.terminalStartupCommand = staleStartupCommand
+        snapshot.remoteConfiguration?.relayPort = configuration.relayPort
+        snapshot.remoteConfiguration?.relayID = configuration.relayID
+        snapshot.remoteConfiguration?.relayToken = configuration.relayToken
+        snapshot.remoteConfiguration?.localSocketPath = configuration.localSocketPath
+
+        let restored = Workspace(workingDirectory: root.path)
+        Workspace.localTerminalLaunchConfigurationOverrideForTesting = { request in
+            XCTFail("Restored project remote terminal must run fresh bootstrap directly, not via local daemon: \(request)")
+            return nil
+        }
+
+        restored.restoreSessionSnapshot(snapshot)
+
+        let restoredConfiguration = try XCTUnwrap(restored.remoteConfiguration)
+        let restoredTerminal = try XCTUnwrap(restored.focusedTerminalPanel)
+        XCTAssertEqual(restoredConfiguration.destination, "tether")
+        XCTAssertEqual(restoredConfiguration.projectConfigPath, configURL.path)
+        XCTAssertNotNil(restoredConfiguration.terminalStartupCommand)
+        XCTAssertNotNil(restoredConfiguration.foregroundAuthToken)
+        XCTAssertEqual(restored.remoteConnectionState, .disconnected)
+        XCTAssertNotEqual(restoredConfiguration.terminalStartupCommand, staleStartupCommand)
+        XCTAssertEqual(restoredTerminal.surface.debugInitialCommand(), restoredConfiguration.terminalStartupCommand)
+        XCTAssertNotEqual(restoredTerminal.surface.debugInitialCommand(), staleStartupCommand)
+        XCTAssertTrue(restored.isRemoteTerminalSurface(restoredTerminal.id))
+    }
+
+    @MainActor
+    func testProjectRemoteMultiPaneRestoreBootstrapsOnlyRestoredTerminals() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-restore-layout-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let configURL = root.appendingPathComponent("cmux.json", isDirectory: false)
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let configuration = try XCTUnwrap(ProjectRemoteWorkspaceBootstrap.build(
+            host: "tether",
+            configPath: configURL.path
+        )).configuration
+        let leftPanelID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let rightPanelID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        let snapshot = SessionWorkspaceSnapshot(
+            processTitle: "Terminal",
+            customTitle: nil,
+            customDescription: nil,
+            customColor: nil,
+            isPinned: false,
+            terminalScrollBarHidden: nil,
+            currentDirectory: root.path,
+            focusedPanelId: leftPanelID,
+            layout: .split(SessionSplitLayoutSnapshot(
+                orientation: .horizontal,
+                dividerPosition: 0.5,
+                first: .pane(SessionPaneLayoutSnapshot(panelIds: [leftPanelID], selectedPanelId: leftPanelID)),
+                second: .pane(SessionPaneLayoutSnapshot(panelIds: [rightPanelID], selectedPanelId: rightPanelID))
+            )),
+            panels: [
+                SessionPanelSnapshot(
+                    id: leftPanelID,
+                    type: .terminal,
+                    title: "left",
+                    customTitle: nil,
+                    directory: root.path,
+                    isPinned: false,
+                    isManuallyUnread: false,
+                    gitBranch: nil,
+                    listeningPorts: [],
+                    ttyName: nil,
+                    terminal: SessionTerminalPanelSnapshot(
+                        workingDirectory: root.path,
+                        scrollback: nil,
+                        localSessionID: nil
+                    ),
+                    browser: nil,
+                    markdown: nil
+                ),
+                SessionPanelSnapshot(
+                    id: rightPanelID,
+                    type: .terminal,
+                    title: "right",
+                    customTitle: nil,
+                    directory: root.path,
+                    isPinned: false,
+                    isManuallyUnread: false,
+                    gitBranch: nil,
+                    listeningPorts: [],
+                    ttyName: nil,
+                    terminal: SessionTerminalPanelSnapshot(
+                        workingDirectory: root.path,
+                        scrollback: nil,
+                        localSessionID: nil
+                    ),
+                    browser: nil,
+                    markdown: nil
+                )
+            ],
+            statusEntries: [],
+            logEntries: [],
+            progress: nil,
+            gitBranch: nil,
+            remoteConfiguration: SessionWorkspaceRemoteConfigurationSnapshot(configuration: configuration)
+        )
+
+        let restored = Workspace(workingDirectory: root.path)
+        var createdInitialCommands: [String?] = []
+        Workspace.terminalPanelCreationObserverForTesting = { _, initialCommand in
+            createdInitialCommands.append(initialCommand)
+        }
+
+        restored.restoreSessionSnapshot(snapshot)
+
+        let restoredConfiguration = try XCTUnwrap(restored.remoteConfiguration)
+        let remoteStartupCommand = try XCTUnwrap(restoredConfiguration.terminalStartupCommand)
+        let terminalPanels = restored.panels.values.compactMap { $0 as? TerminalPanel }
+        XCTAssertEqual(terminalPanels.count, 2)
+        XCTAssertEqual(restored.activeRemoteTerminalSessionCount, 2)
+        XCTAssertTrue(terminalPanels.allSatisfy { restored.isRemoteTerminalSurface($0.id) })
+        XCTAssertTrue(terminalPanels.allSatisfy { $0.surface.debugInitialCommand() == remoteStartupCommand })
+        XCTAssertEqual(
+            createdInitialCommands.filter { $0 == remoteStartupCommand }.count,
+            2,
+            "Restore scaffolding must not launch extra managed SSH bootstrap terminals."
+        )
+    }
+
+    @MainActor
+    func testProjectRemoteRestoreSkipsRemoteWhenProjectConfigNoLongerDeclaresRemoteHost() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("cmux-project-remote-restore-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let configURL = root.appendingPathComponent("cmux.json", isDirectory: false)
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let workspace = Workspace(workingDirectory: root.path)
+        let configuration = try XCTUnwrap(ProjectRemoteWorkspaceBootstrap.build(
+            host: "tether",
+            configPath: configURL.path
+        )).configuration
+        workspace.configureRemoteConnection(configuration, autoConnect: false)
+        let snapshot = workspace.sessionSnapshot(includeScrollback: false)
+
+        try """
+        {
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let restored = Workspace(workingDirectory: root.path)
+        restored.restoreSessionSnapshot(snapshot)
+
+        let restoredTerminal = try XCTUnwrap(restored.focusedTerminalPanel)
+        XCTAssertNil(restored.remoteConfiguration)
+        XCTAssertFalse(restored.isRemoteWorkspace)
+        XCTAssertNil(restoredTerminal.surface.debugInitialCommand())
+        XCTAssertFalse(restored.isRemoteTerminalSurface(restoredTerminal.id))
+    }
+
+    @MainActor
+    func testProjectRemoteRestoreSkipsRemoteWhenProjectConfigChangesHost() throws {
+        CmuxConfigStore.sshHostAliasesOverrideForTesting = { ["tether", "other-host"] }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(
+            "cmux-project-remote-restore-host-change-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let configURL = root.appendingPathComponent("cmux.json", isDirectory: false)
+        try """
+        {
+          "remote": { "host": "tether" },
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let workspace = Workspace(workingDirectory: root.path)
+        let configuration = try XCTUnwrap(ProjectRemoteWorkspaceBootstrap.build(
+            host: "tether",
+            configPath: configURL.path
+        )).configuration
+        workspace.configureRemoteConnection(configuration, autoConnect: false)
+        let snapshot = workspace.sessionSnapshot(includeScrollback: false)
+
+        try """
+        {
+          "remote": { "host": "other-host" },
+          "commands": []
+        }
+        """.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let restored = Workspace(workingDirectory: root.path)
+        restored.restoreSessionSnapshot(snapshot)
+
+        let restoredTerminal = try XCTUnwrap(restored.focusedTerminalPanel)
+        XCTAssertNil(restored.remoteConfiguration)
+        XCTAssertFalse(restored.isRemoteWorkspace)
+        XCTAssertNil(restoredTerminal.surface.debugInitialCommand())
+        XCTAssertFalse(restored.isRemoteTerminalSurface(restoredTerminal.id))
     }
 
     func testTerminalPanelSnapshotRoundTripsLocalSessionID() throws {

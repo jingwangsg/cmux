@@ -289,9 +289,27 @@ struct SessionWorkspaceRemoteConfigurationSnapshot: Codable, Sendable {
     var relayToken: String?
     var localSocketPath: String?
     var terminalStartupCommand: String?
+    var projectConfigPath: String?
 
     init(configuration: WorkspaceRemoteConfiguration) {
         self.destination = configuration.destination
+        if let projectConfigPath = configuration.projectConfigPath?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !projectConfigPath.isEmpty {
+            self.port = nil
+            self.identityFile = nil
+            self.sshOptions = []
+            self.localProxyPort = nil
+            self.relayPort = nil
+            self.localRelayPort = nil
+            self.relayID = nil
+            self.relayToken = nil
+            self.localSocketPath = nil
+            self.terminalStartupCommand = nil
+            self.projectConfigPath = projectConfigPath
+            return
+        }
+
         self.port = configuration.port
         self.identityFile = configuration.identityFile
         self.sshOptions = configuration.sshOptions
@@ -302,10 +320,26 @@ struct SessionWorkspaceRemoteConfigurationSnapshot: Codable, Sendable {
         self.relayToken = configuration.relayToken
         self.localSocketPath = configuration.localSocketPath
         self.terminalStartupCommand = configuration.terminalStartupCommand
+        self.projectConfigPath = nil
     }
 
-    func workspaceRemoteConfiguration() -> WorkspaceRemoteConfiguration {
-        WorkspaceRemoteConfiguration(
+    func workspaceRemoteConfiguration() -> WorkspaceRemoteConfiguration? {
+        if let projectConfigPath = projectConfigPath?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !projectConfigPath.isEmpty {
+            let projectDirectory = (projectConfigPath as NSString).deletingLastPathComponent
+            guard let resolvedRemote = CmuxConfigStore.projectRemoteDefinition(startingFrom: projectDirectory),
+                  resolvedRemote.configPath == projectConfigPath,
+                  resolvedRemote.host.caseInsensitiveCompare(destination) == .orderedSame else {
+                return nil
+            }
+            return ProjectRemoteWorkspaceBootstrap.build(
+                host: resolvedRemote.host,
+                configPath: resolvedRemote.configPath
+            )?.configuration
+        }
+
+        return WorkspaceRemoteConfiguration(
             destination: destination,
             port: port,
             identityFile: identityFile,
@@ -316,7 +350,8 @@ struct SessionWorkspaceRemoteConfigurationSnapshot: Codable, Sendable {
             relayID: relayID,
             relayToken: relayToken,
             localSocketPath: localSocketPath,
-            terminalStartupCommand: terminalStartupCommand
+            terminalStartupCommand: terminalStartupCommand,
+            projectConfigPath: nil
         )
     }
 }

@@ -1332,6 +1332,34 @@ final class BrowserPanelRemoteStoreTests: XCTestCase {
         XCTAssertEqual(panel.webView.url?.host, "cmux-loopback.localtest.me")
     }
 
+    func testRemoteWorkspaceReattachToLocalRestoresDefaultStoreAndResumesPendingNavigation() {
+        let remoteWorkspaceId = UUID()
+        let localWorkspaceId = UUID()
+        let url = URL(string: "http://localhost:3000/demo")!
+        let panel = BrowserPanel(
+            workspaceId: remoteWorkspaceId,
+            initialURL: url,
+            isRemoteWorkspace: true,
+            remoteWebsiteDataStoreIdentifier: remoteWorkspaceId
+        )
+
+        XCTAssertNil(panel.webView.url)
+        XCTAssertFalse(panel.webView.configuration.websiteDataStore === WKWebsiteDataStore.default())
+
+        panel.reattachToWorkspace(
+            localWorkspaceId,
+            isRemoteWorkspace: false,
+            proxyEndpoint: nil,
+            remoteStatus: nil
+        )
+
+        let deadline = Date().addingTimeInterval(1.0)
+        while panel.webView.url == nil, RunLoop.main.run(mode: .default, before: deadline), Date() < deadline {}
+
+        XCTAssertTrue(panel.webView.configuration.websiteDataStore === WKWebsiteDataStore.default())
+        XCTAssertEqual(panel.webView.url?.host, "localhost")
+    }
+
     func testRemoteWorkspaceKeepsHTTPSLoopbackUnaliased() {
         let remoteWorkspaceId = UUID()
         let url = URL(string: "https://localhost:3443/demo")!

@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import Bonsplit
+import Darwin
 
 struct ParsedSSHCommand: Equatable {
     let destination: String
@@ -362,25 +363,125 @@ enum SSHRegisteredHostSettings {
 }
 
 enum SSHConfigHostScanner {
+    private static let maxIncludeDepth = 16
+
     static func hostAliases(configPath: String = NSString(string: "~/.ssh/config").expandingTildeInPath) -> [String] {
-        guard let contents = try? String(contentsOfFile: configPath, encoding: .utf8) else { return [] }
-        return hostAliases(from: contents)
+        var visited = Set<String>()
+        let aliases = hostAliases(configPath: configPath, visited: &visited, depth: 0)
+        return aliases.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
     static func hostAliases(from config: String) -> [String] {
+        let scanned = scan(config)
+        return scanned.aliases.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    private static func hostAliases(
+        configPath: String,
+        visited: inout Set<String>,
+        depth: Int
+    ) -> Set<String> {
+        guard depth <= maxIncludeDepth else { return [] }
+        let normalizedPath = (configPath as NSString).standardizingPath
+        guard visited.insert(normalizedPath).inserted else { return [] }
+        guard let contents = try? String(contentsOfFile: normalizedPath, encoding: .utf8) else { return [] }
+
+        let scanned = scan(contents)
+        var aliases = scanned.aliases
+        let baseDirectory = (normalizedPath as NSString).deletingLastPathComponent
+        for includePattern in scanned.includes {
+            for includePath in includePaths(pattern: includePattern, relativeTo: baseDirectory) {
+                aliases.formUnion(hostAliases(configPath: includePath, visited: &visited, depth: depth + 1))
+            }
+        }
+        return aliases
+    }
+
+    private static func scan(_ config: String) -> (aliases: Set<String>, includes: [String]) {
         var aliases = Set<String>()
+        var includes: [String] = []
         for rawLine in config.split(whereSeparator: \.isNewline) {
             let line = stripComment(String(rawLine)).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !line.isEmpty else { continue }
             let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
-            guard let keyword = parts.first, keyword.lowercased() == "host" else { continue }
-            for alias in parts.dropFirst() {
-                let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard isExplicitHostAlias(trimmed) else { continue }
-                aliases.insert(trimmed)
+            guard let keyword = parts.first else { continue }
+            switch keyword.lowercased() {
+            case "host":
+                for alias in parts.dropFirst() {
+                    let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard isExplicitHostAlias(trimmed) else { continue }
+                    aliases.insert(trimmed)
+                }
+            case "include":
+                includes.append(contentsOf: parts.dropFirst().map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                }.filter { !$0.isEmpty })
+            default:
+                continue
             }
         }
-        return aliases.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        return (aliases, includes)
+    }
+
+    private static func includePaths(pattern: String, relativeTo baseDirectory: String) -> [String] {
+        let expanded = expandTilde(pattern)
+        let absolutePattern = expanded.hasPrefix("/")
+            ? expanded
+            : (baseDirectory as NSString).appendingPathComponent(expanded)
+        return expandPathPattern(absolutePattern)
+    }
+
+    private static func expandTilde(_ path: String) -> String {
+        if path == "~" || path.hasPrefix("~/") {
+            return (path as NSString).expandingTildeInPath
+        }
+        return path
+    }
+
+    private static func expandPathPattern(_ pattern: String) -> [String] {
+        let standardized = (pattern as NSString).standardizingPath
+        guard containsGlobWildcard(standardized) else {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: standardized, isDirectory: &isDirectory),
+                  !isDirectory.boolValue else {
+                return []
+            }
+            return [standardized]
+        }
+
+        let components = (standardized as NSString).pathComponents
+        guard let root = components.first else { return [] }
+        var candidates = [root]
+        for component in components.dropFirst() {
+            var nextCandidates: [String] = []
+            for candidate in candidates {
+                if containsGlobWildcard(component) {
+                    guard let entries = try? FileManager.default.contentsOfDirectory(atPath: candidate) else {
+                        continue
+                    }
+                    for entry in entries where fnmatch(component, entry, 0) == 0 {
+                        nextCandidates.append((candidate as NSString).appendingPathComponent(entry))
+                    }
+                } else {
+                    nextCandidates.append((candidate as NSString).appendingPathComponent(component))
+                }
+            }
+            candidates = nextCandidates
+            if candidates.isEmpty { break }
+        }
+
+        return candidates.compactMap { candidate in
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDirectory),
+                  !isDirectory.boolValue else {
+                return nil
+            }
+            return candidate
+        }.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    private static func containsGlobWildcard(_ value: String) -> Bool {
+        value.rangeOfCharacter(from: CharacterSet(charactersIn: "*?[")) != nil
     }
 
     private static func stripComment(_ line: String) -> String {
